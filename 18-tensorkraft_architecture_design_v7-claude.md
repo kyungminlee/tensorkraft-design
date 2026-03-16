@@ -2,9 +2,15 @@
 # Rust-Based Tensor Network Library
 **for Quantum Many-Body Physics — DMRG Algorithms & DMFT Impurity Solver Integration**
 
-*Version 7.0 — March 2026 | Status: Architectural Specification (Pre-Implementation)*
+*Version 7.1 — March 2026 | Status: Architectural Specification (Pre-Implementation)*
 
 ---
+## Revision Notes (v7.0 → v7.1)
+
+This revision addresses critical concurrency and numerical correctness edge cases for non-Abelian SU(2) symmetry implementations. Changes include:
+- **§4.4** — SU(2) output-sector collision hazard: Documented the necessity of a map-reduce pattern during LPT task generation to prevent data races when multiple input pairs target the same output sector due to fusion-rule multiplicity.
+- **§4.4** — Multiplet-aware SVD truncation: Added the requirement for a two-phase SVD truncation approach in SU(2)-symmetric DMRG. Truncation must apply (2j+1) weighting to discarded singular values and snap to the nearest multiplet edge to prevent explicit symmetry breaking.
+- **§13** — Risk Analysis: Updated the SU(2) Wigner-Eckart complexity row to reflect the map-reduce task accumulation and multiplet-aware SVD truncation mitigations.
 
 ## Revision Notes (v6.0 → v7.0)
 
@@ -538,6 +544,10 @@ pub struct WignerEckartTensor<T: Scalar> {
 **Note:** `SU2Irrep` implements `QuantumNumber` but not `BitPackable`. Its `BlockSparseTensor` uses a separate `SmallVec`-keyed variant behind the `su2-symmetry` feature flag. This is acceptable because non-Abelian contractions are dominated by Clebsch-Gordan coefficient evaluation, not sector lookup.
 
 **Known refactoring requirement (fusion-rule multiplicity):** The Abelian block-sparse GEMM (§5.3.1) assumes a one-to-one mapping in `compute_fusion_rule(*key_a, *key_b) -> Option<PackedSectorKey>`: each input sector pair produces at most one output sector. For SU(2), the tensor product of irreps yields *multiple* output sectors: j₁ ⊗ j₂ = |j₁−j₂| ⊕ (|j₁−j₂|+1) ⊕ ... ⊕ (j₁+j₂). The `SectorGemmTask` generation loop in §5.3.1 must be generalized to produce a `Vec<SectorGemmTask>` per input pair, with each task's output block weighted by the corresponding Clebsch-Gordan coefficient. The `structural_contraction` callback handles the coefficient evaluation, but the task-generation fan-out is a structural change to the LPT scheduling phase. This refactoring is scoped to the `su2-symmetry` feature flag and does not affect the Abelian code path.
+
+**Output-sector collision hazard:** Because multiple input pairs (j_a, j_b) can map to the *same* output sector j_c, a naive `Vec<SectorGemmTask>` fed to `par_iter` creates a data race: two threads writing to the same output block. The SU(2) task generation must use a map-reduce pattern — group tasks by output sector key, then accumulate (reduce) partial contributions within each group before writing the final block. This is a structural change to the LPT scheduling phase that does not affect the Abelian code path, where fusion is always one-to-one.
+
+**Multiplet-aware SVD truncation:** In SU(2)-symmetric DMRG, singular values come in degenerate multiplets of dimension 2j+1. Truncation must keep or discard entire multiplets — splitting a multiplet explicitly breaks the symmetry and crashes the simulation. The truncation error must be weighted by multiplet dimension: each singular value σ_j contributes (2j+1)·σ_j² to the discarded weight. The current `svd_truncated` logic (which slices at `max_bond_dim` without multiplet awareness) must be extended with a two-phase approach: (1) sort by σ, (2) snap the truncation boundary to the nearest multiplet edge. This is scoped to the `su2-symmetry` feature flag.
 
 ---
 
@@ -2010,7 +2020,7 @@ tool = "criterion"     # wall-clock, bare-metal only
 |:-----|:---------|:-----------|
 | faer API instability (pre-1.0) | Medium | Abstract behind LinAlgBackend trait; version-pin; fallback to OpenBLAS FFI |
 | oxiblas sparse format coverage gaps | Medium | Validate BSR early; nalgebra-sparse as backup for CSR/CSC |
-| SU(2) Wigner-Eckart complexity | High | Defer implementation behind feature flag; structural_contraction callback from day one; fusion-rule multiplicity documented (§4.4): `SectorGemmTask` generation must fan out to `Vec` for non-Abelian irreps |
+| SU(2) Wigner-Eckart complexity | High | Defer behind feature flag; structural_contraction callback from day one; fusion-rule multiplicity with map-reduce accumulation for colliding output sectors (§4.4); multiplet-aware SVD truncation (2j+1 weighting, no mid-multiplet splits) |
 | FLOP-only path optimization | Medium | Composite CostMetric (α·FLOPs + β·Bytes_Moved) propagates stride info through candidate trees; penalizes paths requiring explicit transposes; zero-cost conjugation via `is_conjugated` flag |
 | Thread pool oversubscription | Medium | Hybrid ThreadingRegime: Fat-Sectors vs Fragmented-Sectors auto-selected per contraction |
 | Rayon long-tail starvation (binomial sectors) | Medium | LPT scheduling: sort sectors by descending FLOPs before `par_iter`; structural restoration re-sort after collection |
