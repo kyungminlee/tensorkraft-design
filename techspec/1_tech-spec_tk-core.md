@@ -19,12 +19,13 @@
 
 Mathematical operations on tensors (contraction, addition, trace, decomposition) are **not** implemented here. They belong in `tk-linalg` or `tk-contract`.
 
-**No dependencies** — `tk-core` is a pure-Rust leaf crate. It may depend only on:
+**Minimal dependencies** — `tk-core` is a pure-Rust leaf crate. It may depend only on:
 - `smallvec` (stack-allocated small vectors)
 - `bumpalo` (arena allocator)
 - `num-complex`, `num-traits` (numeric type abstractions)
 - `thiserror` (error derive macros)
 - `cfg-if` (feature-flag conditional compilation)
+- `log` (structured logging facade, used for pinned-memory fallback telemetry when `backend-cuda` is active)
 
 ---
 
@@ -277,7 +278,15 @@ impl<T: Scalar> DenseTensor<T> {
     /// Materialize into heap-allocated owned storage.
     /// Must be called before SweepArena::reset() for any tensor
     /// whose data must survive past the current sweep step.
-    pub fn into_owned(self) -> DenseTensor<T>;
+    pub fn into_owned(self) -> DenseTensor<T> {
+        match self.storage {
+            TensorCow::Owned(_) => self,
+            TensorCow::Borrowed(storage) => DenseTensor {
+                shape: self.shape,
+                storage: TensorCow::Owned(storage.clone()),
+            },
+        }
+    }
 
     /// View as a 2-D matrix (row-major). Errors if rank != 2.
     pub fn as_mat_ref(&self) -> TkResult<MatRef<'_, T>>;
@@ -302,7 +311,7 @@ ONLY the final SVD result               →  .into_owned() before arena reset
 
 The borrow checker enforces this statically. Any `TempTensor<'a>` that escapes the arena's lifetime `'a` is a compile error. Calling `.into_owned()` produces a `DenseTensor` with `'static` storage (heap-allocated), which may be stored anywhere.
 
-See §9 for the exact data-flow sequence.
+See §9.5 for the exact data-flow sequence.
 
 ---
 
@@ -453,7 +462,12 @@ pub enum ArenaStorage {
 ```rust
 impl SweepArena {
     /// Construct with a pre-allocated capacity (bytes).
-    pub fn with_capacity(bytes: usize) -> Self;
+    ///
+    /// On CPU-only builds: wraps a `bumpalo::Bump`.
+    /// On CUDA builds: attempts to allocate pinned (DMA-capable) memory
+    /// via `PinnedMemoryTracker::try_reserve`. Falls back to pageable
+    /// memory if the budget is exhausted or `cudaMallocHost` fails.
+    pub fn new(capacity_bytes: usize) -> Self;
 
     /// Allocate a zero-filled temporary tensor in the arena.
     /// The returned tensor's storage lifetime is tied to 'a (this arena).
@@ -478,16 +492,81 @@ impl SweepArena {
     ///
     /// The borrow checker statically enforces this: TempTensor<'a> cannot
     /// outlive the arena's current allocation epoch. This call ends the epoch.
-    pub fn reset(&mut self);
+    pub fn reset(&mut self) {
+        #[cfg(not(feature = "backend-cuda"))]
+        { self.inner.reset(); }
+        #[cfg(feature = "backend-cuda")]
+        {
+            match &mut self.storage {
+                ArenaStorage::Pinned(arena) => arena.reset(),
+                ArenaStorage::Pageable(bump) => bump.reset(),
+            }
+        }
+    }
 
     /// Current allocation usage in bytes.
     pub fn allocated_bytes(&self) -> usize;
 }
 ```
 
-### 9.4 Ownership Boundary
+### 9.4 CUDA Constructor and Drop
 
-The following pseudocode shows exactly where `.into_owned()` must be called within a DMRG sweep step (detailed data flow is in the architecture document §9):
+When `backend-cuda` is active, the constructor integrates with `PinnedMemoryTracker` to attempt pinned allocation with automatic pageable fallback:
+
+```rust
+#[cfg(feature = "backend-cuda")]
+impl SweepArena {
+    pub fn new(capacity_bytes: usize) -> Self {
+        if PinnedMemoryTracker::try_reserve(capacity_bytes) {
+            match PinnedArena::new(capacity_bytes) {
+                Ok(arena) => {
+                    log::info!("SweepArena: {} bytes pinned memory", capacity_bytes);
+                    return SweepArena { storage: ArenaStorage::Pinned(arena) };
+                }
+                Err(_) => {
+                    // cudaMallocHost failed despite budget check — release reservation.
+                    PinnedMemoryTracker::release(capacity_bytes);
+                }
+            }
+        }
+        // Fallback: pageable memory with telemetry (see §10.5).
+        let count = PINNED_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        log::warn!(
+            target: "tensorkraft::telemetry",
+            "PINNED_MEMORY_FALLBACK: SweepArena fell back to pageable memory \
+             ({} bytes requested, {} total fallbacks). GPU DMA transfers will \
+             use hidden staging buffers, halving effective PCI-e bandwidth.",
+            capacity_bytes, count
+        );
+        SweepArena {
+            storage: ArenaStorage::Pageable(bumpalo::Bump::with_capacity(capacity_bytes)),
+        }
+    }
+
+    /// Number of times any SweepArena construction fell back to pageable memory.
+    /// Exposed in DMRGEngine stats for observability.
+    pub fn pinned_fallback_count() -> usize {
+        PINNED_FALLBACK_COUNT.load(Ordering::Relaxed)
+    }
+}
+```
+
+The `Drop` implementation releases the pinned budget when a pinned arena is dropped:
+
+```rust
+#[cfg(feature = "backend-cuda")]
+impl Drop for SweepArena {
+    fn drop(&mut self) {
+        if let ArenaStorage::Pinned(arena) = &self.storage {
+            PinnedMemoryTracker::release(arena.capacity());
+        }
+    }
+}
+```
+
+### 9.5 Ownership Boundary
+
+The following pseudocode shows exactly where `.into_owned()` must be called within a DMRG sweep step (detailed data flow is in the architecture document §9; arena step 7):
 
 ```rust
 fn dmrg_step<T: Scalar>(
@@ -531,21 +610,24 @@ Enabled only when `features = ["backend-cuda"]`.
 
 ### 10.1 Purpose
 
-Host-to-GPU DMA transfers are only high-bandwidth when the source memory is page-locked (pinned). Pinning too much memory starves the OS page cache and can deadlock the system. `PinnedMemoryTracker` provides a global atomic budget to bound pinned allocation.
+Host-to-GPU DMA transfers are only high-bandwidth when the source memory is page-locked (pinned). Pinning too much memory starves the OS page cache and can deadlock the system. `PinnedMemoryTracker` provides a process-local atomic budget to bound pinned allocation.
 
 ### 10.2 Definition
 
+The tracker uses **module-level static atomics** rather than an instance-based struct. This avoids lifetime issues with a global singleton and aligns with the process-local isolation semantics required by MPI (§10.4).
+
 ```rust
 #[cfg(feature = "backend-cuda")]
-pub struct PinnedMemoryTracker {
-    /// Maximum allowed pinned allocation in bytes across all arenas.
-    max_bytes: usize,
-    /// Current pinned allocation, updated atomically (lock-free).
-    current_bytes: AtomicUsize,
-    /// Number of times a pinned allocation request fell back to pageable.
-    /// Exposed in DMRGEngine stats for observability.
-    fallback_count: AtomicUsize,
-}
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static PINNED_BYTES_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+static PINNED_BYTES_LIMIT: AtomicUsize = AtomicUsize::new(0);
+static PINNED_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Unit struct providing static methods to manage the process-global
+/// pinned-memory budget. All state lives in module-level atomics.
+#[cfg(feature = "backend-cuda")]
+pub struct PinnedMemoryTracker;
 ```
 
 ### 10.3 Interface
@@ -553,57 +635,75 @@ pub struct PinnedMemoryTracker {
 ```rust
 #[cfg(feature = "backend-cuda")]
 impl PinnedMemoryTracker {
-    /// Initialize the global tracker.
+    /// Initialize the global pinned-memory budget.
     /// Should be called once at program startup.
-    /// On MPI nodes, `max_bytes` must be divided by the number of
-    /// co-resident ranks before calling this function.
-    pub fn init_global(max_bytes: usize);
+    /// On MPI nodes, `max_bytes` must already be divided by the number of
+    /// co-resident ranks before calling this function (see §10.4).
+    pub fn initialize_budget(max_bytes: usize) {
+        PINNED_BYTES_LIMIT.store(max_bytes, Ordering::Release);
+    }
 
-    /// Access the process-global instance.
-    pub fn global() -> &'static Self;
+    /// Attempt to reserve `bytes` of pinned memory from the budget.
+    /// Returns `true` on success (budget decremented atomically via CAS loop).
+    /// Returns `false` when the budget would be exceeded.
+    /// Callers are responsible for falling back to pageable allocation
+    /// and incrementing the fallback counter on failure.
+    pub fn try_reserve(bytes: usize) -> bool {
+        let mut current = PINNED_BYTES_ALLOCATED.load(Ordering::Relaxed);
+        loop {
+            let limit = PINNED_BYTES_LIMIT.load(Ordering::Acquire);
+            if current + bytes > limit { return false; }
+            match PINNED_BYTES_ALLOCATED.compare_exchange_weak(
+                current, current + bytes,
+                Ordering::AcqRel, Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
 
-    /// Attempt to reserve `bytes` of pinned memory.
-    /// Returns Ok(PinnedGuard) on success (budget decremented atomically).
-    /// Returns Err(PinnedBudgetExhausted) when the budget is full,
-    /// and records a structured telemetry event with the fallback counter.
-    pub fn try_reserve(bytes: usize) -> Result<PinnedGuard, PinnedBudgetExhausted>;
-
-    /// Number of pinned-allocation fallbacks since initialization.
-    pub fn fallback_count() -> usize;
-}
-
-/// RAII guard: releases pinned budget when dropped.
-#[cfg(feature = "backend-cuda")]
-pub struct PinnedGuard {
-    bytes: usize,
-}
-
-impl Drop for PinnedGuard {
-    fn drop(&mut self) {
-        PinnedMemoryTracker::global()
-            .current_bytes
-            .fetch_sub(self.bytes, Ordering::Release);
+    /// Release `bytes` from the pinned budget.
+    /// Called when a pinned arena is dropped or reset.
+    pub fn release(bytes: usize) {
+        PINNED_BYTES_ALLOCATED.fetch_sub(bytes, Ordering::Release);
     }
 }
 ```
 
-### 10.4 MPI Interaction
+**Design note:** The architecture document specifies `try_reserve` returning `bool` (not `Result<PinnedGuard, ...>`) with explicit `release()` calls managed by `SweepArena`'s `Drop` implementation (§9.5). This avoids the need for a separate `PinnedGuard` RAII type and keeps the budget logic concentrated in `SweepArena`'s lifecycle methods.
 
-On multi-GPU nodes with MPI, each rank shares the same physical NUMA domain and pinned-memory budget. The calling code (in `tk-dmft`) must query the number of co-resident MPI ranks and divide `max_bytes` accordingly before calling `PinnedMemoryTracker::init_global`. `tk-core` itself has no MPI dependency.
+### 10.4 MPI Process-Isolation Semantics
+
+**Critical clarification:** Rust's `AtomicUsize` is strictly **process-local** — each MPI rank runs as an independent OS process with an isolated virtual memory space. Rank 0 cannot read Rank 1's `PINNED_BYTES_ALLOCATED`. The `PinnedMemoryTracker` does *not* coordinate dynamically across ranks at runtime.
+
+Instead, the node-level budget is **statically partitioned once at startup** via the `initialize_dmft_node_budget` topology query (in `tk-dmft`), which divides the safe node limit evenly across co-resident ranks. Each rank then independently enforces its pre-negotiated slice using its own process-local atomic counter. This design is correct because pinned-memory allocation is monotonic within a DMFT iteration (allocate at start, release at end) — no dynamic rebalancing between ranks is needed.
+
+```rust
+// In tk-dmft (not tk-core — tk-core has no MPI dependency):
+#[cfg(all(feature = "backend-cuda", feature = "backend-mpi"))]
+pub fn initialize_dmft_node_budget(comm: &MpiComm) {
+    let total_ram = sys_info::mem_info().unwrap().total;
+    let local_ranks = comm.split_by_shared_memory().size();
+    let safe_node_limit = (total_ram as f64 * 0.60) as usize;
+    let rank_budget = safe_node_limit / local_ranks;
+    PinnedMemoryTracker::initialize_budget(rank_budget);
+}
+```
 
 ### 10.5 Telemetry
 
-When `try_reserve` falls back to pageable allocation, it emits a structured telemetry event (not just a log line) so that the `DMRGEngine` stats struct can surface the fallback count to the user. Format:
+When `SweepArena::new` falls back to pageable allocation, it emits a warning via the `log` crate with the `tensorkraft::telemetry` target so that the `DMRGEngine` stats struct can surface the fallback count to the user:
 
 ```rust
-// Emitted inside try_reserve on fallback:
-tracing::event!(
-    tracing::Level::WARN,
-    kind = "pinned_memory_fallback",
-    requested_bytes = bytes,
-    current_bytes = self.current_bytes.load(Ordering::Relaxed),
-    max_bytes = self.max_bytes,
-    fallback_count = self.fallback_count.fetch_add(1, Ordering::Relaxed) + 1,
+// Emitted inside SweepArena::new on pinned fallback (see §9.5):
+let count = PINNED_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+log::warn!(
+    target: "tensorkraft::telemetry",
+    "PINNED_MEMORY_FALLBACK: SweepArena fell back to pageable memory \
+     ({} bytes requested, {} total fallbacks). GPU DMA transfers will \
+     use hidden staging buffers, halving effective PCI-e bandwidth.",
+    capacity_bytes, count
 );
 ```
 
@@ -632,10 +732,6 @@ pub enum TkError {
 
     #[error("scalar type mismatch")]
     ScalarTypeMismatch,
-
-    #[cfg(feature = "backend-cuda")]
-    #[error("pinned memory budget exhausted")]
-    PinnedBudgetExhausted,
 }
 
 pub type TkResult<T> = Result<T, TkError>;
@@ -669,7 +765,7 @@ pub use arena::SweepArena;
 pub use error::{TkError, TkResult};
 
 #[cfg(feature = "backend-cuda")]
-pub use pinned::{PinnedMemoryTracker, PinnedGuard};
+pub use pinned::PinnedMemoryTracker;
 ```
 
 ---
@@ -700,7 +796,10 @@ pub use pinned::{PinnedMemoryTracker, PinnedGuard};
 | `tensorcow_borrowed_no_clone` | Shape ops on `Borrowed` variant don't clone data |
 | `tensorcow_into_owned_clones` | `into_owned()` on `Borrowed` produces new heap allocation |
 | `arena_reset_reclaims` | `allocated_bytes()` returns to ~0 after `reset()` |
+| `matref_adjoint_roundtrip` | `mat.adjoint().adjoint()` recovers original strides and conjugation flag |
 | `arena_lifetime_compile_error` | (compile-fail test) TempTensor<'a> cannot escape past reset |
+| `pinned_budget_enforcement` | `PinnedMemoryTracker::try_reserve` returns false when budget exceeded (cfg: backend-cuda) |
+| `pinned_drop_releases_budget` | Dropping a pinned `SweepArena` releases budget via `PinnedMemoryTracker::release` (cfg: backend-cuda) |
 | `scalar_conj_complex` | `C64::conj()` produces correct imaginary sign flip |
 | `scalar_is_real_f64` | `f64::is_real()` returns true |
 | `scalar_is_real_c64` | `C64::is_real()` returns false |
@@ -739,7 +838,7 @@ Use the `trybuild` crate to verify borrow-checker enforcement:
 ```rust
 // tests/compile_fail/arena_escape.rs  (expected to fail compilation)
 fn escape_temp_tensor() {
-    let mut arena = SweepArena::with_capacity(1024);
+    let mut arena = SweepArena::new(1024);
     let t: TempTensor<f64> = arena.alloc_tensor(TensorShape::row_major(&[4, 4]));
     arena.reset();
     let _ = t.as_slice(); // use-after-reset: borrow checker must reject this
@@ -762,7 +861,56 @@ The following must be validated by CI benchmarks (Criterion, instruction-countin
 
 ---
 
-## 16. Out of Scope
+## 16. Forward Compatibility: `StorageDevice` Trait (Phase 5)
+
+The architecture document §10.1 introduces a `StorageDevice` trait that generalizes `TensorStorage` to support GPU and MPI device memory:
+
+```rust
+pub trait StorageDevice: Send + Sync + 'static {
+    type Alloc: Allocator;
+    fn alloc<T: Scalar>(len: usize) -> DeviceBuffer<T, Self>;
+    fn synchronize(&self);
+}
+
+pub struct HostDevice;
+
+#[cfg(feature = "backend-cuda")]
+pub struct CudaDevice { pub ordinal: usize }
+
+#[cfg(feature = "backend-mpi")]
+pub struct MpiDevice { pub comm: MpiComm, pub rank: usize }
+
+/// Default type parameter preserves backward compatibility.
+pub struct TensorStorage<T: Scalar, D: StorageDevice = HostDevice> {
+    data: DeviceBuffer<T, D>,
+    device: D,
+}
+```
+
+This generalization is **deferred to Phase 5** (CUDA/MPI integration). In Phases 1–3, `TensorStorage<T>` remains the simple `Vec<T>` wrapper defined in §5. The default type parameter `D = HostDevice` ensures backward compatibility — existing code using `TensorStorage<f64>` continues to work unchanged when the trait is introduced.
+
+**Impact on `tk-core`:** The `StorageDevice` trait, `HostDevice`, and the parameterized `TensorStorage` will be added to `tk-core` when Phase 5 begins. `CudaDevice` and `MpiDevice` implementations live in their respective backend crates, not in `tk-core`.
+
+---
+
+## 17. Cross-Crate Arena Usage: `flatten()` (Phase 4)
+
+The `SweepArena` is used not only for `alloc_tensor` within DMRG sweep steps, but also by `tk-symmetry`'s `BlockSparseTensor::flatten()` method (architecture document §4.2). The `flatten()` method accepts a `&SweepArena` parameter and packs fragmented block data into a single contiguous buffer allocated from the arena:
+
+```rust
+// In tk-symmetry (not tk-core), but depends on SweepArena from tk-core:
+impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
+    pub fn flatten<'a>(&self, arena: &'a SweepArena) -> FlatBlockStorage<'a, T>;
+}
+```
+
+When `backend-cuda` is active, the arena's pinned memory ensures that the flat buffer is DMA-capable for GPU transfers without the NVIDIA driver's hidden pin-copy-unpin staging dance. This is critical for PCI-e bandwidth — allocating the flat buffer from the pageable heap would halve effective transfer bandwidth.
+
+This cross-crate usage pattern does not change `SweepArena`'s API but motivates the `alloc_slice_uninit` method and confirms that the arena must support arbitrary-size allocations beyond just `TensorShape`-sized tensors.
+
+---
+
+## 18. Out of Scope
 
 The following are explicitly **not** implemented in `tk-core`:
 
@@ -775,7 +923,7 @@ The following are explicitly **not** implemented in `tk-core`:
 
 ---
 
-## 17. Open Questions
+## 19. Open Questions
 
 | # | Question | Status |
 |:--|:---------|:-------|
