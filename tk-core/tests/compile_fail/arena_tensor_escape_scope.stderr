@@ -1,0 +1,7 @@
+error[E0515]: cannot return value referencing local variable `arena`
+  --> tests/compile_fail/arena_tensor_escape_scope.rs:16:5
+   |
+15 |     let t = arena.alloc_tensor::<f64>(TensorShape::row_major(&[2, 3]));
+   |             ----- `arena` is borrowed here
+16 |     t // ERROR: cannot return value referencing local variable `arena`
+   |     ^ returns a value referencing data owned by the current function

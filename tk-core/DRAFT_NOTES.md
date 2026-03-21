@@ -45,12 +45,17 @@ The `Scalar` trait implementation for `f128` is gated behind the `backend-oxibla
 
 ### 5. No `StorageDevice` trait generalization
 
-The tech spec (section 16) describes a future `StorageDevice` trait that parameterizes `TensorStorage<T, D>` over a device type (`HostDevice`, `CudaDevice`, `MpiDevice`). This is deferred to Phase 5. The current `TensorStorage<T>` is hardcoded to host-heap storage via `Vec<T>`.
+The tech spec (section 15) describes a future `StorageDevice` trait that parameterizes `TensorStorage<T, D>` over a device type (`HostDevice`, `CudaDevice`, `MpiDevice`). This is deferred to Phase 5. The current `TensorStorage<'a, T>` enum (`Owned(Vec<T>)` / `Borrowed(&'a [T])`) is hardcoded to host memory.
 
-### 6. No compile-fail tests yet
+### 6. ~~No compile-fail tests yet~~ (RESOLVED)
 
-The tech spec (section 14.3) requires `trybuild`-based compile-fail tests to verify that `TempTensor<'a>` cannot escape past `SweepArena::reset()`. The `trybuild` dev-dependency is declared in `Cargo.toml` but no compile-fail test files have been written yet.
+Five `trybuild`-based compile-fail tests added in `tests/compile_fail/`:
+- `arena_tensor_outlives_reset` — `TempTensor` cannot be used after `arena.reset()`
+- `arena_tensor_escape_scope` — `TempTensor` cannot escape the function that owns the arena
+- `borrowed_storage_outlives_data` — `TensorStorage::Borrowed` cannot outlive its source data
+- `slice_view_outlives_tensor` — sliced view cannot be used after the original tensor is moved
+- `matref_outlives_tensor` — `MatRef` cannot be used after the tensor is moved
 
 ### 7. No `proptest` property-based tests yet
 
-The tech spec (section 14.2) requires `proptest`-based property tests for `TensorShape` (offset bounds, permutation numel preservation). The `proptest` dev-dependency is declared but no property tests have been written yet.
+The tech spec (section 13.2) requires `proptest`-based property tests for `TensorShape` (offset bounds, permutation numel preservation). The `proptest` dev-dependency is declared but no property tests have been written yet.

@@ -1,0 +1,11 @@
+error[E0505]: cannot move out of `t` because it is borrowed
+  --> tests/compile_fail/matref_outlives_tensor.rs:10:10
+   |
+ 8 |     let t = DenseTensor::from_vec(TensorShape::row_major(&[2, 3]), data);
+   |         - binding `t` declared here
+ 9 |     let mat = t.as_mat_ref().unwrap(); // borrows from `t`
+   |               - borrow of `t` occurs here
+10 |     drop(t); // move `t`
+   |          ^ move out of `t` occurs here
+11 |     let _ = mat.get(0, 0); // ERROR: `t` was moved while `mat` borrows it
+   |             --- borrow later used here

@@ -1,0 +1,9 @@
+error[E0502]: cannot borrow `arena` as mutable because it is also borrowed as immutable
+  --> tests/compile_fail/arena_tensor_outlives_reset.rs:10:5
+   |
+ 9 |     let t = arena.alloc_tensor::<f64>(TensorShape::row_major(&[4, 4]));
+   |             ----- immutable borrow occurs here
+10 |     arena.reset();
+   |     ^^^^^^^^^^^^^ mutable borrow occurs here
+11 |     let _ = t.as_slice(); // use-after-reset: must not compile
+   |             - immutable borrow later used here

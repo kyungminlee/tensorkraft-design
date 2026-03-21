@@ -1,0 +1,11 @@
+error[E0505]: cannot move out of `t` because it is borrowed
+  --> tests/compile_fail/slice_view_outlives_tensor.rs:10:10
+   |
+ 8 |     let t = DenseTensor::from_vec(TensorShape::row_major(&[3, 4]), data);
+   |         - binding `t` declared here
+ 9 |     let sliced = t.slice_axis(0, 1, 3); // borrows from `t`
+   |                  - borrow of `t` occurs here
+10 |     drop(t); // move `t` — invalidates the borrow
+   |          ^ move out of `t` occurs here
+11 |     let _ = sliced.as_slice(); // ERROR: `t` was moved while `sliced` borrows it
+   |             ------ borrow later used here

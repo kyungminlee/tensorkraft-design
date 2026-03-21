@@ -1,0 +1,12 @@
+error[E0597]: `data` does not live long enough
+  --> tests/compile_fail/borrowed_storage_outlives_data.rs:9:35
+   |
+ 7 |     let storage = {
+   |         ------- borrow later stored here
+ 8 |         let data = vec![1.0_f64, 2.0, 3.0];
+   |             ---- binding `data` declared here
+ 9 |         TensorStorage::from_slice(&data)
+   |                                   ^^^^^ borrowed value does not live long enough
+10 |         // `data` is dropped here
+11 |     };
+   |     - `data` dropped here while still borrowed
