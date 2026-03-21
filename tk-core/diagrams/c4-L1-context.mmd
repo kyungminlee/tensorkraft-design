@@ -1,0 +1,51 @@
+---
+title: "C4 Level 1 — System Context: tensorkraft Workspace"
+---
+graph TB
+    %% ── External actors ──
+    physicist["Physicist / Developer
+    [Person]
+    Defines Hamiltonians,
+    runs DMRG/DMFT simulations"]
+
+    python["Python Script
+    [External System]
+    Jupyter / CLI via PyO3 bindings"]
+
+    cuda["CUDA Runtime
+    [External System]
+    GPU kernels, cudaMallocHost,
+    device memory transfers"]
+
+    mpi["MPI Runtime
+    [External System]
+    Multi-node parallelism
+    (OpenMPI / MPICH)"]
+
+    blas["BLAS / LAPACK
+    [External System]
+    oxiblas or faer backend
+    for dense linear algebra"]
+
+    %% ── The system ──
+    tk["tensorkraft
+    [Software System]
+    Rust tensor network library for
+    quantum many-body physics
+    (DMRG, DMFT)"]
+
+    %% ── Relationships ──
+    physicist -- "defines models,\nanalyzes results" --> tk
+    python -- "zero-copy NumPy\ninterop via PyO3" --> tk
+    tk -- "GPU acceleration\n(optional)" --> cuda
+    tk -- "distributed compute\n(optional)" --> mpi
+    tk -- "SVD, GEMM,\neigensolvers" --> blas
+
+    %% ── Styling ──
+    classDef person fill:#08427B,color:#fff,stroke:none
+    classDef system fill:#1168BD,color:#fff,stroke:none
+    classDef external fill:#999,color:#fff,stroke:none
+
+    class physicist person
+    class tk system
+    class python,cuda,mpi,blas external

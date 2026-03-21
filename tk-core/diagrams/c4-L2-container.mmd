@@ -1,0 +1,68 @@
+---
+title: "C4 Level 2 — Container: tensorkraft Crate Dependency Graph"
+---
+graph TB
+    %% ── Crates (containers) ──
+    core["tk-core
+    [Rust Crate]
+    Tensor shapes, CoW storage,
+    arena allocators, MatRef/MatMut,
+    Scalar trait, error types"]
+
+    sym["tk-symmetry
+    [Rust Crate — planned]
+    QuantumNumber trait, U(1)/Z₂
+    block-sparse formats"]
+
+    linalg["tk-linalg
+    [Rust Crate — planned]
+    LinAlgBackend trait, SVD/EVD
+    dispatch, block-sparse parallel"]
+
+    contract["tk-contract
+    [Rust Crate — planned]
+    Contraction DAG, path optimizer,
+    reshape-free GEMM executor"]
+
+    dsl["tk-dsl
+    [Rust Crate — planned]
+    hamiltonian!{} proc-macro,
+    OpSum builder, operator enums"]
+
+    dmrg["tk-dmrg
+    [Rust Crate — planned]
+    DMRG sweep, Lanczos/Davidson,
+    MPO compilation, MPS storage"]
+
+    dmft["tk-dmft
+    [Rust Crate — planned]
+    DMFT self-consistency loop,
+    TDVP, spectral methods"]
+
+    py["tk-python
+    [Rust Crate — planned]
+    PyO3/maturin bindings,
+    zero-copy NumPy interop"]
+
+    %% ── Dependencies ──
+    sym -- "depends on" --> core
+    linalg -- "depends on" --> core
+    linalg -- "depends on" --> sym
+    contract -- "depends on" --> core
+    contract -- "depends on" --> sym
+    contract -- "depends on" --> linalg
+    dsl -- "depends on" --> core
+    dmrg -- "depends on" --> core
+    dmrg -- "depends on" --> sym
+    dmrg -- "depends on" --> linalg
+    dmrg -- "depends on" --> contract
+    dmrg -- "depends on" --> dsl
+    dmft -- "depends on" --> dmrg
+    py -- "depends on" --> dmft
+
+    %% ── Styling ──
+    classDef implemented fill:#1168BD,color:#fff,stroke:none
+    classDef planned fill:#438DD5,color:#fff,stroke:#1168BD,stroke-dasharray:5 5
+
+    class core implemented
+    class sym,linalg,contract,dsl,dmrg,dmft,py planned

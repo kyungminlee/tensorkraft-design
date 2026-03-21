@@ -1,0 +1,103 @@
+---
+title: "C4 Level 3 — Component: tk-core Modules"
+---
+graph TB
+    %% ── External consumers ──
+    downstream["Downstream Crates
+    (tk-symmetry, tk-linalg,
+    tk-contract, tk-dmrg, ...)"]
+
+    %% ── Public API surface (lib.rs) ──
+    subgraph tkcore["tk-core"]
+        direction TB
+
+        lib["lib.rs
+        [Module]
+        Re-exports all public types
+        as a flat namespace"]
+
+        subgraph types["Type System"]
+            scalar["scalar.rs
+            [Module]
+            Scalar trait: conj, abs_sq,
+            from_real, is_real
+            Impls: f32, f64, C32, C64"]
+
+            error["error.rs
+            [Module]
+            TkError enum (6 variants)
+            TkResult&lt;T&gt; alias"]
+        end
+
+        subgraph tensor_layer["Tensor Layer"]
+            shape["shape.rs
+            [Module]
+            TensorShape: dims + strides
+            SmallVec&lt;[usize; 6]&gt;
+            permute, reshape, slice_axis"]
+
+            storage["storage.rs
+            [Module]
+            TensorStorage&lt;'a, T&gt;
+            Owned(Vec) / Borrowed(&amp;[T])
+            Copy-on-Write semantics"]
+
+            tensor["tensor.rs
+            [Module]
+            DenseTensor&lt;'a, T&gt;
+            shape + storage + offset
+            TempTensor alias"]
+
+            matview["matview.rs
+            [Module]
+            MatRef&lt;'a, T&gt; + MatMut&lt;'a, T&gt;
+            lazy is_conjugated flag
+            adjoint, conjugate, transpose"]
+        end
+
+        subgraph memory["Memory Management"]
+            arena["arena.rs
+            [Module]
+            SweepArena: bump allocator
+            for DMRG sweep temporaries
+            O(1) reset, zero-copy alloc"]
+
+            pinned["pinned.rs
+            [Module — backend-cuda]
+            PinnedMemoryTracker
+            CAS-loop budget enforcement
+            static atomics"]
+        end
+    end
+
+    %% ── Relationships ──
+    downstream -- "imports via" --> lib
+
+    lib --> scalar
+    lib --> error
+    lib --> shape
+    lib --> storage
+    lib --> tensor
+    lib --> matview
+    lib --> arena
+    lib -. "cfg(backend-cuda)" .-> pinned
+
+    tensor -- "owns" --> shape
+    tensor -- "owns" --> storage
+    tensor -- "produces" --> matview
+    storage -- "T: Scalar" --> scalar
+    shape -- "errors" --> error
+    tensor -- "errors" --> error
+    arena -- "allocates" --> tensor
+    arena -. "cfg(backend-cuda)\nbudget tracking" .-> pinned
+
+    %% ── Styling ──
+    classDef module fill:#438DD5,color:#fff,stroke:none
+    classDef conditional fill:#85BBF0,color:#000,stroke:#438DD5,stroke-dasharray:5 5
+    classDef external fill:#999,color:#fff,stroke:none
+    classDef group fill:#E8F4FD,stroke:#438DD5,color:#1168BD
+
+    class lib,scalar,error,shape,storage,tensor,matview,arena module
+    class pinned conditional
+    class downstream external
+    class types,tensor_layer,memory group

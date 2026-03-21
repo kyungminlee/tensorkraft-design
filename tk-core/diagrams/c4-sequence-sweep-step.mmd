@@ -1,0 +1,37 @@
+---
+title: "Sequence: DMRG Sweep Step — Arena Allocation Lifecycle"
+---
+sequenceDiagram
+    participant Engine as DMRGEngine
+    participant Arena as SweepArena
+    participant Bump as bumpalo::Bump
+    participant Tensor as DenseTensor<'a>
+    participant Owned as DenseTensor<'static>
+
+    Note over Engine,Owned: One sweep step (repeated per bond)
+
+    Engine->>Arena: alloc_tensor(shape)
+    Arena->>Bump: alloc_slice_fill_copy(n, T::zero())
+    Bump-->>Arena: &'a [T] (bump-allocated slice)
+    Arena->>Tensor: DenseTensor::borrowed(shape, &'a [T])
+    Arena-->>Engine: TempTensor<'a> (Borrowed storage)
+
+    Note over Engine: Perform contractions,<br/>SVD on temporary tensors
+
+    Engine->>Tensor: .slice_axis(axis, start, end)
+    Tensor-->>Engine: DenseTensor<'a> (offset advanced, same buffer)
+
+    Engine->>Tensor: .as_mat_ref()
+    Tensor-->>Engine: MatRef<'a> (zero-copy 2D view)
+
+    Note over Engine: SVD produces final result —<br/>must persist beyond arena reset
+
+    Engine->>Tensor: .into_owned()
+    Tensor->>Owned: gather elements → Vec<T>
+    Owned-->>Engine: DenseTensor<'static> (heap-owned)
+
+    Note over Engine: All temporaries dropped,<br/>only owned result survives
+
+    Engine->>Arena: reset()
+    Arena->>Bump: reset() — O(1) reclaim
+    Note over Bump: All bump memory reused<br/>for next sweep step

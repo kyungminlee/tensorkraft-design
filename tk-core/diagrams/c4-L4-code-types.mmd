@@ -1,0 +1,119 @@
+---
+title: "C4 Level 4 — Code: tk-core Core Type Relationships"
+---
+classDiagram
+    direction TB
+
+    class Scalar {
+        <<trait>>
+        +type Real: Float
+        +conj() Self
+        +abs_sq() Real
+        +from_real(Real) Self
+        +is_real() bool
+    }
+
+    class f32 {
+        Real = f32
+    }
+    class f64 {
+        Real = f64
+    }
+    class C32 {
+        Complex~f32~
+        Real = f32
+    }
+    class C64 {
+        Complex~f64~
+        Real = f64
+    }
+
+    Scalar <|.. f32
+    Scalar <|.. f64
+    Scalar <|.. C32
+    Scalar <|.. C64
+
+    class TensorShape {
+        -dims: SmallVec~[usize; 6]~
+        -strides: SmallVec~[usize; 6]~
+        +row_major(dims) TensorShape
+        +col_major(dims) TensorShape
+        +with_strides(dims, strides) TensorShape
+        +numel() usize
+        +rank() usize
+        +offset(index) usize
+        +is_contiguous() bool
+        +permute(perm) TensorShape
+        +reshape(new_dims) TkResult~TensorShape~
+        +slice_axis(axis, start, end) (TensorShape, usize)
+    }
+
+    class TensorStorage~'a, T~ {
+        <<enum>>
+        Owned(Vec~T~)
+        Borrowed(&'a [T])
+        +zeros(n) TensorStorage~'static, T~
+        +from_vec(Vec~T~) TensorStorage~'static, T~
+        +from_slice(&'a [T]) Self
+        +as_slice() &[T]
+        +as_mut_slice() &mut [T]
+        +into_owned() TensorStorage~'static, T~
+        +borrow() TensorStorage~'_, T~
+    }
+
+    class DenseTensor~'a, T~ {
+        -shape: TensorShape
+        -storage: TensorStorage~'a, T~
+        -offset: usize
+        +zeros(shape) DenseTensor~'static, T~
+        +from_vec(shape, Vec~T~) DenseTensor~'static, T~
+        +borrowed(shape, &'a [T]) Self
+        +permute(perm) DenseTensor~'_, T~
+        +reshape(new_dims) TkResult~DenseTensor~
+        +slice_axis(axis, start, end) DenseTensor~'_, T~
+        +into_owned() DenseTensor~'static, T~
+        +as_mat_ref() TkResult~MatRef~
+        +as_mat_mut() TkResult~MatMut~
+    }
+
+    class MatRef~'a, T~ {
+        +data: &'a [T]
+        +rows: usize
+        +cols: usize
+        +row_stride: isize
+        +col_stride: isize
+        +is_conjugated: bool
+        +adjoint() MatRef~'a, T~
+        +conjugate() MatRef~'a, T~
+        +transpose() MatRef~'a, T~
+        +get(row, col) T
+    }
+
+    class MatMut~'a, T~ {
+        +data: &'a mut [T]
+        +rows: usize
+        +cols: usize
+        +row_stride: isize
+        +col_stride: isize
+        +get(row, col) T
+        +set(row, col, val)
+    }
+
+    DenseTensor~'a, T~ *-- TensorShape : owns
+    DenseTensor~'a, T~ *-- TensorStorage~'a, T~ : owns
+    DenseTensor~'a, T~ ..> MatRef~'a, T~ : produces
+    DenseTensor~'a, T~ ..> MatMut~'a, T~ : produces
+    TensorStorage~'a, T~ ..> Scalar : T bounded by
+
+    class TkError {
+        <<enum>>
+        ShapeMismatch
+        ReshapeError
+        NonContiguous
+        RankError
+        IndexOutOfBounds
+        ScalarTypeMismatch
+    }
+
+    DenseTensor~'a, T~ ..> TkError : returns in TkResult
+    TensorShape ..> TkError : returns in TkResult

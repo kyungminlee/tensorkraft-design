@@ -1,0 +1,74 @@
+---
+title: "C4 Level 4 — Code: tk-core Memory Management & Lifetime Model"
+---
+classDiagram
+    direction TB
+
+    class SweepArena {
+        -inner: Bump  [cpu-only]
+        -storage: ArenaStorage  [backend-cuda]
+        +new(capacity_bytes) Self
+        +alloc_tensor~T~(shape) DenseTensor~'_, T~
+        +alloc_slice_zeroed~T~(len) &[T]
+        +alloc_slice_uninit~T~(len) &mut [T]
+        +reset()
+        +allocated_bytes() usize
+    }
+
+    class ArenaStorage {
+        <<enum — backend-cuda only>>
+        Pinned(PinnedArena)
+        Pageable(Bump)
+    }
+
+    class PinnedArena {
+        <<backend-cuda only>>
+        -inner: Bump
+        -capacity: usize
+        +new(capacity_bytes) Result~Self~
+        +reset()
+        +capacity() usize
+        +allocated_bytes() usize
+    }
+
+    class PinnedMemoryTracker {
+        <<backend-cuda only>>
+        -PINNED_BYTES_ALLOCATED: AtomicUsize$
+        -PINNED_BYTES_LIMIT: AtomicUsize$
+        +initialize_budget(max_bytes)$
+        +try_reserve(bytes) bool$
+        +release(bytes)$
+        +allocated_bytes() usize$
+        +budget_limit() usize$
+    }
+
+    class Bump {
+        <<bumpalo>>
+        Bump allocator
+    }
+
+    SweepArena *-- Bump : cpu-only
+    SweepArena *-- ArenaStorage : backend-cuda
+    ArenaStorage *-- PinnedArena
+    ArenaStorage *-- Bump
+    PinnedArena *-- Bump : wraps (placeholder)
+    SweepArena ..> PinnedMemoryTracker : budget check
+
+    class DenseTensor~'a, T~ {
+        shape: TensorShape
+        storage: TensorStorage~'a, T~
+        offset: usize
+    }
+
+    class TensorStorage~'a, T~ {
+        <<enum>>
+        Owned(Vec~T~)
+        Borrowed(&'a [T])
+    }
+
+    note for SweepArena "alloc_tensor flow:\n1. Bump-allocate zeroed slice\n2. Wrap as TensorStorage::Borrowed\n3. Return DenseTensor with lifetime\n   tied to arena ('a)\n\nNo heap Vec created."
+
+    SweepArena ..> DenseTensor~'a, T~ : allocates (Borrowed)
+    DenseTensor~'a, T~ *-- TensorStorage~'a, T~ : owns
+
+    note for TensorStorage~'a, T~ "Copy-on-Write:\n- Arena tensors start as Borrowed\n- into_owned() clones to Owned(Vec)\n- Must call before arena.reset()\n  to persist data"
