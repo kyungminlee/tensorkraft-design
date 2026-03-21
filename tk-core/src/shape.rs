@@ -206,6 +206,79 @@ impl TensorShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy: generate dims of rank 2..=6, each dimension 1..=8.
+    fn dims_strategy() -> impl Strategy<Value = Vec<usize>> {
+        prop::collection::vec(1usize..=8, 2..=6)
+    }
+
+    proptest! {
+        #[test]
+        fn prop_offset_within_bounds(dims in dims_strategy()) {
+            let shape = TensorShape::row_major(&dims);
+            let numel = shape.numel();
+            if numel == 0 {
+                return Ok(());
+            }
+            // Generate a valid multi-index: each component in [0, dim).
+            let index: Vec<usize> = dims.iter().map(|&d| d - 1).collect();
+            let off = shape.offset(&index);
+            prop_assert!(off < numel, "offset {} >= numel {} for index {:?}, dims {:?}", off, numel, index, dims);
+        }
+
+        #[test]
+        fn prop_permute_preserves_numel(dims in dims_strategy()) {
+            let shape = TensorShape::row_major(&dims);
+            let rank = shape.rank();
+            // Use a reversed permutation as a simple valid perm.
+            let perm: Vec<usize> = (0..rank).rev().collect();
+            let permuted = shape.permute(&perm);
+            prop_assert_eq!(shape.numel(), permuted.numel());
+        }
+
+        #[test]
+        fn prop_permute_roundtrip(dims in dims_strategy()) {
+            let shape = TensorShape::row_major(&dims);
+            let rank = shape.rank();
+            let perm: Vec<usize> = (0..rank).rev().collect();
+            let permuted = shape.permute(&perm);
+            let restored = permuted.permute(&perm); // reverse of reverse = identity
+            prop_assert_eq!(shape.dims(), restored.dims());
+            prop_assert_eq!(shape.strides(), restored.strides());
+        }
+
+        #[test]
+        fn prop_reshape_roundtrip(dims in dims_strategy()) {
+            let shape = TensorShape::row_major(&dims);
+            let numel = shape.numel();
+            if numel == 0 {
+                return Ok(());
+            }
+            // Flatten to 1-D and reshape back.
+            let flat = shape.reshape(&[numel]).unwrap();
+            prop_assert_eq!(flat.numel(), numel);
+            let restored = flat.reshape(&dims).unwrap();
+            prop_assert_eq!(restored.dims(), shape.dims());
+        }
+
+        #[test]
+        fn prop_slice_axis_numel(dims in dims_strategy()) {
+            let shape = TensorShape::row_major(&dims);
+            // Slice the first axis at 0..1 (single element along that axis).
+            let (sliced, _offset) = shape.slice_axis(0, 0, 1);
+            let expected_numel = shape.numel() / dims[0];
+            prop_assert_eq!(sliced.numel(), expected_numel);
+        }
+
+        #[test]
+        fn prop_col_major_same_numel(dims in dims_strategy()) {
+            let row = TensorShape::row_major(&dims);
+            let col = TensorShape::col_major(&dims);
+            prop_assert_eq!(row.numel(), col.numel());
+            prop_assert_eq!(row.dims(), col.dims());
+        }
+    }
 
     #[test]
     fn shape_row_major_strides() {

@@ -56,6 +56,12 @@ Five `trybuild`-based compile-fail tests added in `tests/compile_fail/`:
 - `slice_view_outlives_tensor` — sliced view cannot be used after the original tensor is moved
 - `matref_outlives_tensor` — `MatRef` cannot be used after the tensor is moved
 
-### 7. No `proptest` property-based tests yet
+### 7. ~~No `proptest` property-based tests yet~~ (RESOLVED)
 
-The tech spec (section 13.2) requires `proptest`-based property tests for `TensorShape` (offset bounds, permutation numel preservation). The `proptest` dev-dependency is declared but no property tests have been written yet.
+Six `proptest` property-based tests added to `shape.rs`:
+- `prop_offset_within_bounds` — offset for any valid multi-index is within numel
+- `prop_permute_preserves_numel` — permutation never changes element count
+- `prop_permute_roundtrip` — double-reverse permutation restores original shape
+- `prop_reshape_roundtrip` — flatten then reshape back recovers original dims
+- `prop_slice_axis_numel` — slicing one element along axis divides numel by that axis size
+- `prop_col_major_same_numel` — row-major and col-major have same numel and dims
