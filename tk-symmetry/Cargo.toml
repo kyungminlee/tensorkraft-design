@@ -1,0 +1,19 @@
+[package]
+name = "tk-symmetry"
+version = "0.1.0"
+edition = "2021"
+description = "Quantum number types, block-sparse tensor format, and sector-lookup infrastructure for tensorkraft"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+su2-symmetry = []
+
+[dependencies]
+tk-core = { path = "../tk-core" }
+smallvec = "1"
+hashbrown = "0.15"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

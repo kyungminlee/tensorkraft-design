@@ -1,0 +1,464 @@
+//! `BlockSparseTensor<T, Q>` — Abelian block-sparse tensor.
+
+use smallvec::SmallVec;
+use tk_core::{DenseTensor, Scalar, TensorShape};
+
+use crate::flux::{check_flux_rule, enumerate_valid_sectors};
+use crate::quantum_number::{BitPackable, LegDirection};
+use crate::sector_key::{PackedSectorKey, QIndex};
+
+/// Block-sparse tensor for systems with Abelian symmetry Q.
+///
+/// Data is partitioned into dense sub-blocks, one per symmetry sector.
+/// Only blocks satisfying the flux rule are stored; all others are zero.
+///
+/// INVARIANT: `sector_keys` is sorted in ascending order at all times.
+/// Any operation that modifies `sector_keys` must restore this invariant.
+pub struct BlockSparseTensor<T: Scalar, Q: BitPackable> {
+    /// `QIndex` for each tensor leg. `len() == rank`.
+    indices: Vec<QIndex<Q>>,
+    /// Sorted sector keys (packed multi-leg quantum-number tuples).
+    /// Parallel to `sector_blocks`.
+    sector_keys: Vec<PackedSectorKey>,
+    /// Dense sub-blocks, one per sector.
+    /// `sector_blocks[i]` corresponds to `sector_keys[i]`.
+    sector_blocks: Vec<DenseTensor<'static, T>>,
+    /// Total charge of the tensor. Non-zero for e.g. creation operators.
+    flux: Q,
+    /// Leg directions for flux rule validation.
+    leg_directions: Vec<LegDirection>,
+}
+
+impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
+    /// Construct a zero tensor with the given leg bases and flux.
+    /// Automatically enumerates all sectors satisfying the flux rule
+    /// and allocates zero-filled `DenseTensor` blocks for each.
+    pub fn zeros(indices: Vec<QIndex<Q>>, flux: Q, leg_directions: Vec<LegDirection>) -> Self {
+        debug_assert_eq!(
+            indices.len(),
+            leg_directions.len(),
+            "indices and leg_directions must have the same length"
+        );
+
+        let valid_sectors = enumerate_valid_sectors(&indices, &flux, &leg_directions);
+        let mut sector_keys = Vec::with_capacity(valid_sectors.len());
+        let mut sector_blocks = Vec::with_capacity(valid_sectors.len());
+
+        for sector_qns in &valid_sectors {
+            let key = PackedSectorKey::pack(sector_qns);
+            let dims: Vec<usize> = sector_qns
+                .iter()
+                .zip(indices.iter())
+                .map(|(q, idx)| idx.dim_of(q).expect("quantum number not found in QIndex"))
+                .collect();
+            let shape = TensorShape::row_major(&dims);
+            sector_keys.push(key);
+            sector_blocks.push(DenseTensor::zeros(shape));
+        }
+
+        // Sort by key, keeping blocks in sync
+        let mut paired: Vec<_> = sector_keys
+            .into_iter()
+            .zip(sector_blocks.into_iter())
+            .collect();
+        paired.sort_by_key(|(k, _)| *k);
+
+        let (sector_keys, sector_blocks): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+
+        let tensor = BlockSparseTensor {
+            indices,
+            sector_keys,
+            sector_blocks,
+            flux,
+            leg_directions,
+        };
+
+        #[cfg(debug_assertions)]
+        tensor.assert_invariants();
+
+        tensor
+    }
+
+    /// Construct from an explicit list of (sector_key, block) pairs.
+    /// Panics in debug mode if any block violates the flux rule,
+    /// or if sector_keys are not unique.
+    pub fn from_blocks(
+        indices: Vec<QIndex<Q>>,
+        flux: Q,
+        leg_directions: Vec<LegDirection>,
+        blocks: Vec<(Vec<Q>, DenseTensor<'static, T>)>,
+    ) -> Self {
+        let mut sector_keys = Vec::with_capacity(blocks.len());
+        let mut sector_blocks = Vec::with_capacity(blocks.len());
+
+        for (qns, block) in blocks {
+            #[cfg(debug_assertions)]
+            {
+                assert!(
+                    check_flux_rule(&qns, &flux, &leg_directions),
+                    "flux rule violated for sector {:?}",
+                    qns,
+                );
+                // Verify block dimensions match QIndex sectors
+                for (i, q) in qns.iter().enumerate() {
+                    let expected = indices[i]
+                        .dim_of(q)
+                        .expect("quantum number not found in QIndex");
+                    assert_eq!(
+                        block.shape().dims()[i],
+                        expected,
+                        "block dim mismatch on leg {}: expected {}, got {}",
+                        i,
+                        expected,
+                        block.shape().dims()[i],
+                    );
+                }
+            }
+            let key = PackedSectorKey::pack(&qns);
+            sector_keys.push(key);
+            sector_blocks.push(block);
+        }
+
+        // Sort by key
+        let mut paired: Vec<_> = sector_keys
+            .into_iter()
+            .zip(sector_blocks.into_iter())
+            .collect();
+        paired.sort_by_key(|(k, _)| *k);
+
+        let (sector_keys, sector_blocks): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+
+        #[cfg(debug_assertions)]
+        {
+            // Check no duplicate keys
+            for i in 1..sector_keys.len() {
+                assert_ne!(
+                    sector_keys[i - 1],
+                    sector_keys[i],
+                    "duplicate sector key"
+                );
+            }
+        }
+
+        let tensor = BlockSparseTensor {
+            indices,
+            sector_keys,
+            sector_blocks,
+            flux,
+            leg_directions,
+        };
+
+        #[cfg(debug_assertions)]
+        tensor.assert_invariants();
+
+        tensor
+    }
+
+    /// O(log N) immutable block lookup. Returns `None` if the sector is absent
+    /// (which means all elements in that sector are zero).
+    #[inline(always)]
+    pub fn get_block(&self, sector_qns: &[Q]) -> Option<&DenseTensor<'static, T>> {
+        let key = PackedSectorKey::pack(sector_qns);
+        self.sector_keys
+            .binary_search(&key)
+            .ok()
+            .map(|idx| &self.sector_blocks[idx])
+    }
+
+    /// O(log N) mutable block lookup.
+    #[inline(always)]
+    pub fn get_block_mut(&mut self, sector_qns: &[Q]) -> Option<&mut DenseTensor<'static, T>> {
+        let key = PackedSectorKey::pack(sector_qns);
+        self.sector_keys
+            .binary_search(&key)
+            .ok()
+            .map(|idx| &mut self.sector_blocks[idx])
+    }
+
+    /// Insert or overwrite a block. Maintains the sorted key invariant.
+    pub fn insert_block(&mut self, sector_qns: Vec<Q>, block: DenseTensor<'static, T>) {
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                check_flux_rule(&sector_qns, &self.flux, &self.leg_directions),
+                "flux rule violated for sector {:?}",
+                sector_qns,
+            );
+        }
+
+        let key = PackedSectorKey::pack(&sector_qns);
+        match self.sector_keys.binary_search(&key) {
+            Ok(idx) => {
+                // Overwrite existing block
+                self.sector_blocks[idx] = block;
+            }
+            Err(idx) => {
+                // Insert at sorted position
+                self.sector_keys.insert(idx, key);
+                self.sector_blocks.insert(idx, block);
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        self.assert_invariants();
+    }
+
+    /// Iterator over all non-zero (sector_qns, block) pairs.
+    pub fn iter_blocks(
+        &self,
+    ) -> impl Iterator<Item = (SmallVec<[Q; 8]>, &DenseTensor<'static, T>)> {
+        let rank = self.rank();
+        self.sector_keys
+            .iter()
+            .zip(self.sector_blocks.iter())
+            .map(move |(key, block)| (key.unpack::<Q>(rank), block))
+    }
+
+    /// Iterator over all non-zero (key, block) pairs by packed key.
+    pub fn iter_keyed_blocks(
+        &self,
+    ) -> impl Iterator<Item = (PackedSectorKey, &DenseTensor<'static, T>)> {
+        self.sector_keys.iter().copied().zip(self.sector_blocks.iter())
+    }
+
+    /// Number of tensor legs.
+    pub fn rank(&self) -> usize {
+        self.indices.len()
+    }
+
+    /// Number of non-zero sectors.
+    pub fn n_sectors(&self) -> usize {
+        self.sector_blocks.len()
+    }
+
+    /// The tensor's flux (total charge).
+    pub fn flux(&self) -> &Q {
+        &self.flux
+    }
+
+    /// Read-only access to leg indices.
+    pub fn indices(&self) -> &[QIndex<Q>] {
+        &self.indices
+    }
+
+    /// Read-only access to leg directions.
+    pub fn leg_directions(&self) -> &[LegDirection] {
+        &self.leg_directions
+    }
+
+    /// Read-only access to the sorted sector keys.
+    pub fn sector_keys(&self) -> &[PackedSectorKey] {
+        &self.sector_keys
+    }
+
+    /// Read-only access to the sector blocks.
+    pub fn sector_blocks(&self) -> &[DenseTensor<'static, T>] {
+        &self.sector_blocks
+    }
+
+    /// Total stored element count (sum of all block sizes).
+    pub fn nnz(&self) -> usize {
+        self.sector_blocks.iter().map(|b| b.numel()).sum()
+    }
+
+    /// Maximum dimension across all sectors on one leg.
+    pub fn max_sector_dim_on_leg(&self, leg: usize) -> usize {
+        self.indices[leg]
+            .iter_sectors()
+            .map(|(_, _, dim)| dim)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Permute tensor legs. Returns a new tensor with rearranged `QIndices`
+    /// and re-packed sector keys. Block data is permuted via `DenseTensor::permute`
+    /// (zero-copy stride permutation, materialized via `into_owned`).
+    pub fn permute(&self, perm: &[usize]) -> Self {
+        debug_assert_eq!(perm.len(), self.rank());
+
+        let new_indices: Vec<_> = perm.iter().map(|&i| self.indices[i].clone()).collect();
+        let new_directions: Vec<_> = perm.iter().map(|&i| self.leg_directions[i]).collect();
+        let rank = self.rank();
+
+        let mut new_keys = Vec::with_capacity(self.n_sectors());
+        let mut new_blocks = Vec::with_capacity(self.n_sectors());
+
+        for (key, block) in self.sector_keys.iter().zip(self.sector_blocks.iter()) {
+            let old_qns: SmallVec<[Q; 8]> = key.unpack(rank);
+            let new_qns: SmallVec<[Q; 8]> = perm.iter().map(|&i| old_qns[i].clone()).collect();
+            let new_key = PackedSectorKey::pack(&new_qns);
+            let new_block = block.permute(perm).into_owned();
+            new_keys.push(new_key);
+            new_blocks.push(new_block);
+        }
+
+        // Re-sort by key
+        let mut paired: Vec<_> = new_keys.into_iter().zip(new_blocks.into_iter()).collect();
+        paired.sort_by_key(|(k, _)| *k);
+        let (sector_keys, sector_blocks): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+
+        BlockSparseTensor {
+            indices: new_indices,
+            sector_keys,
+            sector_blocks,
+            flux: self.flux.clone(),
+            leg_directions: new_directions,
+        }
+    }
+
+    /// Verify internal invariants (debug/test builds only).
+    #[cfg(debug_assertions)]
+    pub fn assert_invariants(&self) {
+        // 1. sector_keys is strictly sorted
+        for i in 1..self.sector_keys.len() {
+            assert!(
+                self.sector_keys[i - 1] < self.sector_keys[i],
+                "sector_keys not strictly sorted at index {}",
+                i,
+            );
+        }
+
+        // 2. Each block's shape matches the QIndex sectors
+        let rank = self.rank();
+        for (key, block) in self.sector_keys.iter().zip(self.sector_blocks.iter()) {
+            let qns: SmallVec<[Q; 8]> = key.unpack(rank);
+            for (leg, q) in qns.iter().enumerate() {
+                let expected_dim = self.indices[leg]
+                    .dim_of(q)
+                    .unwrap_or_else(|| panic!("sector {:?} not found in leg {}", q, leg));
+                assert_eq!(
+                    block.shape().dims()[leg],
+                    expected_dim,
+                    "block dim mismatch on leg {} for sector {:?}",
+                    leg,
+                    q,
+                );
+            }
+        }
+
+        // 3. Each sector satisfies the flux rule
+        for key in &self.sector_keys {
+            let qns: SmallVec<[Q; 8]> = key.unpack(rank);
+            assert!(
+                check_flux_rule(&qns, &self.flux, &self.leg_directions),
+                "flux rule violated for sector {:?}",
+                qns,
+            );
+        }
+    }
+
+    /// Construct from pre-sorted raw parts. Used by `unflatten`.
+    ///
+    /// # Safety contract (debug-checked)
+    /// - `sector_keys` must be sorted and have no duplicates.
+    /// - Each block must satisfy the flux rule.
+    pub(crate) fn from_raw_parts(
+        indices: Vec<QIndex<Q>>,
+        sector_keys: Vec<PackedSectorKey>,
+        sector_blocks: Vec<DenseTensor<'static, T>>,
+        flux: Q,
+        leg_directions: Vec<LegDirection>,
+    ) -> Self {
+        let tensor = BlockSparseTensor {
+            indices,
+            sector_keys,
+            sector_blocks,
+            flux,
+            leg_directions,
+        };
+
+        #[cfg(debug_assertions)]
+        tensor.assert_invariants();
+
+        tensor
+    }
+}
+
+impl<T: Scalar, Q: BitPackable> std::fmt::Debug for BlockSparseTensor<T, Q> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockSparseTensor")
+            .field("rank", &self.rank())
+            .field("n_sectors", &self.n_sectors())
+            .field("nnz", &self.nnz())
+            .field("flux", &self.flux)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builtins::U1;
+    use crate::quantum_number::QuantumNumber;
+
+    fn make_test_indices() -> (Vec<QIndex<U1>>, Vec<LegDirection>) {
+        let idx = QIndex::new(vec![(U1(-1), 2), (U1(0), 3), (U1(1), 2)]);
+        let indices = vec![idx.clone(), idx.clone(), idx.clone()];
+        let dirs = vec![
+            LegDirection::Incoming,
+            LegDirection::Incoming,
+            LegDirection::Outgoing,
+        ];
+        (indices, dirs)
+    }
+
+    #[test]
+    fn block_sparse_zeros_valid_sectors() {
+        let (indices, dirs) = make_test_indices();
+        let t = BlockSparseTensor::<f64, U1>::zeros(indices, U1::identity(), dirs);
+        // All sectors should satisfy the flux rule
+        assert!(t.n_sectors() > 0);
+        assert_eq!(t.nnz(), t.sector_blocks.iter().map(|b| b.numel()).sum::<usize>());
+    }
+
+    #[test]
+    fn block_sparse_get_block_present() {
+        let (indices, dirs) = make_test_indices();
+        let t = BlockSparseTensor::<f64, U1>::zeros(indices, U1::identity(), dirs);
+        // U1(0) + U1(0) - U1(0) = 0 should be a valid sector
+        let block = t.get_block(&[U1(0), U1(0), U1(0)]);
+        assert!(block.is_some());
+        let block = block.unwrap();
+        assert_eq!(block.shape().dims(), &[3, 3, 3]);
+    }
+
+    #[test]
+    fn block_sparse_get_block_absent() {
+        let (indices, dirs) = make_test_indices();
+        let t = BlockSparseTensor::<f64, U1>::zeros(indices, U1::identity(), dirs);
+        // U1(0) + U1(0) - U1(1) = -1 ≠ 0, so this sector should be absent
+        assert!(t.get_block(&[U1(0), U1(0), U1(1)]).is_none());
+    }
+
+    #[test]
+    fn block_sparse_sector_key_sorted() {
+        let (indices, dirs) = make_test_indices();
+        let mut t = BlockSparseTensor::<f64, U1>::zeros(indices, U1::identity(), dirs);
+        // Insert a block — keys should remain sorted
+        let block = DenseTensor::<f64>::zeros(TensorShape::row_major(&[2, 3, 2]));
+        t.insert_block(vec![U1(-1), U1(0), U1(-1)], block);
+        for i in 1..t.sector_keys.len() {
+            assert!(t.sector_keys[i - 1] < t.sector_keys[i]);
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "flux rule violated")]
+    fn block_sparse_flux_rule_enforced() {
+        let (indices, dirs) = make_test_indices();
+        let mut t = BlockSparseTensor::<f64, U1>::zeros(indices, U1::identity(), dirs);
+        // U1(0) + U1(0) - U1(1) = -1 ≠ 0 — should panic
+        let block = DenseTensor::<f64>::zeros(TensorShape::row_major(&[3, 3, 2]));
+        t.insert_block(vec![U1(0), U1(0), U1(1)], block);
+    }
+
+    #[test]
+    fn block_sparse_permute_numel() {
+        let (indices, dirs) = make_test_indices();
+        let t = BlockSparseTensor::<f64, U1>::zeros(indices, U1::identity(), dirs);
+        let original_nnz = t.nnz();
+        let permuted = t.permute(&[2, 0, 1]);
+        assert_eq!(permuted.nnz(), original_nnz);
+    }
+}
