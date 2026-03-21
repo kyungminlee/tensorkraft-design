@@ -433,12 +433,23 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
 
     /// Fuse (combine) a contiguous range of legs into one combined leg.
     /// The combined QIndex has sectors given by all valid fused quantum numbers.
+    /// The fused quantum number for a combination (q_i, q_{i+1}, ...) is computed
+    /// respecting the original leg directions: Incoming contributes q, Outgoing
+    /// contributes q.dual(). The fused leg direction is always Incoming.
     /// Used to reshape MPS tensors before GEMM.
     pub fn fuse_legs(&self, legs: std::ops::Range<usize>) -> Self;
 
     /// Split one fused leg back into its component legs.
-    /// Inverse of fuse_legs. Requires the original QIndex information.
-    pub fn split_leg(&self, leg: usize, original_indices: Vec<QIndex<Q>>) -> Self;
+    /// Inverse of fuse_legs. Requires the original QIndex and direction information
+    /// for each sub-leg. The directions are needed to reconstruct the fuse map
+    /// (which quantum-number combinations map to which fused quantum number and
+    /// at what offset within the fused dimension).
+    pub fn split_leg(
+        &self,
+        leg: usize,
+        original_indices: Vec<QIndex<Q>>,
+        original_directions: Vec<LegDirection>,
+    ) -> Self;
 }
 ```
 
