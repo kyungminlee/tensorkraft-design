@@ -11,12 +11,12 @@
 
 `tk-symmetry` implements the quantum number types, block-sparse tensor format, and sector-lookup infrastructure that enable symmetry-exploiting algorithms throughout the tensorkraft workspace. It sits directly above `tk-core` in the dependency graph and is consumed by `tk-linalg`, `tk-contract`, and all higher-level crates.
 
-**Core responsibility:** Represent the algebraic structure of physical symmetries (conservation laws) and expose tensors whose storage is partitioned into dense sub-blocks indexed by quantum number tuples (sectors). Only non-zero blocks are stored or computed.
+**Core responsibility:** Represent the algebraic structure of physical symmetries (conservation laws) and expose tensors whose storage is partitioned into dense sub-blocks indexed by quantum number tuples (sectors). Only non-zero blocks are stored or computed. A dual-layout storage strategy supports both structural mutations (fragmented `Vec<DenseTensor<T>>`) and GPU-optimized DMA transfers (contiguous `FlatBlockStorage` packed into pinned arena memory).
 
 **Performance motivation:** In a system with U(1) charge conservation, roughly 1/√N of tensor entries are non-zero at each charge sector. Exploiting block-sparsity yields O(1/√N) memory reduction and O(N^{1/2}) speedup in GEMM — order-of-magnitude gains for large bond dimensions.
 
 **Dependencies:**
-- `tk-core` — `Scalar`, `DenseTensor`, `TensorShape`, `TkError`
+- `tk-core` — `Scalar`, `DenseTensor`, `TensorShape`, `TkError`, `SweepArena` (for arena-backed `flatten()`)
 - `smallvec` — stack-allocated vectors for sector keys
 - `hashbrown` — fast HashMap for sector metadata
 - `thiserror` — error derive macros
@@ -35,6 +35,7 @@ tk-symmetry/
     ├── builtins.rs         U1, Z2, U1Z2 implementations
     ├── sector_key.rs       PackedSectorKey, QIndex
     ├── block_sparse.rs     BlockSparseTensor<T, Q>
+    ├── flat_storage.rs     FlatBlockStorage, dual-layout flatten/unflatten
     ├── formats.rs          Sparsity format enum, conversion utilities
     ├── flux.rs             Flux rule validation, sector enumeration
     └── su2/
@@ -441,7 +442,66 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
 }
 ```
 
-### 7.5 Flux Rule Validation
+### 7.5 Dual-Layout Block Storage (Phase 4)
+
+The current `Vec<DenseTensor<T>>` per-block storage (the **mutation layout**) is adequate for CPU-only Phases 1–3. For GPU transfers in Phase 5, hundreds of individually-allocated blocks would require either hundreds of small `cudaMemcpyAsync` calls (terrible PCIe utilization) or manual gathering into a staging buffer.
+
+The architecture distinguishes two storage layouts:
+
+- **Mutation Layout (fragmented, default):** `Vec<DenseTensor<T>>` — each block is an independent heap allocation. Optimal for structural mutations (e.g., appending columns during TDVP subspace expansion is O(D_sector²) because only the affected block is reallocated).
+- **Compute Layout (contiguous, read-only):** A single flat buffer with an offset table, optimized for GPU DMA and cache-friendly GEMM dispatch. Structural mutations on this layout are forbidden (would require O(D_total²) memory shift).
+
+```rust
+/// Compute-side read-only block storage: all sector data in one contiguous allocation.
+/// Enables single-DMA GPU transfer of the entire tensor.
+/// NOT used during structural mutations (subspace expansion); see mutation layout.
+pub struct FlatBlockStorage<'a, T: Scalar> {
+    /// Single contiguous buffer containing all sector blocks back-to-back.
+    /// Allocated from SweepArena (pinned memory when backend-cuda is active),
+    /// NOT from the pageable heap. This guarantees DMA-capable memory for
+    /// GPU transfers without the NVIDIA driver's hidden pin-copy-unpin dance.
+    data: &'a mut [T],
+    /// Start index of each sector block within `data`.
+    /// offsets[i] is the start index of sector_keys[i]'s block data.
+    offsets: Vec<usize>,
+    /// Dimensions (rows, cols) of each sector block.
+    shapes: Vec<(usize, usize)>,
+}
+
+impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
+    /// Pack fragmented blocks into a contiguous flat buffer for GPU/GEMM.
+    /// Called after structural mutations are complete, before dispatch.
+    ///
+    /// CRITICAL: The flat buffer is allocated from the SweepArena, NOT from
+    /// fresh pageable heap memory. When `backend-cuda` is active, the arena
+    /// uses pinned memory, so the resulting buffer is directly DMA-capable —
+    /// no hidden staging copy by the NVIDIA driver.
+    ///
+    /// Cost: O(D_total²) — a single memcpy pass, negligible relative to
+    /// the O(D³) GEMM it feeds.
+    pub fn flatten<'a>(&self, arena: &'a SweepArena) -> FlatBlockStorage<'a, T> {
+        let total_elems = self.sector_blocks.iter().map(|b| b.num_elements()).sum();
+        let buf = arena.alloc_slice::<T>(total_elems);
+        let mut offset = 0;
+        let mut offsets = Vec::with_capacity(self.sector_blocks.len());
+        let mut shapes = Vec::with_capacity(self.sector_blocks.len());
+        for block in &self.sector_blocks {
+            offsets.push(offset);
+            shapes.push((block.rows(), block.cols()));
+            buf[offset..offset + block.num_elements()].copy_from_slice(block.as_slice());
+            offset += block.num_elements();
+        }
+        FlatBlockStorage { data: buf, offsets, shapes }
+    }
+
+    /// Restore fragmented layout from flat buffer (e.g., after GPU computation).
+    pub fn unflatten(flat: &FlatBlockStorage<T>, keys: &[PackedSectorKey]) -> Self { /* ... */ }
+}
+```
+
+**Transition flow during a TDVP step:** (1) subspace expansion mutates A_L in fragmented layout → (2) `A_L.flatten(&arena)` packs into the arena's pinned memory → (3) GEMM/GPU operates on the flat buffer (DMA-direct, no staging copy) → (4) results unflattened back to mutable layout for the next step → (5) `SweepArena::reset()` reclaims the flat buffer in O(1). The `SparseLinAlgBackend` trait takes `&BlockSparseTensor` as an opaque input, so the internal layout switching is invisible to callers.
+
+### 7.6 Flux Rule Validation
 
 ```rust
 /// Verify that a given multi-index sector satisfies the tensor's flux rule.
@@ -619,12 +679,15 @@ impl ClebschGordanCache {
 /// Only the reduced matrix elements are stored; the CG coefficients are
 /// looked up from the cache at contraction time.
 pub struct WignerEckartTensor<T: Scalar> {
+    /// Clebsch-Gordan / 6j / 9j structural coefficient evaluator.
+    /// The core contraction engine includes an optional `structural_contraction`
+    /// callback from day one: the Abelian code path passes a no-op (zero overhead);
+    /// the SU(2) code path injects symbol evaluations via this cache.
+    structural: ClebschGordanCache,
     /// Reduced matrix elements, stored as a block-sparse tensor with SU2Irrep sectors.
     /// Uses SmallVec-keyed storage (not PackedSectorKey) because SU2Irrep
     /// is not BitPackable.
     reduced: HashMap<SmallVec<[SU2Irrep; 6]>, DenseTensor<T>>,
-    /// Shared Clebsch-Gordan cache (Arc for multi-thread sharing across sweeps).
-    cg_cache: std::sync::Arc<ClebschGordanCache>,
     /// Tensor flux (irrep of the operator).
     flux: SU2Irrep,
 }
@@ -634,11 +697,13 @@ pub struct WignerEckartTensor<T: Scalar> {
 
 These items are scoped to the `su2-symmetry` feature flag and do not affect the Abelian code path:
 
-**Fusion-rule multiplicity (task generation fan-out):** The Abelian block-sparse GEMM in `tk-linalg` assumes `compute_fusion_rule(key_a, key_b) -> Option<PackedSectorKey>` (one-to-one). For SU(2), j₁ ⊗ j₂ produces multiple output irreps. The `SectorGemmTask` generation loop must produce `Vec<SectorGemmTask>` per input pair, each weighted by the corresponding Clebsch-Gordan coefficient. The `structural_contraction` callback in `tk-contract` is the injection point for this coefficient evaluation.
+**Fusion-rule multiplicity (task generation fan-out):** The Abelian block-sparse GEMM in `tk-linalg` assumes `compute_fusion_rule(key_a, key_b) -> Option<PackedSectorKey>` (one-to-one). For SU(2), j₁ ⊗ j₂ produces multiple output irreps: j₁ ⊗ j₂ = |j₁−j₂| ⊕ (|j₁−j₂|+1) ⊕ ... ⊕ (j₁+j₂). The `SectorGemmTask` generation loop must produce `Vec<SectorGemmTask>` per input pair, each weighted by the corresponding Clebsch-Gordan coefficient. The `structural_contraction` callback in `tk-contract` is the injection point for this coefficient evaluation.
 
-**Output-sector collision hazard (map-reduce):** Multiple input pairs (j_a, j_b) can map to the same output sector j_c. Naive parallel dispatch creates a data race. Task generation must group tasks by output sector key and reduce (accumulate) partial contributions before writing. This is a structural change to the LPT scheduling phase in `tk-linalg`.
+**Task generation memory bound:** The combinatorial fan-out of the map-reduce pattern is bounded by the physics. In SU(2)-symmetric DMRG, the number of distinct irreps at a given bond (D_reduced) is typically 10–50 even at large total bond dimensions, because many states share the same j label. The fan-out per input pair is at most (2·j_max + 1) output sectors. The total task count before reduction is therefore O(D_reduced² × j_max). For j_max = 10 and D_reduced = 50, this yields ~250,000 tasks at ~64 bytes each ≈ 16 MB — well within L3 cache and posing no allocation pressure. The task vector should be pre-allocated with `Vec::with_capacity(d_reduced * d_reduced * (2 * j_max + 1))` to avoid incremental reallocation during the generation loop. For exotic high-spin models with j_max > 50 or D_reduced > 200, a streaming/chunked reduction should be considered, but this is outside the scope of Phase 5 targets.
 
-**Multiplet-aware SVD truncation:** Singular values in SU(2)-symmetric DMRG come in degenerate multiplets of dimension 2j+1. Truncation must snap to multiplet boundaries. The `svd_truncated` logic must implement a two-phase approach:
+**Output-sector collision hazard (map-reduce):** Multiple input pairs (j_a, j_b) can map to the same output sector j_c. Naive parallel dispatch via `par_iter` creates a data race: two threads writing to the same output block. The SU(2) task generation must use a map-reduce pattern — group tasks by output sector key, then accumulate (reduce) partial contributions within each group before writing the final block. This is a structural change to the LPT scheduling phase in `tk-linalg` that does not affect the Abelian code path, where fusion is always one-to-one.
+
+**Multiplet-aware SVD truncation:** Singular values in SU(2)-symmetric DMRG come in degenerate multiplets of dimension 2j+1. Truncation must keep or discard entire multiplets — splitting a multiplet explicitly breaks the symmetry and crashes the simulation. The `svd_truncated` logic must implement a two-phase approach:
 1. Sort singular values by magnitude.
 2. Snap the truncation boundary to the nearest multiplet edge (never split a multiplet).
 3. Weight discarded singular values by (2j+1)·σ_j² when computing truncation error.
@@ -687,6 +752,7 @@ pub mod quantum_number;
 pub mod builtins;
 pub mod sector_key;
 pub mod block_sparse;
+pub mod flat_storage;
 pub mod formats;
 pub mod flux;
 pub mod error;
@@ -699,6 +765,7 @@ pub use quantum_number::{QuantumNumber, BitPackable, LegDirection};
 pub use builtins::{U1, Z2, U1Z2, U1Wide};
 pub use sector_key::{PackedSectorKey, PackedSectorKey128, QIndex};
 pub use block_sparse::BlockSparseTensor;
+pub use flat_storage::FlatBlockStorage;
 pub use formats::SparsityFormat;
 pub use error::{SymmetryError, SymResult};
 
@@ -741,6 +808,9 @@ No other `tk-symmetry`-specific feature flags. The `parallel` and backend flags 
 | `enumerate_sectors_completeness` | All valid sectors for a rank-3 U1 tensor are found |
 | `check_flux_rule_correct` | Correct sectors pass; flux-violating sectors fail |
 | `qindex_offset_of` | `offset_of` returns correct cumulative offsets |
+| `flatten_contiguous_data` | `flatten()` produces contiguous buffer matching element-by-element iteration over fragmented blocks |
+| `unflatten_round_trip` | `unflatten(flatten(tensor))` recovers original blocks exactly |
+| `flatten_offsets_correct` | Each offset in `FlatBlockStorage` matches the cumulative element count |
 
 ### 14.2 Property-Based Tests
 
@@ -785,6 +855,7 @@ This is called at the end of every constructor and mutation in debug/test builds
 | `get_block` | O(log N) — binary search over sorted `Vec<u64>`; no allocations |
 | `pack` for rank-8 U1 tensor | Single loop, ≤ 8 shifts and ORs — should compile to ~8 instructions |
 | `BlockSparseTensor::zeros` construction | One-time cost; not on hot path |
+| `flatten` | O(D_total²) single memcpy pass; negligible relative to O(D³) GEMM it feeds |
 | `SU2Irrep::fuse_all` | Returns an iterator; no heap allocation |
 
 CI Criterion benchmarks must verify that `get_block` on a 100-sector tensor completes in < 10 ns.
