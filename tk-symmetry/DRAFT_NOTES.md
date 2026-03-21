@@ -6,7 +6,7 @@ This is a draft implementation of the `tk-symmetry` crate based on the tech spec
 (`techspec/2_tech-spec_tk-symmetry.md`) and the architecture design document
 (`tensorkraft_architecture_design_v8_4.md`).
 
-**Status:** All source files compile. 33 unit tests pass (including SU(2) tests
+**Status:** All source files compile. 40 unit tests pass (including SU(2) tests
 behind the `su2-symmetry` feature flag).
 
 ## What is implemented
@@ -17,7 +17,7 @@ behind the `su2-symmetry` feature flag).
 | `builtins.rs` | Complete | `U1`, `Z2`, `U1Z2`, `U1Wide` with pack/unpack + unit tests |
 | `sector_key.rs` | Complete | `PackedSectorKey`, `PackedSectorKey128`, `QIndex<Q>` |
 | `flux.rs` | Complete | `check_flux_rule`, `enumerate_valid_sectors` with backtracking + last-leg pruning |
-| `block_sparse.rs` | Core done | `BlockSparseTensor<T, Q>` with constructors, sector access, insert, permute, debug invariants |
+| `block_sparse.rs` | Core done | `BlockSparseTensor<T, Q>` with constructors, sector access, insert, permute, fuse_legs, split_leg, debug invariants |
 | `flat_storage.rs` | Core done | `FlatBlockStorage<'a, T>` with `flatten`/`unflatten` round-trip |
 | `formats.rs` | Complete | `SparsityFormat` enum |
 | `error.rs` | Complete | `SymmetryError`, `SymResult` |
@@ -28,10 +28,13 @@ behind the `su2-symmetry` feature flag).
 
 ### BlockSparseTensor
 
-- **`fuse_legs` / `split_leg`**: Not implemented. These structural operations
-  (combining/splitting tensor legs before GEMM) require careful QIndex merging
-  logic and are critical for the DMRG contraction path. The tech spec defines
-  the signatures but the implementation is non-trivial.
+- **`fuse_legs` / `split_leg`**: Implemented. `fuse_legs(Range<usize>)` fuses a
+  contiguous range of legs into one combined leg; `split_leg` reverses it.
+  The fused leg direction is always `Incoming`. `split_leg` takes an additional
+  `original_directions: Vec<LegDirection>` parameter beyond the tech spec signature
+  (needed to reconstruct the fuse map correctly for mixed-direction legs).
+  Round-trip `fuse_legs → split_leg` preserves data exactly. Not yet benchmarked
+  for large tensors.
 
 - **Property-based tests**: The tech spec calls for `proptest`-driven tests
   (e.g., `packed_key_binary_search_finds_inserted`, `u1_fuse_associativity`).
@@ -83,8 +86,8 @@ behind the `su2-symmetry` feature flag).
 
 ## Test coverage
 
-- 33 tests total (with `su2-symmetry` feature)
+- 40 tests total (with `su2-symmetry` feature)
 - Covers: quantum number axioms, pack/unpack round-trips, sector key ordering,
   overflow detection, flux rule validation, sector enumeration, block-sparse
-  construction/access/insert/permute, flatten/unflatten round-trip, SU(2) irrep
+  construction/access/insert/permute/fuse_legs/split_leg, flatten/unflatten round-trip, SU(2) irrep
   algebra, CG coefficient computation
