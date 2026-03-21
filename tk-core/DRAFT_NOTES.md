@@ -31,11 +31,9 @@
 
 The current `alloc_tensor` implementation allocates a `TensorStorage` backed by a heap `Vec<T>` and places it into the bump arena via `bump.alloc(...)`. A production implementation should perform the data allocation itself directly within the bump arena's memory region (pointer-bump only, no `malloc` system call), which requires unsafe pointer management. The current approach still benefits from arena-scoped lifetime tracking but does not achieve the zero-`malloc` performance invariant specified in the tech spec (section 15).
 
-### 2. `DenseTensor::slice_axis` does not adjust the data pointer offset
+### 2. ~~`DenseTensor::slice_axis` does not adjust the data pointer offset~~ (RESOLVED)
 
-`slice_axis` (in `src/tensor.rs`) correctly computes the sliced `TensorShape` and the element offset, but the returned `DenseTensor` still borrows the full underlying storage without advancing the data pointer by the computed offset. A production implementation must return a view whose `.as_slice()` starts at `base_ptr + offset`, which requires either:
-- A `TensorCow::BorrowedSlice(&'a [T])` variant that carries an offset, or
-- Storing an explicit `offset: usize` field in `DenseTensor` and applying it in all data-access methods.
+Fixed by adding an `offset: usize` field to `DenseTensor`. All data-access methods (`as_slice`, `as_mut_slice`, `as_mat_ref`, `as_mat_mut`) apply the offset. `into_owned()` gathers elements into a fresh contiguous buffer when offset is nonzero or layout is non-contiguous. Chained slicing accumulates offsets correctly. Covered by 5 new tests (`slice_axis_offset_correct`, `slice_axis_cols`, `slice_axis_into_owned_gathers_elements`, `slice_axis_chained`, `slice_axis_mat_ref`).
 
 ### 3. `PinnedArena` is a placeholder
 
