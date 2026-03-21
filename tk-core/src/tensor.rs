@@ -4,7 +4,7 @@ use crate::error::{TkError, TkResult};
 use crate::matview::{MatMut, MatRef};
 use crate::scalar::Scalar;
 use crate::shape::TensorShape;
-use crate::storage::{TensorCow, TensorStorage};
+use crate::storage::TensorStorage;
 
 /// The primary N-dimensional dense tensor.
 ///
@@ -16,7 +16,7 @@ use crate::storage::{TensorCow, TensorStorage};
 /// and nonzero for sliced views (produced by `slice_axis`).
 pub struct DenseTensor<'a, T: Scalar> {
     shape: TensorShape,
-    storage: TensorCow<'a, T>,
+    storage: TensorStorage<'a, T>,
     /// Element offset into the storage buffer where this tensor's data begins.
     /// Used by `slice_axis` to create sub-views without copying.
     offset: usize,
@@ -32,7 +32,7 @@ impl<'a, T: Scalar> DenseTensor<'a, T> {
         let n = shape.numel();
         DenseTensor {
             shape,
-            storage: TensorCow::Owned(TensorStorage::zeros(n)),
+            storage: TensorStorage::zeros(n),
             offset: 0,
         }
     }
@@ -51,17 +51,17 @@ impl<'a, T: Scalar> DenseTensor<'a, T> {
         );
         DenseTensor {
             shape,
-            storage: TensorCow::Owned(TensorStorage::from_vec(data)),
+            storage: TensorStorage::from_vec(data),
             offset: 0,
         }
     }
 
-    /// Create a tensor that borrows from existing storage.
-    pub fn borrowed(shape: TensorShape, storage: &'a TensorStorage<T>) -> Self {
-        debug_assert!(storage.len() >= shape.numel());
+    /// Create a tensor that borrows from a slice.
+    pub fn borrowed(shape: TensorShape, data: &'a [T]) -> Self {
+        debug_assert!(data.len() >= shape.numel());
         DenseTensor {
             shape,
-            storage: TensorCow::Borrowed(storage),
+            storage: TensorStorage::from_slice(data),
             offset: 0,
         }
     }
@@ -109,14 +109,12 @@ impl<'a, T: Scalar> DenseTensor<'a, T> {
         // Fast path: already owned, contiguous, at offset 0, and tight.
         let can_move = self.offset == 0
             && self.shape.is_contiguous()
-            && matches!(&self.storage, TensorCow::Owned(s) if s.len() == self.shape.numel());
+            && matches!(&self.storage, TensorStorage::Owned(v) if v.len() == self.shape.numel());
 
         if can_move {
-            // We know storage is Owned and the buffer is exactly right.
-            let storage = self.storage.into_owned();
             return DenseTensor {
                 shape: self.shape,
-                storage: TensorCow::Owned(storage),
+                storage: self.storage.into_owned(),
                 offset: 0,
             };
         }
@@ -126,7 +124,7 @@ impl<'a, T: Scalar> DenseTensor<'a, T> {
         let new_shape = TensorShape::row_major(self.shape.dims());
         DenseTensor {
             shape: new_shape,
-            storage: TensorCow::Owned(TensorStorage::from_vec(data)),
+            storage: TensorStorage::from_vec(data),
             offset: 0,
         }
     }
@@ -213,11 +211,8 @@ impl<'a, T: Scalar> DenseTensor<'a, T> {
     // -- internal helpers --
 
     /// Borrow the underlying storage (regardless of Owned/Borrowed variant).
-    fn borrow_storage(&self) -> TensorCow<'_, T> {
-        match &self.storage {
-            TensorCow::Borrowed(s) => TensorCow::Borrowed(s),
-            TensorCow::Owned(s) => TensorCow::Borrowed(s),
-        }
+    fn borrow_storage(&self) -> TensorStorage<'_, T> {
+        self.storage.borrow()
     }
 
     /// Offset-adjusted immutable data slice.
@@ -231,12 +226,7 @@ impl<'a, T: Scalar> DenseTensor<'a, T> {
     /// Panics if the storage is `Borrowed`.
     fn data_slice_mut(&mut self) -> &mut [T] {
         let offset = self.offset;
-        match &mut self.storage {
-            TensorCow::Owned(s) => &mut s.as_mut_slice()[offset..],
-            TensorCow::Borrowed(_) => {
-                panic!("cannot mutably access borrowed tensor storage; call .into_owned() first")
-            }
-        }
+        &mut self.storage.as_mut_slice()[offset..]
     }
 
     /// Gather all logical elements into a contiguous Vec in row-major order.
@@ -317,16 +307,16 @@ mod tests {
     #[test]
     fn tensor_into_owned() {
         let t = DenseTensor::<f64>::zeros(TensorShape::row_major(&[2, 3]));
-        let storage = TensorStorage::<f64>::zeros(6);
-        let borrowed = DenseTensor::borrowed(TensorShape::row_major(&[2, 3]), &storage);
-        assert!(borrowed.storage.is_borrowed());
+        let data = vec![0.0_f64; 6];
+        let borrowed = DenseTensor::borrowed(TensorShape::row_major(&[2, 3]), &data);
+        assert!(matches!(borrowed.storage, TensorStorage::Borrowed(_)));
         let owned = borrowed.into_owned();
-        assert!(owned.storage.is_owned());
+        assert!(matches!(owned.storage, TensorStorage::Owned(_)));
         assert_eq!(owned.offset(), 0);
 
         // Already owned => no-op
         let still_owned = t.into_owned();
-        assert!(still_owned.storage.is_owned());
+        assert!(matches!(still_owned.storage, TensorStorage::Owned(_)));
     }
 
     #[test]

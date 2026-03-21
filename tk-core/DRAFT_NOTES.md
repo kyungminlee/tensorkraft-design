@@ -14,7 +14,7 @@
 | `src/error.rs` | `TkError` enum (6 variants) and `TkResult<T>` alias |
 | `src/scalar.rs` | `Scalar` trait with `conj`, `abs_sq`, `from_real`, `is_real`; impls for `f32`, `f64`, `Complex<f32>`, `Complex<f64>`; type aliases `C32`, `C64` |
 | `src/shape.rs` | `TensorShape` with `SmallVec<[usize; 6]>` dims/strides; constructors (`row_major`, `col_major`, `with_strides`); methods (`numel`, `rank`, `offset`, `is_contiguous`, `permute`, `reshape`, `slice_axis`) |
-| `src/storage.rs` | `TensorStorage<T>` (owned `Vec<T>` wrapper) and `TensorCow<'a, T>` (`Borrowed`/`Owned` enum) |
+| `src/storage.rs` | `TensorStorage<'a, T>` enum with `Owned(Vec<T>)` / `Borrowed(&'a [T])` variants, Copy-on-Write semantics |
 | `src/tensor.rs` | `DenseTensor<'a, T>` with shape + CoW storage; `TempTensor` alias; methods including `into_owned()`, `as_mat_ref()`, `as_mat_mut()`, `permute()`, `reshape()`, `slice_axis()` |
 | `src/matview.rs` | `MatRef<'a, T>` with lazy `is_conjugated` flag; `MatMut<'a, T>`; zero-copy `adjoint()`, `conjugate()`, `transpose()` |
 | `src/arena.rs` | `SweepArena` with `bumpalo::Bump`; CUDA-gated `ArenaStorage` enum (`Pinned`/`Pageable`); `PinnedArena` placeholder; `Drop` impl releasing pinned budget |
@@ -22,14 +22,14 @@
 
 ## Test Results
 
-- **35 tests pass** (33 base + 2 pinned-memory tests with `backend-cuda`)
+- **43 tests pass** (41 base + 2 pinned-memory tests with `backend-cuda`)
 - Compiles cleanly on both default and `backend-cuda` feature configurations
 
 ## Known Limitations
 
-### 1. `SweepArena::alloc_tensor` uses heap `Vec` internally
+### 1. ~~`SweepArena::alloc_tensor` uses heap `Vec` internally~~ (RESOLVED)
 
-The current `alloc_tensor` implementation allocates a `TensorStorage` backed by a heap `Vec<T>` and places it into the bump arena via `bump.alloc(...)`. A production implementation should perform the data allocation itself directly within the bump arena's memory region (pointer-bump only, no `malloc` system call), which requires unsafe pointer management. The current approach still benefits from arena-scoped lifetime tracking but does not achieve the zero-`malloc` performance invariant specified in the tech spec (section 15).
+Fixed by merging `TensorCow` into `TensorStorage` as a single `Owned(Vec<T>)` / `Borrowed(&'a [T])` enum. `SweepArena::alloc_tensor` now bump-allocates a zeroed slice and wraps it as `TensorStorage::Borrowed`, with the lifetime tied to the arena. No heap `Vec` is created for arena-allocated tensors. `DenseTensor::borrowed()` now takes a `&'a [T]` slice directly.
 
 ### 2. ~~`DenseTensor::slice_axis` does not adjust the data pointer offset~~ (RESOLVED)
 

@@ -9,7 +9,6 @@ use bumpalo::Bump;
 
 use crate::scalar::Scalar;
 use crate::shape::TensorShape;
-use crate::storage::TensorStorage;
 use crate::tensor::DenseTensor;
 
 cfg_if::cfg_if! {
@@ -118,35 +117,11 @@ impl SweepArena {
     ///
     /// The returned tensor's storage lifetime is tied to this arena.
     /// It cannot outlive the arena's current allocation epoch.
+    /// No heap allocation occurs — the data lives entirely in bump memory.
     pub fn alloc_tensor<T: Scalar>(&self, shape: TensorShape) -> DenseTensor<'_, T> {
         let n = shape.numel();
         let slice = self.alloc_slice_zeroed::<T>(n);
-        // SAFETY: We construct a TensorStorage wrapper around the arena slice.
-        // The lifetime is tied to `&self`, enforcing the arena epoch constraint.
-        let storage_ref = unsafe { &*(slice as *const [T] as *const TensorStorage<T>) };
-        // Instead of the unsafe cast above, we use the proper approach:
-        // allocate in the arena and wrap in our types.
-        let _ = storage_ref; // suppress unused
-        self.alloc_tensor_impl(shape, n)
-    }
-
-    fn alloc_tensor_impl<T: Scalar>(&self, shape: TensorShape, n: usize) -> DenseTensor<'_, T> {
-        // Allocate a zero-filled slice from the bump allocator
-        let bump = self.bump();
-        let layout = std::alloc::Layout::array::<T>(n).expect("layout overflow");
-        let ptr = bump.alloc_layout(layout).as_ptr() as *mut T;
-        // Zero-initialize
-        unsafe {
-            std::ptr::write_bytes(ptr, 0, n);
-        }
-        // Create a TensorStorage in the arena
-        let storage = bump.alloc(TensorStorage::from_vec(
-            // We cannot use Vec here since arena memory is not heap-owned.
-            // Instead, we create storage from slice. For this draft, we
-            // use a heap-allocated Vec and store it in the arena.
-            vec![T::zero(); n],
-        ));
-        DenseTensor::borrowed(shape, storage)
+        DenseTensor::borrowed(shape, slice)
     }
 
     /// Allocate a zeroed slice from the arena.

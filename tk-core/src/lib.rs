@@ -28,7 +28,7 @@ pub use error::{TkError, TkResult};
 pub use matview::{MatMut, MatRef};
 pub use scalar::{Scalar, C32, C64};
 pub use shape::TensorShape;
-pub use storage::{TensorCow, TensorStorage};
+pub use storage::TensorStorage;
 pub use tensor::{DenseTensor, TempTensor};
 
 #[cfg(feature = "backend-cuda")]
