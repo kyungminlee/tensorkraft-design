@@ -22,7 +22,8 @@
 
 ## Test Results
 
-- **43 tests pass** (41 base + 2 pinned-memory tests with `backend-cuda`)
+- **49 unit tests pass** on default features (+ 2 pinned-memory tests with `backend-cuda` = 51 total)
+- **5 compile-fail tests** via `trybuild` verify lifetime safety invariants
 - Compiles cleanly on both default and `backend-cuda` feature configurations
 
 ## Known Limitations
@@ -35,19 +36,7 @@ Fixed by merging `TensorCow` into `TensorStorage` as a single `Owned(Vec<T>)` / 
 
 Fixed by adding an `offset: usize` field to `DenseTensor`. All data-access methods (`as_slice`, `as_mut_slice`, `as_mat_ref`, `as_mat_mut`) apply the offset. `into_owned()` gathers elements into a fresh contiguous buffer when offset is nonzero or layout is non-contiguous. Chained slicing accumulates offsets correctly. Covered by 5 new tests (`slice_axis_offset_correct`, `slice_axis_cols`, `slice_axis_into_owned_gathers_elements`, `slice_axis_chained`, `slice_axis_mat_ref`).
 
-### 3. `PinnedArena` is a placeholder
-
-`PinnedArena` in `src/arena.rs` wraps a standard `bumpalo::Bump` allocator. A real implementation must call `cudaMallocHost` / `cudaFreeHost` via FFI to allocate page-locked memory that is DMA-capable for high-bandwidth GPU transfers. This is blocked on CUDA toolkit bindings and is expected to be implemented in Phase 5.
-
-### 4. `f128` support (`backend-oxiblas`) is not implemented
-
-The `Scalar` trait implementation for `f128` is gated behind the `backend-oxiblas` feature flag but is not yet written. This depends on Rust's `f128` stabilization status and on whether `faer` provides an `f128` GEMM path (open question #2 in the tech spec).
-
-### 5. No `StorageDevice` trait generalization
-
-The tech spec (section 15) describes a future `StorageDevice` trait that parameterizes `TensorStorage<T, D>` over a device type (`HostDevice`, `CudaDevice`, `MpiDevice`). This is deferred to Phase 5. The current `TensorStorage<'a, T>` enum (`Owned(Vec<T>)` / `Borrowed(&'a [T])`) is hardcoded to host memory.
-
-### 6. ~~No compile-fail tests yet~~ (RESOLVED)
+### 3. ~~No compile-fail tests yet~~ (RESOLVED)
 
 Five `trybuild`-based compile-fail tests added in `tests/compile_fail/`:
 - `arena_tensor_outlives_reset` — `TempTensor` cannot be used after `arena.reset()`
@@ -56,7 +45,7 @@ Five `trybuild`-based compile-fail tests added in `tests/compile_fail/`:
 - `slice_view_outlives_tensor` — sliced view cannot be used after the original tensor is moved
 - `matref_outlives_tensor` — `MatRef` cannot be used after the tensor is moved
 
-### 7. ~~No `proptest` property-based tests yet~~ (RESOLVED)
+### 4. ~~No `proptest` property-based tests yet~~ (RESOLVED)
 
 Six `proptest` property-based tests added to `shape.rs`:
 - `prop_offset_within_bounds` — offset for any valid multi-index is within numel
@@ -65,3 +54,15 @@ Six `proptest` property-based tests added to `shape.rs`:
 - `prop_reshape_roundtrip` — flatten then reshape back recovers original dims
 - `prop_slice_axis_numel` — slicing one element along axis divides numel by that axis size
 - `prop_col_major_same_numel` — row-major and col-major have same numel and dims
+
+### 5. `PinnedArena` is a placeholder
+
+`PinnedArena` in `src/arena.rs` wraps a standard `bumpalo::Bump` allocator. A real implementation must call `cudaMallocHost` / `cudaFreeHost` via FFI to allocate page-locked memory that is DMA-capable for high-bandwidth GPU transfers. This is blocked on CUDA toolkit bindings and is expected to be implemented in Phase 5.
+
+### 6. No `StorageDevice` trait generalization
+
+The tech spec (section 15) describes a future `StorageDevice` trait that parameterizes `TensorStorage<T, D>` over a device type (`HostDevice`, `CudaDevice`, `MpiDevice`). This is deferred to Phase 5. The current `TensorStorage<'a, T>` enum (`Owned(Vec<T>)` / `Borrowed(&'a [T])`) is hardcoded to host memory.
+
+### 7. `f128` support (`backend-oxiblas`) is not implemented
+
+The `Scalar` trait implementation for `f128` is gated behind the `backend-oxiblas` feature flag but is not yet written. This depends on Rust's `f128` stabilization status and on whether `faer` provides an `f128` GEMM path (open question #2 in the tech spec).
