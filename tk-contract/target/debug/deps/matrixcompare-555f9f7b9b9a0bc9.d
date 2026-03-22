@@ -1,0 +1,11 @@
+/home/user/tensorkraft-design/tk-contract/target/debug/deps/matrixcompare-555f9f7b9b9a0bc9.d: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/lib.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/matrix_comparison.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/scalar_comparison.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/comparison_failure.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/comparators.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/macros.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/ulp.rs
+
+/home/user/tensorkraft-design/tk-contract/target/debug/deps/libmatrixcompare-555f9f7b9b9a0bc9.rmeta: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/lib.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/matrix_comparison.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/scalar_comparison.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/comparison_failure.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/comparators.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/macros.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/ulp.rs
+
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/lib.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/matrix_comparison.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/scalar_comparison.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/comparison_failure.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/comparators.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/macros.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matrixcompare-0.3.0/src/ulp.rs:

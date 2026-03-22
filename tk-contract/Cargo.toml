@@ -1,0 +1,29 @@
+[package]
+name = "tk-contract"
+version = "0.1.0"
+edition = "2021"
+description = "DAG-based tensor contraction engine for the tensorkraft workspace"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tk-core     = { path = "../tk-core" }
+tk-symmetry = { path = "../tk-symmetry" }
+tk-linalg   = { path = "../tk-linalg" }
+smallvec    = { version = "1", features = ["union"] }
+hashbrown   = "0.15"
+thiserror   = "2"
+cfg-if      = "1"
+log         = "0.4"
+
+[dev-dependencies]
+proptest  = "1"
+approx    = "0.5"
+
+[features]
+default = ["backend-faer", "parallel"]
+backend-faer     = ["tk-linalg/backend-faer"]
+# backend-mkl      = ["tk-linalg/backend-mkl"]
+# backend-openblas = ["tk-linalg/backend-openblas"]
+# backend-cuda     = ["tk-linalg/backend-cuda", "tk-core/backend-cuda"]
+su2-symmetry     = ["tk-symmetry/su2-symmetry"]
+parallel         = ["tk-linalg/parallel"]
