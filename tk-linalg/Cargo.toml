@@ -1,0 +1,45 @@
+[package]
+name = "tk-linalg"
+version = "0.1.0"
+edition = "2021"
+description = "Linear algebra backend abstraction layer for tensorkraft"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tk-core = { path = "../tk-core" }
+tk-symmetry = { path = "../tk-symmetry" }
+
+# Default (pure-Rust) backends
+faer = { version = "0.19", optional = true }
+# oxiblas = { version = "0.3", optional = true }  # TODO: uncomment when oxiblas is published
+
+# Data parallelism
+rayon = { version = "1.10", optional = true }
+
+# FFI backends
+# intel-mkl-sys = { version = "0.7", optional = true }
+# openblas-src = { version = "0.10", optional = true }
+# cblas-sys = { version = "0.1", optional = true }
+# lapacke = { version = "0.3", optional = true }
+
+# CUDA backend
+# cudarc = { version = "0.11", optional = true }
+
+# Utilities
+num_cpus = "1.16"
+num-traits = "0.2"
+log = "0.4"
+thiserror = "2"
+
+[features]
+default = ["backend-faer", "parallel"]
+backend-faer = ["faer"]
+# backend-oxiblas = ["oxiblas"]
+# backend-mkl = ["intel-mkl-sys", "cblas-sys", "lapacke"]
+# backend-openblas = ["openblas-src", "cblas-sys", "lapacke"]
+# backend-cuda = ["cudarc"]
+parallel = ["rayon"]
+su2-symmetry = ["tk-symmetry/su2-symmetry"]
+
+[dev-dependencies]
+proptest = "1"
