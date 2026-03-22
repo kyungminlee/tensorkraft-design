@@ -1,5 +1,149 @@
 # Development Notes — tensorkraft
 
+## tk-core: Lessons Learned & Spec Feedback
+
+### Architecture doc `TensorCow` wrapper is unnecessary — merge CoW into `TensorStorage`
+
+The architecture doc (§3.1) defines three types: `TensorStorage<T>` (wrapping `Vec<T>`),
+`TensorCow<'a, T>` (borrowing `&'a TensorStorage<T>` or owning one), and `DenseTensor<T>`
+(holding a `TensorCow`). During implementation, we found that the indirection through
+`TensorCow` adds complexity with no benefit. The tech spec's simpler design —
+`TensorStorage<'a, T>` as a single enum with `Owned(Vec<T>)` / `Borrowed(&'a [T])` —
+eliminates one type and avoids the double-indirection where `Borrowed` held a reference
+to a `TensorStorage` struct wrapping a `Vec<T>`.
+
+**Recommendation for future specs:** When the architecture doc defines wrapper types,
+verify during tech spec writing that each layer of indirection adds real value. The
+`TensorCow` → `TensorStorage` collapse removed a type without losing any capability.
+
+### `DenseTensor` needs an `offset` field — architecture doc omission
+
+The architecture doc (§3.1) defines `DenseTensor` with only `shape` and `storage` fields.
+The tech spec adds `offset: usize`, which proved essential for `slice_axis` to work as a
+zero-copy view. Without offset, slicing would require either copying data or creating a
+new borrowed view pointing into the middle of a buffer (which `&[T]` can do, but then
+chained slicing becomes complex because you'd need to re-slice the slice reference).
+
+The `offset` field propagates cleanly: `slice_axis` accumulates offsets, `as_slice()`
+applies it, and `into_owned()` gathers only the logical elements when offset is nonzero.
+This is a case where the architecture doc's data structure was incomplete, and the tech
+spec caught it. Future architecture docs should consider the full lifecycle of view
+operations (slice → chain → materialize) when defining tensor structs.
+
+### `DenseTensor` requires a lifetime parameter — architecture doc omission
+
+The architecture doc (§3.1) defines `DenseTensor<T>` without a lifetime parameter, relying
+on the separately-defined `TensorCow<'a, T>` to carry the borrow lifetime. When we merged
+CoW into `TensorStorage<'a, T>`, the lifetime surfaced to `DenseTensor<'a, T>`. This is
+the correct design — the lifetime must be visible at the tensor level so the borrow checker
+can enforce arena safety. But it means every function signature involving `DenseTensor` must
+be lifetime-annotated, which the architecture doc's pseudocode didn't anticipate.
+
+**Impact:** Functions like `permute`, `reshape`, `slice_axis` all return
+`DenseTensor<'_, T>` (borrowing from self). The `TempTensor<'a, T>` alias is just
+`DenseTensor<'a, T>` — no separate type needed. The architecture doc's `TempTensor<'a, T>`
+as a distinct concept is slightly misleading; it's the same type with a shorter lifetime.
+
+### `Scalar` trait needs more bounds than the architecture doc shows
+
+The architecture doc (§3.4) defines `Scalar` with `Add<Output=Self> + Mul<Output=Self>`.
+The implementation requires additional bounds: `Sub<Output=Self>`, `Neg<Output=Self>`,
+`Debug`, and `'static`. `Sub` and `Neg` are needed by any code that computes residuals or
+differences. `Debug` is needed for error messages. `'static` is needed because `Scalar`
+appears in struct definitions that need `'static` for owned storage. The `Real` associated
+type also needs `PartialOrd` (for truncation thresholds) and `Float` (for `epsilon()`,
+`sqrt()`, etc.), which the architecture doc omits.
+
+**Recommendation:** When specifying trait hierarchies, enumerate the full bound set in the
+architecture doc. Downstream crates discover missing bounds at compile time, and adding
+bounds to a sealed trait is technically non-breaking but creates churn.
+
+### `is_contiguous()` only checks row-major — potential column-major trap
+
+`TensorShape::is_contiguous()` compares strides against the expected row-major strides. A
+tensor created via `col_major()` will report `is_contiguous() == false` even though its
+data is physically contiguous (just in Fortran order). This means `reshape()` fails on
+column-major tensors, which could surprise users.
+
+This is acceptable for DMRG where we always work in row-major, but the name
+`is_contiguous()` is misleading — it really means `is_row_major_contiguous()`. If we ever
+need column-major reshape (e.g., for Fortran FFI), we'll need to either rename this method
+or add a more general contiguity check that accepts any ordering.
+
+### `into_owned()` is more complex than specs suggest
+
+Both specs show `into_owned()` as a simple clone-if-borrowed operation. The real
+implementation has a three-way fast/slow path:
+
+1. **Move path:** already owned, contiguous, offset 0, tight buffer → zero-cost move
+2. **Memcpy path:** contiguous with nonzero offset → single `to_vec()` on a subslice
+3. **Gather path:** non-contiguous strides → element-by-element gather via multi-index iteration
+
+The gather path (`gather_elements()`) is O(numel × rank) due to multi-index arithmetic.
+For rank-6 tensors this adds meaningful overhead. Future specs should mention the gather
+path explicitly, since it affects performance of any operation that materializes a
+transposed view (e.g., `tensor.permute(&perm).into_owned()`).
+
+### `gather_elements()` multi-index iteration is a non-trivial algorithm
+
+Neither spec mentions the algorithm for materializing a non-contiguous view. The
+implementation uses row-major multi-index enumeration: maintain a `vec![0; rank]` counter,
+compute `sum(index[i] * strides[i])` for each element, increment the counter with carry
+from the last axis. This is correct but has two performance concerns:
+
+1. The inner loop does `rank` multiplies per element (could be reduced to incremental
+   offset updates for common stride patterns).
+2. The temporary `vec![0; rank]` heap-allocates for rank > ~12 (could use `SmallVec`
+   to stay consistent with `TensorShape`'s stack allocation strategy).
+
+Neither concern matters for DMRG tensors (rank ≤ 6, gather is rare), but worth noting
+for future extensions.
+
+### Rank-0 tensor edge case: `numel()` returns 1 for empty dims
+
+`TensorShape::row_major(&[])` creates a rank-0 shape with `numel() == 1` (empty product).
+This is mathematically correct (a scalar tensor holds one element), but `strides` is empty,
+so `offset(&[])` returns 0 and `is_contiguous()` returns true. The code works, but no tests
+exercise this case because rank-0 is officially deferred (tech spec open question #1). If
+we later decide to support rank-0 tensors, the current code accidentally works — but
+`SweepArena::alloc_tensor` would allocate a 1-element buffer, which is correct.
+
+### `borrow_storage()` pattern enables zero-copy chain
+
+The key enabler for zero-copy `permute`/`reshape`/`slice_axis` is the `borrow_storage()`
+helper, which creates a `TensorStorage::Borrowed` from either variant. This means even
+an `Owned` tensor produces borrowed views — the original `Vec` stays alive as long as
+the original tensor is alive, and the view borrows from it. This is not mentioned in
+either spec but is critical for understanding why `tensor.permute(p1).slice_axis(0, 1, 3)`
+compiles: each operation borrows from the previous, and Rust's lifetime chain ensures
+the original data outlives all views.
+
+### Debug-mode permutation validation has non-trivial cost
+
+`TensorShape::permute()` validates the permutation in debug builds by cloning into a
+`SmallVec`, sorting, and comparing against `0..rank`. This is O(rank log rank) per call.
+In a DMRG sweep with thousands of contractions, each involving multiple permutations, this
+adds up. The validation is valuable for catching bugs, but if debug-build performance
+becomes an issue, consider a bitset-based O(rank) validation instead.
+
+### Compile-fail tests require careful error message targeting
+
+The five `trybuild` compile-fail tests verify borrow-checker enforcement, but they're
+sensitive to Rust compiler version — error messages change across rustc releases. We pin
+expected `.stderr` files to the current toolchain. When upgrading rustc, these tests may
+need `.stderr` updates even though the safety properties haven't changed. Consider using
+`trybuild`'s `compile_fail` mode (without `.stderr` matching) for robustness, at the cost
+of less precise error checking.
+
+### Architecture doc workspace layout doesn't match actual structure
+
+The architecture doc (§2.1) shows crates under `crates/` (e.g., `crates/tk-core/`), but
+the actual workspace uses top-level directories (`tk-core/`, `tk-symmetry/`, `tk-linalg/`).
+This is a minor discrepancy but could confuse new contributors. Future tech specs should
+note the actual layout or the architecture doc should be updated.
+
+---
+
 ## tk-linalg: Lessons Learned & Design Observations
 
 ### faer 0.19 API surface
