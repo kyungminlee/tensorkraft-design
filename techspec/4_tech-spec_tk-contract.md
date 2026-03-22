@@ -159,6 +159,17 @@ impl ContractionSpec {
     ///
     /// **Implementation note:** Same caching consideration as `contracted_pairs()`.
     pub fn free_indices(&self) -> Vec<(IndexId, TensorId, usize)>;
+
+    /// Find all contracted indices shared between two specific tensors.
+    ///
+    /// Required by optimizers during candidate-pair evaluation: the greedy
+    /// optimizer calls this O(n²) times per step to determine the M/K/N
+    /// dimensions of each candidate pairwise contraction.
+    ///
+    /// For n ≤ 5 (DMRG), a linear scan over `contracted_pairs()` is fine.
+    /// For larger networks, consider building a `HashMap<(TensorId, TensorId),
+    /// Vec<ContractedPair>>` at construction time.
+    pub fn shared_indices(&self, a: TensorId, b: TensorId) -> Vec<ContractedPair>;
 }
 ```
 
@@ -168,6 +179,26 @@ impl ContractionSpec {
 /// Maps each (TensorId, leg_position) pair to its `IndexSpec`.
 /// Passed to `PathOptimizer::optimize` to enable cost estimation without
 /// access to tensor data.
+///
+/// **Intermediate tensor dimensions (discovered during draft implementation):**
+/// The `IndexMap` is passed as read-only to the optimizer, but optimizers
+/// need to compute dimensions of *intermediate* results from pairwise
+/// contractions. When the optimizer considers contracting tensors A and B,
+/// the result's dimensions are derived from A and B's free legs — information
+/// that must be looked up from the `IndexMap` by the original `TensorId`s.
+///
+/// The optimizer should NOT mutate the `IndexMap` to register intermediates.
+/// Instead, intermediate dimensions should be tracked in the optimizer's
+/// internal working state (e.g., alongside each `ContractionNode` in the
+/// candidate tree). The `ContractionNode::Contraction::result_indices` field
+/// already carries the output index ordering; the optimizer pairs this with
+/// the known input dimensions to derive intermediate shapes without touching
+/// the `IndexMap`.
+///
+/// For the `GreedyOptimizer` (n ≤ 5), computing M/K/N inline from left/right
+/// node dimensions is sufficient. For `DPOptimizer` and `TreeSAOptimizer`,
+/// a per-node dimension cache in the optimizer's memoization table is the
+/// recommended approach.
 pub struct IndexMap {
     specs: HashMap<(TensorId, usize), IndexSpec>,
 }
@@ -182,6 +213,11 @@ impl IndexMap {
     /// Look up the `IndexSpec` for one leg. Returns `None` if the
     /// (tensor_id, leg) pair was never registered.
     pub fn get(&self, tensor_id: TensorId, leg: usize) -> Option<&IndexSpec>;
+
+    /// Compare only dimensions (not strides) against another `IndexMap`.
+    /// Used by `ExecutionPlan::needs_rebuild` to detect shape changes
+    /// without being sensitive to stride layout differences.
+    pub fn dims_match(&self, other: &IndexMap) -> bool;
 }
 ```
 
@@ -568,6 +604,29 @@ impl PathOptimizer for TreeSAOptimizer {
 /// All intermediate tensors are allocated from the provided `SweepArena`.
 /// Callers must call `arena.reset()` after `execute` returns and the output
 /// tensor has been extracted (via `.into_owned()` if it must survive the reset).
+///
+/// **Lifetime design note (discovered during draft implementation):**
+/// The executor must hold both borrowed input tensors (`&'a DenseTensor<'a, T>`)
+/// and owned intermediate results (`DenseTensor<'static, T>`) simultaneously.
+/// These have incompatible lifetimes in the `DenseTensor<'a, T>` type. Two
+/// workable designs:
+///
+/// **Option A — Arena-unified:** All inputs are first copied into the
+/// `SweepArena` at the start of `execute`, giving every tensor the same
+/// `'arena` lifetime. This costs one memcpy per input but eliminates all
+/// lifetime mismatches. Recommended when the arena is already pre-sized
+/// to hold the full contraction working set.
+///
+/// **Option B — Split storage:** The executor maintains separate
+/// `inputs: &HashMap<TensorId, &DenseTensor<T>>` (borrowed) and
+/// `intermediates: HashMap<TensorId, DenseTensor<'static, T>>` (owned).
+/// The `get_tensor` helper dispatches to the correct map by `TensorId`.
+/// No extra copies, but the two maps have different lifetime parameters,
+/// requiring either an enum wrapper or careful lifetime erasure.
+///
+/// The current signature below uses Option A (arena parameter). Implementors
+/// choosing Option B should adjust the `execute` signature to omit the arena
+/// and return `DenseTensor<'static, T>` instead.
 pub struct ContractionExecutor<T: Scalar, B: LinAlgBackend<T>> {
     backend: B,
     _phantom: PhantomData<T>,
@@ -636,6 +695,29 @@ These are `pub(crate)` helpers in `reshape.rs` that implement the critical "resh
 /// contiguous in row-major order, the MatRef is a zero-copy view.
 /// Otherwise, the tensor data is first transposed into a contiguous arena
 /// buffer via `block_transpose`, and the MatRef points into that buffer.
+///
+/// # Contiguity fast path vs. transpose slow path
+///
+/// The function checks two conditions for zero-copy reshape:
+/// 1. The tensor's underlying storage is contiguous (row-major, no stride gaps).
+/// 2. The contracted legs are the *trailing* (rightmost) axes, so fusing
+///    them into a single "K" dimension is a no-op reshape.
+///
+/// When both conditions hold, `tensor_to_mat_ref` returns a `MatRef` pointing
+/// directly into the tensor's existing storage — zero allocation, zero copy.
+///
+/// When either condition fails, the tensor must be explicitly transposed
+/// into a contiguous buffer before GEMM dispatch. The `arena` parameter
+/// provides the allocation target:
+/// - If a `SweepArena` is provided, the transposed copy lives in arena
+///   memory and is reclaimed on the next `arena.reset()`.
+/// - If no arena is available (e.g., during unit tests or one-off contractions),
+///   a heap-allocated `Vec<T>` is used as fallback. This is correct but
+///   defeats the allocation-amortization benefit of the arena.
+///
+/// The optimizer's `CostMetric::bandwidth_weight` already penalizes paths
+/// that require transposes, so the slow path is triggered only when no
+/// transpose-free ordering exists.
 ///
 /// # Conjugation propagation
 /// If the input tensor's natural axis ordering for the contracted legs

@@ -1220,6 +1220,8 @@ pub struct ContractionExecutor<T: Scalar, B: LinAlgBackend<T>> {
 }
 ```
 
+**Lifetime design note:** The executor must hold both borrowed input tensors and owned intermediate results simultaneously. Since `DenseTensor<'a, T>` carries a storage lifetime, these have incompatible type parameters. Two viable strategies are documented in the tk-contract tech spec §7.1: (A) copy all inputs into the arena upfront to unify lifetimes, or (B) maintain separate typed maps for inputs vs. intermediates. Strategy A is simpler and recommended for the arena-centric execution model; the extra memcpy per input is negligible relative to the O(D³) GEMM cost.
+
 ### 6.4 Fermionic Sign Convention
 
 The contraction engine operates with **bosonic tensor legs only**. It does not implement native fermionic swap gates or automatic Jordan-Wigner string insertion during leg permutations.
