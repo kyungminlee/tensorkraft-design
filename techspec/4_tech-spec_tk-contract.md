@@ -149,9 +149,15 @@ impl ContractionSpec {
 
     /// Set of contracted index pairs: each element is a pair of
     /// (TensorId, leg_position) for the two tensors sharing that IndexId.
+    ///
+    /// **Implementation note:** Consider caching this result during `new()`
+    /// rather than recomputing on every call, since optimizers may invoke
+    /// this repeatedly during candidate evaluation.
     pub fn contracted_pairs(&self) -> Vec<(IndexId, (TensorId, usize), (TensorId, usize))>;
 
     /// Free indices in order, with their (TensorId, leg_position).
+    ///
+    /// **Implementation note:** Same caching consideration as `contracted_pairs()`.
     pub fn free_indices(&self) -> Vec<(IndexId, TensorId, usize)>;
 }
 ```
@@ -203,10 +209,13 @@ pub enum ContractionNode {
     Contraction {
         left: Box<ContractionNode>,
         right: Box<ContractionNode>,
-        /// Index pairs being contracted: (left_index, right_index).
-        /// Each pair holds the two `IndexId`s naming the contracted leg
-        /// on each side. Dimensions must match; validated during graph construction.
-        contracted_indices: Vec<(IndexId, IndexId)>,
+        /// Contracted index pairs. Each entry is a single `IndexId` that
+        /// appears on both the left and right subtrees (shared indices are
+        /// summed over during contraction). Since `ContractionSpec` uses the
+        /// same `IndexId` on both tensors to denote contraction, each element
+        /// here is the shared `IndexId` — not a pair of distinct IDs.
+        /// Dimensions must match; validated during graph construction.
+        contracted_indices: Vec<IndexId>,
         /// Indices of the result tensor, in the order they will appear
         /// after the pairwise contraction. Free indices from `left` appear
         /// first, then free indices from `right` (standard outer-product order).
@@ -388,6 +397,13 @@ pub trait PathOptimizer: Send + Sync {
     /// - `spec`: The full contraction specification (which tensors, which indices).
     /// - `index_map`: Dimension and stride metadata for cost estimation.
     /// - `cost`: Weights for the composite FLOP + bandwidth metric.
+    /// - `max_memory_bytes`: Optional hard constraint on peak intermediate memory.
+    ///   If `Some(limit)`, the optimizer rejects candidate paths whose estimated
+    ///   peak memory exceeds `limit` bytes. For DMRG (fixed 4-tensor contractions),
+    ///   this defaults to `None` because memory is dominated by environments and
+    ///   MPS tensors, not intermediate contraction results. Essential for future
+    ///   PEPS/tree TNS extensions where intermediate memory blow-up is the limiting
+    ///   factor (see design document §6.2 and §13).
     ///
     /// # Returns
     /// An `Ok(ContractionGraph)` on success.
@@ -401,6 +417,7 @@ pub trait PathOptimizer: Send + Sync {
         spec: &ContractionSpec,
         index_map: &IndexMap,
         cost: &CostMetric,
+        max_memory_bytes: Option<usize>,
     ) -> ContractResult<ContractionGraph>;
 
     /// Name of this optimizer (for diagnostic logging and benchmark labeling).
@@ -433,6 +450,7 @@ impl PathOptimizer for GreedyOptimizer {
         spec: &ContractionSpec,
         index_map: &IndexMap,
         cost: &CostMetric,
+        max_memory_bytes: Option<usize>,
     ) -> ContractResult<ContractionGraph>;
 
     fn name(&self) -> &str { "greedy" }
@@ -470,6 +488,7 @@ impl PathOptimizer for DPOptimizer {
         spec: &ContractionSpec,
         index_map: &IndexMap,
         cost: &CostMetric,
+        max_memory_bytes: Option<usize>,
     ) -> ContractResult<ContractionGraph>;
 
     fn name(&self) -> &str { "dp" }
@@ -518,6 +537,7 @@ impl PathOptimizer for TreeSAOptimizer {
         spec: &ContractionSpec,
         index_map: &IndexMap,
         cost: &CostMetric,
+        max_memory_bytes: Option<usize>,
     ) -> ContractResult<ContractionGraph>;
 
     fn name(&self) -> &str { "treesa" }
@@ -596,6 +616,7 @@ impl<T: Scalar, B: LinAlgBackend<T>> ContractionExecutor<T, B> {
         inputs: &HashMap<TensorId, &DenseTensor<T>>,
         optimizer: &dyn PathOptimizer,
         cost: &CostMetric,
+        max_memory_bytes: Option<usize>,
         arena: &'arena mut SweepArena,
     ) -> ContractResult<TempTensor<'arena, T>>;
 }
@@ -748,9 +769,24 @@ pub trait StructuralContractionHook<T: Scalar, Q: BitPackable>: Send + Sync {
     /// Called once per sector-pair (sector_a, sector_b) during pairwise
     /// block-sparse contraction.
     ///
+    /// **Important semantics:** `sector_a` and `sector_b` represent the
+    /// quantum numbers of the *free* (non-contracted) legs only. The caller
+    /// (`SparseContractionExecutor`) is responsible for pre-extracting free-leg
+    /// quantum numbers before invoking this hook. Contracted legs have already
+    /// been matched by the sector-pair selection logic in `block_gemm` (which
+    /// ensures that the contracted legs of A and B carry dual quantum numbers,
+    /// satisfying the flux conservation rule). The hook's job is solely to
+    /// determine the output sector(s) from the remaining free legs.
+    ///
+    /// For Abelian symmetries, element-wise fusion of free-leg quantum numbers
+    /// produces exactly one output sector with coefficient 1, because Abelian
+    /// fusion is one-to-one. For SU(2), a single pair of free-leg irreps can
+    /// fuse into multiple output irreps (fusion-rule multiplicity), each with
+    /// a distinct Clebsch-Gordan coefficient.
+    ///
     /// # Parameters
-    /// - `sector_a`: Quantum number tuple for the block from tensor A.
-    /// - `sector_b`: Quantum number tuple for the block from tensor B.
+    /// - `sector_a`: Quantum numbers of the *free* legs from tensor A's block.
+    /// - `sector_b`: Quantum numbers of the *free* legs from tensor B's block.
     ///
     /// # Returns
     /// A `SmallVec` of `(output_sector, coefficient)` pairs. For Abelian
@@ -775,8 +811,9 @@ impl<T: Scalar, Q: BitPackable> StructuralContractionHook<T, Q> for AbelianHook<
         sector_a: &[Q],
         sector_b: &[Q],
     ) -> SmallVec<[(SmallVec<[Q; 8]>, T); 4]> {
-        // Abelian fusion: fuse sector_a ⊕ sector_b → unique output sector.
-        // Coefficient is always 1.
+        // Abelian fusion: element-wise fuse of free-leg quantum numbers
+        // from sector_a and sector_b → unique output sector.
+        // Coefficient is always 1 (Abelian fusion is one-to-one).
         let output: SmallVec<[Q; 8]> = sector_a
             .iter()
             .zip(sector_b.iter())
@@ -820,6 +857,7 @@ impl<T: Scalar, Q: BitPackable> ExecutionPlan<T, Q> {
         index_map: &IndexMap,
         optimizer: &dyn PathOptimizer,
         cost: &CostMetric,
+        max_memory_bytes: Option<usize>,
     ) -> ContractResult<Self>;
 
     /// Returns true if the plan must be rebuilt because a tensor shape has changed.
@@ -847,17 +885,27 @@ impl<T: Scalar, Q: BitPackable> ExecutionPlan<T, Q> {
 
 /// Sentinel quantum-number type for the dense (non-symmetric) execution path.
 /// Not exported; exists only to satisfy the `Q: BitPackable` type parameter
-/// when no symmetry is in use.
+/// when no symmetry is in use. `NoQ` implements `QuantumNumber` and
+/// `BitPackable` (zero-width packing) but does NOT implement `Scalar` —
+/// it is a quantum-number sentinel, not a numeric type.
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NoQ;
-impl tk_core::Scalar for NoQ { /* trivial impl */ }
-impl tk_symmetry::QuantumNumber for NoQ { /* trivial impl */ }
+impl tk_symmetry::QuantumNumber for NoQ {
+    fn identity() -> Self { NoQ }
+    fn fuse(&self, _other: &Self) -> Self { NoQ }
+    fn dual(&self) -> Self { NoQ }
+}
 impl tk_symmetry::BitPackable for NoQ {
     const BIT_WIDTH: usize = 0;
     fn pack(&self) -> u64 { 0 }
     fn unpack(_: u64) -> Self { NoQ }
 }
+
+/// Convenience type alias for the dense (non-symmetric) execution path.
+/// Downstream crates can use `DenseExecutionPlan<f64>` instead of
+/// `ExecutionPlan<f64, NoQ>`, since `NoQ` is not publicly exported.
+pub type DenseExecutionPlan<T> = ExecutionPlan<T>;
 ```
 
 ---
@@ -1004,6 +1052,10 @@ smallvec    = { version = "1", features = ["union"] }
 hashbrown   = "0.14"
 thiserror   = "1"
 cfg-if      = "1"
+log         = "0.4"                                       # diagnostic logging (warn/error for physics anomalies)
+rand        = { version = "0.8", optional = true }        # RNG for TreeSAOptimizer
+rand_xoshiro = { version = "0.6", optional = true }       # fast seedable RNG (xoshiro256++) for TreeSAOptimizer
+rayon       = { version = "1", optional = true }           # parallel sector dispatch in SparseContractionExecutor
 
 [dev-dependencies]
 proptest  = "1"
@@ -1018,7 +1070,8 @@ backend-mkl      = ["tk-linalg/backend-mkl"]
 backend-openblas = ["tk-linalg/backend-openblas"]
 backend-cuda     = ["tk-linalg/backend-cuda", "tk-core/backend-cuda"]
 su2-symmetry     = ["tk-symmetry/su2-symmetry"]
-parallel         = ["tk-linalg/parallel"]
+parallel         = ["tk-linalg/parallel", "rayon"]
+treesa           = ["rand", "rand_xoshiro"]                # TreeSAOptimizer requires RNG
 ```
 
 ---
@@ -1256,6 +1309,6 @@ The following are explicitly **not** implemented in `tk-contract`:
 | 2 | Should `DPOptimizer` use a memoization cache keyed on tensor-subset bitvectors, or construct a flat DP table? Flat table is faster for n ≤ 12 but requires O(2^n) memory upfront. | Implement flat table; benchmark before optimizing |
 | 3 | `TreeSAOptimizer` requires a reproducible RNG for testing. Should it use `rand::SeedableRng::seed_from_u64` (portable) or `rand_xoshiro` (faster, also seedable)? | Use `rand_xoshiro256pp` for speed; seed stored in `TreeSAOptimizer::seed` |
 | 4 | For the `backend-cuda` path, should `SparseContractionExecutor` fall back to host-side GEMM for sectors smaller than a configurable threshold (to avoid kernel-launch overhead for tiny blocks)? | Benchmark on realistic DMRG sector distributions at D=1000 before deciding |
-| 5 | Should `ExecutionPlan::needs_rebuild` compare full `IndexMap` contents or only the dimensions (ignoring stride layout changes from permutations that don't affect shape)? | Compare only dimensions for invalidation; stride changes do not change the plan's index connectivity |
+| 5 | Should `ExecutionPlan::needs_rebuild` compare full `IndexMap` contents or only the dimensions (ignoring stride layout changes from permutations that don't affect shape)? | **Resolved (§15 Note 5):** Compare only dimensions for invalidation; stride changes do not change the plan's index connectivity. Shape comparison runs O(n_tensors × rank) per sweep step — negligible overhead |
 | 6 | Is `NoQ` the right mechanism for the "no symmetry" dense path, or should `ContractionExecutor` and `ExecutionPlan` have separate non-generic versions? | Keep `NoQ`; the generic approach prevents code duplication and the zero-size type has no overhead |
 | 7 | The current design does not support hyperedge contractions (a single `IndexId` connecting three or more tensors). Is this needed for any planned use case through Phase 4? | No: DMRG and DMFT use only pairwise-decomposable networks; defer to Phase 5+ if needed |
