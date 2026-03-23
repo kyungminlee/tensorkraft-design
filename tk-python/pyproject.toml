@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tensorkraft"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+features    = ["extension-module", "backend-faer", "parallel"]
+bindings    = "pyo3"
+strip       = true
