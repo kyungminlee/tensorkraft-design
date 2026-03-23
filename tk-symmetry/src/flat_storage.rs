@@ -20,8 +20,13 @@ pub struct FlatBlockStorage<'a, T: Scalar> {
     /// Start index of each sector block within `data`.
     /// `offsets[i]` is the start index of `sector_keys[i]`'s block data.
     offsets: Vec<usize>,
-    /// Dimensions (rows, cols) of each sector block.
+    /// Dimensions (rows, cols) of each sector block (for GEMM dispatch).
+    /// For rank-2 blocks this is the natural shape; for higher-rank blocks
+    /// this is a flattened `(numel, 1)` view for BLAS compatibility.
     shapes: Vec<(usize, usize)>,
+    /// Full original dimensions of each sector block, preserving higher-rank
+    /// shape information through the flatten/unflatten round-trip.
+    full_shapes: Vec<Vec<usize>>,
 }
 
 impl<'a, T: Scalar> FlatBlockStorage<'a, T> {
@@ -40,9 +45,15 @@ impl<'a, T: Scalar> FlatBlockStorage<'a, T> {
         &self.offsets
     }
 
-    /// Shapes (rows, cols) for each sector block.
+    /// Shapes (rows, cols) for each sector block (BLAS-compatible view).
     pub fn shapes(&self) -> &[(usize, usize)] {
         &self.shapes
+    }
+
+    /// Full original dimensions of each sector block.
+    /// Preserves higher-rank shape information (e.g., rank-3 MPS tensors).
+    pub fn full_shapes(&self) -> &[Vec<usize>] {
+        &self.full_shapes
     }
 
     /// Number of sector blocks.
@@ -91,6 +102,7 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
         let mut offset = 0;
         let mut offsets = Vec::with_capacity(self.n_sectors());
         let mut shapes = Vec::with_capacity(self.n_sectors());
+        let mut full_shapes = Vec::with_capacity(self.n_sectors());
 
         for block in self.sector_blocks() {
             offsets.push(offset);
@@ -102,6 +114,7 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
                 (block.numel(), 1)
             };
             shapes.push(shape);
+            full_shapes.push(dims.to_vec());
 
             let n = block.numel();
             buf[offset..offset + n].copy_from_slice(&block.as_slice()[..n]);
@@ -112,10 +125,15 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
             data: buf,
             offsets,
             shapes,
+            full_shapes,
         }
     }
 
     /// Restore fragmented layout from flat buffer (e.g., after GPU computation).
+    ///
+    /// Uses `full_shapes` to reconstruct original block dimensions, correctly
+    /// handling higher-rank blocks (e.g., rank-3 MPS tensors) that were
+    /// flattened to `(numel, 1)` for BLAS.
     pub fn unflatten(
         flat: &FlatBlockStorage<T>,
         keys: &[PackedSectorKey],
@@ -133,8 +151,13 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
 
         for (i, &key) in keys.iter().enumerate() {
             let slice = flat.block_slice(i);
-            let (rows, cols) = flat.shapes[i];
-            let shape = TensorShape::row_major(&[rows, cols]);
+            // Use full_shapes to reconstruct original dimensions if available
+            let shape = if !flat.full_shapes.is_empty() {
+                TensorShape::row_major(&flat.full_shapes[i])
+            } else {
+                let (rows, cols) = flat.shapes[i];
+                TensorShape::row_major(&[rows, cols])
+            };
             let block = DenseTensor::from_vec(shape, slice.to_vec());
             sector_keys.push(key);
             sector_blocks.push(block);

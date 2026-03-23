@@ -108,7 +108,12 @@ impl<Q: QuantumNumber> QIndex<Q> {
     pub fn new(mut sectors: Vec<(Q, usize)>) -> Self {
         sectors.sort_by(|a, b| a.0.cmp(&b.0));
         let total_dim = sectors.iter().map(|(_, d)| d).sum();
-        QIndex { sectors, total_dim }
+        let idx = QIndex { sectors, total_dim };
+
+        #[cfg(debug_assertions)]
+        idx.assert_invariants();
+
+        idx
     }
 
     /// Total dimension: sum of all sector dimensions.
@@ -155,6 +160,44 @@ impl<Q: QuantumNumber> QIndex<Q> {
     /// Read-only access to the underlying sector list.
     pub fn sectors(&self) -> &[(Q, usize)] {
         &self.sectors
+    }
+
+    /// Verify internal invariants (debug/test builds only).
+    ///
+    /// Checks:
+    /// 1. Sectors are strictly sorted by quantum number.
+    /// 2. All sector dimensions are non-zero.
+    /// 3. `total_dim` equals the sum of all sector dimensions.
+    #[cfg(debug_assertions)]
+    pub fn assert_invariants(&self) {
+        // 1. Strictly sorted by quantum number
+        for i in 1..self.sectors.len() {
+            assert!(
+                self.sectors[i - 1].0 < self.sectors[i].0,
+                "QIndex sectors not strictly sorted at index {}: {:?} >= {:?}",
+                i,
+                self.sectors[i - 1].0,
+                self.sectors[i].0,
+            );
+        }
+
+        // 2. All dimensions are non-zero
+        for (i, (q, dim)) in self.sectors.iter().enumerate() {
+            assert!(
+                *dim > 0,
+                "QIndex sector {} ({:?}) has zero dimension",
+                i,
+                q,
+            );
+        }
+
+        // 3. total_dim is consistent
+        let computed: usize = self.sectors.iter().map(|(_, d)| d).sum();
+        assert_eq!(
+            self.total_dim, computed,
+            "QIndex total_dim ({}) does not match sum of sector dims ({})",
+            self.total_dim, computed,
+        );
     }
 }
 

@@ -6,6 +6,7 @@ use hashbrown::HashMap;
 use smallvec::SmallVec;
 use tk_core::{DenseTensor, Scalar, TensorShape};
 
+use crate::error::{SymResult, SymmetryError};
 use crate::flux::{check_flux_rule, enumerate_valid_sectors};
 use crate::quantum_number::{BitPackable, LegDirection};
 use crate::sector_key::{PackedSectorKey, QIndex};
@@ -155,6 +156,126 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
         tensor.assert_invariants();
 
         tensor
+    }
+
+    /// Fallible version of `from_blocks`. Returns `Err` if any block violates
+    /// the flux rule or has mismatched dimensions, instead of panicking.
+    pub fn try_from_blocks(
+        indices: Vec<QIndex<Q>>,
+        flux: Q,
+        leg_directions: Vec<LegDirection>,
+        blocks: Vec<(Vec<Q>, DenseTensor<'static, T>)>,
+    ) -> SymResult<Self> {
+        let mut sector_keys = Vec::with_capacity(blocks.len());
+        let mut sector_blocks = Vec::with_capacity(blocks.len());
+
+        for (qns, block) in blocks {
+            if !check_flux_rule(&qns, &flux, &leg_directions) {
+                return Err(SymmetryError::FluxRuleViolation {
+                    sector: qns.iter().map(|q| format!("{:?}", q)).collect(),
+                    actual: format!("{:?}", {
+                        let fused = qns
+                            .iter()
+                            .zip(leg_directions.iter())
+                            .fold(Q::identity(), |acc, (q, dir)| match dir {
+                                LegDirection::Incoming => acc.fuse(q),
+                                LegDirection::Outgoing => acc.fuse(&q.dual()),
+                            });
+                        fused
+                    }),
+                    expected: format!("{:?}", flux),
+                });
+            }
+            for (i, q) in qns.iter().enumerate() {
+                let expected = indices[i]
+                    .dim_of(q)
+                    .ok_or_else(|| SymmetryError::SectorNotFound {
+                        qns: vec![format!("{:?}", q)],
+                    })?;
+                if block.shape().dims()[i] != expected {
+                    return Err(SymmetryError::LegDimensionMismatch {
+                        leg: i,
+                        expected,
+                        got: block.shape().dims()[i],
+                    });
+                }
+            }
+            let key = PackedSectorKey::pack(&qns);
+            sector_keys.push(key);
+            sector_blocks.push(block);
+        }
+
+        // Sort by key
+        let mut paired: Vec<_> = sector_keys
+            .into_iter()
+            .zip(sector_blocks.into_iter())
+            .collect();
+        paired.sort_by_key(|(k, _)| *k);
+        let (sector_keys, sector_blocks): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+
+        // Check no duplicate keys
+        for i in 1..sector_keys.len() {
+            if sector_keys[i - 1] == sector_keys[i] {
+                let qns: SmallVec<[Q; 8]> = sector_keys[i].unpack(indices.len());
+                return Err(SymmetryError::SectorNotFound {
+                    qns: qns.iter().map(|q| format!("{:?} (duplicate)", q)).collect(),
+                });
+            }
+        }
+
+        let tensor = BlockSparseTensor {
+            indices,
+            sector_keys,
+            sector_blocks,
+            flux,
+            leg_directions,
+        };
+
+        #[cfg(debug_assertions)]
+        tensor.assert_invariants();
+
+        Ok(tensor)
+    }
+
+    /// Fallible version of `insert_block`. Returns `Err` if the sector
+    /// violates the flux rule instead of panicking.
+    pub fn try_insert_block(
+        &mut self,
+        sector_qns: Vec<Q>,
+        block: DenseTensor<'static, T>,
+    ) -> SymResult<()> {
+        if !check_flux_rule(&sector_qns, &self.flux, &self.leg_directions) {
+            return Err(SymmetryError::FluxRuleViolation {
+                sector: sector_qns.iter().map(|q| format!("{:?}", q)).collect(),
+                actual: format!("{:?}", {
+                    let fused = sector_qns
+                        .iter()
+                        .zip(self.leg_directions.iter())
+                        .fold(Q::identity(), |acc, (q, dir)| match dir {
+                            LegDirection::Incoming => acc.fuse(q),
+                            LegDirection::Outgoing => acc.fuse(&q.dual()),
+                        });
+                    fused
+                }),
+                expected: format!("{:?}", self.flux),
+            });
+        }
+
+        let key = PackedSectorKey::pack(&sector_qns);
+        match self.sector_keys.binary_search(&key) {
+            Ok(idx) => {
+                self.sector_blocks[idx] = block;
+            }
+            Err(idx) => {
+                self.sector_keys.insert(idx, key);
+                self.sector_blocks.insert(idx, block);
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        self.assert_invariants();
+
+        Ok(())
     }
 
     /// O(log N) immutable block lookup. Returns `None` if the sector is absent
