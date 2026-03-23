@@ -1,0 +1,24 @@
+[package]
+name = "tk-dsl"
+version = "0.1.0"
+edition = "2021"
+description = "Ergonomic DSL layer: typed operator enums, OpSum builder, lattice abstractions, and intelligent indices for tensorkraft"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tk-core     = { path = "../tk-core" }
+tk-symmetry = { path = "../tk-symmetry" }
+tk-contract = { path = "../tk-contract" }
+smallvec    = "1"
+smallstr    = "0.3"
+thiserror   = "2"
+num-traits  = "0.2"
+
+[dev-dependencies]
+proptest = "1"
+approx   = "0.5"
+
+[features]
+default      = ["parallel"]
+parallel     = []
+su2-symmetry = ["tk-symmetry/su2-symmetry"]

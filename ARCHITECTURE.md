@@ -1139,11 +1139,15 @@ The contraction engine separates: (1) finding the optimal contraction sequence (
 
 ```rust
 pub enum ContractionNode {
-    Input { tensor_id: TensorId },
+    Input {
+        tensor_id: TensorId,
+        indices: Vec<IndexId>,  // logical index ordering
+    },
     Contraction {
         left: Box<ContractionNode>,
         right: Box<ContractionNode>,
-        contracted_indices: Vec<(IndexId, IndexId)>,
+        contracted_indices: Vec<IndexId>,  // shared IndexIds summed over
+        result_indices: Vec<IndexId>,      // output index ordering
     },
 }
 
@@ -1151,8 +1155,8 @@ pub struct ContractionGraph {
     inputs: Vec<TensorId>,
     root: ContractionNode,
     estimated_flops: f64,
-    estimated_bytes_moved: f64,  // memory traffic including transposes
-    estimated_memory: usize,
+    estimated_memory_bytes: usize,    // memory traffic including transposes
+    max_intermediate_size: usize,     // peak intermediate tensor size (elements)
 }
 ```
 
@@ -1171,7 +1175,7 @@ pub struct CostMetric {
 pub trait PathOptimizer: Send + Sync {
     fn optimize(
         &self,
-        inputs: &[&TensorShape],
+        spec: &ContractionSpec,
         index_map: &IndexMap,
         cost: &CostMetric,
         /// Optional hard constraint on peak intermediate memory.
@@ -1183,7 +1187,7 @@ pub trait PathOptimizer: Send + Sync {
         /// Essential for future PEPS/tree TNS extensions where intermediate
         /// memory blow-up is often the limiting factor, not FLOPs.
         max_memory_bytes: Option<usize>,
-    ) -> ContractionGraph;
+    ) -> ContractResult<ContractionGraph>;
 }
 
 pub struct GreedyOptimizer;                                        // O(n³)
@@ -1206,13 +1210,17 @@ Two execution strategies, selected by backend capabilities:
 **Strategy B — Pre-Allocated Transpose Arenas:** Standard GEMM (faer) requires transposition for non-contiguous contractions. Cache-aligned buffers from SweepArena; cache-oblivious block-transpose (8×8 or 16×16 tiles) maximizes cache-line utilization.
 
 ```rust
+/// The arena is passed by parameter to `execute()`, not owned by the executor.
+/// This avoids lifetime entanglement and lets the caller (e.g., `DMRGEngine`)
+/// control arena lifecycle. LPT scheduling is delegated to
+/// `SparseLinAlgBackend::block_gemm` in `tk-linalg`.
 pub struct ContractionExecutor<T: Scalar, B: LinAlgBackend<T>> {
     backend: B,
-    arena: SweepArena,
-    lpt_config: PartitionedLptConfig,
     _phantom: PhantomData<T>,
 }
 ```
+
+**Lifetime design note:** The executor must hold both borrowed input tensors and owned intermediate results simultaneously. Since `DenseTensor<'a, T>` carries a storage lifetime, these have incompatible type parameters. Two viable strategies are documented in the tk-contract tech spec §7.1: (A) copy all inputs into the arena upfront to unify lifetimes, or (B) maintain separate typed maps for inputs vs. intermediates. Strategy A is simpler and recommended for the arena-centric execution model; the extra memcpy per input is negligible relative to the O(D³) GEMM cost.
 
 ### 6.4 Fermionic Sign Convention
 

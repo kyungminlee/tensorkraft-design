@@ -1,0 +1,33 @@
+[package]
+name = "tk-dmrg"
+version = "0.1.0"
+edition = "2021"
+description = "DMRG algorithm engine: MPS/MPO types, sweep engine, eigensolvers, truncation, and time evolution for tensorkraft"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tk-core      = { path = "../tk-core" }
+tk-symmetry  = { path = "../tk-symmetry" }
+tk-linalg    = { path = "../tk-linalg" }
+tk-contract  = { path = "../tk-contract" }
+tk-dsl       = { path = "../tk-dsl" }
+
+smallvec     = "1"
+num-traits   = "0.2"
+num-complex  = "0.4"
+thiserror    = "2"
+log          = "0.4"
+rand         = "0.8"
+
+[dev-dependencies]
+proptest = "1"
+approx   = "0.5"
+
+[features]
+default      = ["backend-faer", "parallel"]
+backend-faer = ["tk-linalg/backend-faer"]
+# backend-mkl      = ["tk-linalg/backend-mkl"]
+# backend-openblas = ["tk-linalg/backend-openblas"]
+# backend-cuda     = ["tk-linalg/backend-cuda", "tk-core/backend-cuda"]
+su2-symmetry = ["tk-symmetry/su2-symmetry"]
+parallel     = ["tk-linalg/parallel"]
