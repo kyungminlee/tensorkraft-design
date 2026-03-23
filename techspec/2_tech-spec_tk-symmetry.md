@@ -1,8 +1,8 @@
 # Technical Specification: `tk-symmetry`
 
 **Crate:** `tensorkraft/crates/tk-symmetry`
-**Version:** 0.1.0 (Pre-Implementation)
-**Status:** Specification
+**Version:** 0.2.0 (Post-Draft-Implementation)
+**Status:** Draft
 **Last Updated:** March 2026
 
 ---
@@ -20,7 +20,9 @@
 - `smallvec` — stack-allocated vectors for sector keys
 - `hashbrown` — fast HashMap for sector metadata
 - `thiserror` — error derive macros
-- `lie-groups` (optional, `#[cfg(feature = "su2-symmetry")]`) — Clebsch-Gordan coefficients
+- `dashmap` — thread-safe concurrent hash map for `ClebschGordanCache`
+
+> **Implementation note:** The original spec listed `lie-groups` as an optional dependency for Clebsch-Gordan coefficients. The draft implementation instead uses a hand-rolled Racah formula with `DashMap`-based thread-safe lazy caching, removing the `lie-groups` dependency entirely.
 
 ---
 
@@ -60,6 +62,9 @@ tk-symmetry/
 ///   - `q.fuse(Q::identity()) == q` (identity element)
 ///   - `q.fuse(q.dual()) == Q::identity()` (inverse)
 ///   - `a.fuse(b.fuse(c)) == a.fuse(b).fuse(c)` (associativity)
+/// The `'static` bound is required because quantum number values are stored
+/// in long-lived structs (e.g., `BlockSparseTensor`, `QIndex`) that outlive
+/// any particular function scope.
 pub trait QuantumNumber:
     Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static
 {
@@ -103,7 +108,12 @@ Sector lookup during block-sparse GEMM is on the hot path — it executes once p
 ///
 /// Only Abelian symmetries implement this trait. Non-Abelian symmetries
 /// (SU(2)) use a separate SmallVec-keyed storage path.
-pub trait BitPackable: QuantumNumber {
+/// `Copy` is required as a supertrait because downstream crates clone quantum
+/// numbers pervasively (sector enumeration, key packing, block construction).
+/// All built-in types (`U1`, `Z2`, `U1Z2`, `U1Wide`) are `Copy`. Requiring
+/// `Copy` here eliminates excessive `.clone()` boilerplate throughout the
+/// codebase.
+pub trait BitPackable: QuantumNumber + Copy {
     /// Number of bits required to encode one quantum number.
     /// Must be a compile-time constant.
     const BIT_WIDTH: usize;
@@ -352,12 +362,18 @@ impl<Q: QuantumNumber> QIndex<Q> {
 pub struct BlockSparseTensor<T: Scalar, Q: BitPackable> {
     /// QIndex for each tensor leg. len() == rank.
     indices: Vec<QIndex<Q>>,
+    /// Direction (Incoming/Outgoing) for each tensor leg. len() == rank.
+    /// Essential for flux rule validation: Incoming legs contribute q,
+    /// Outgoing legs contribute q.dual() to the fused charge.
+    leg_directions: Vec<LegDirection>,
     /// Sorted sector keys (packed multi-leg quantum-number tuples).
     /// Parallel to sector_blocks.
     sector_keys: Vec<PackedSectorKey>,
     /// Dense sub-blocks, one per sector.
     /// sector_blocks[i] corresponds to sector_keys[i].
-    sector_blocks: Vec<DenseTensor<T>>,
+    /// All blocks use `'static` lifetime: `Vec<DenseTensor<'static, T>>`.
+    /// No arena-borrowed blocks; all block data is heap-owned.
+    sector_blocks: Vec<DenseTensor<'static, T>>,
     /// Total charge of the tensor. Non-zero for e.g. creation operators.
     flux: Q,
 }
@@ -367,18 +383,38 @@ pub struct BlockSparseTensor<T: Scalar, Q: BitPackable> {
 
 ```rust
 impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
-    /// Construct a zero tensor with the given leg bases and flux.
+    /// Construct a zero tensor with the given leg bases, flux, and leg directions.
     /// Automatically enumerates all sectors satisfying the flux rule
     /// and allocates zero-filled DenseTensor blocks for each.
-    pub fn zeros(indices: Vec<QIndex<Q>>, flux: Q) -> Self;
+    ///
+    /// `leg_directions` must have the same length as `indices`.
+    pub fn zeros(
+        indices: Vec<QIndex<Q>>,
+        flux: Q,
+        leg_directions: Vec<LegDirection>,
+    ) -> Self;
 
     /// Construct from an explicit list of (sector_key, block) pairs.
     /// Panics in debug mode if any block violates the flux rule,
     /// or if sector_keys are not unique.
+    ///
+    /// `leg_directions` must have the same length as `indices`.
     pub fn from_blocks(
         indices: Vec<QIndex<Q>>,
         flux: Q,
+        leg_directions: Vec<LegDirection>,
         blocks: Vec<(Vec<Q>, DenseTensor<T>)>,
+    ) -> Self;
+
+    /// Internal escape hatch: construct from pre-validated raw parts.
+    /// Bypasses all invariant checks.
+    /// Used by `unflatten` to reconstruct tensors from flat storage.
+    pub(crate) fn from_raw_parts(
+        indices: Vec<QIndex<Q>>,
+        leg_directions: Vec<LegDirection>,
+        sector_keys: Vec<PackedSectorKey>,
+        sector_blocks: Vec<DenseTensor<'static, T>>,
+        flux: Q,
     ) -> Self;
 }
 ```
@@ -411,24 +447,35 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
     pub fn rank(&self) -> usize { self.indices.len() }
     pub fn n_sectors(&self) -> usize { self.sector_blocks.len() }
     pub fn flux(&self) -> &Q { &self.flux }
+    pub fn leg_directions(&self) -> &[LegDirection] { &self.leg_directions }
 
     /// Total stored element count (sum of all block sizes).
     pub fn nnz(&self) -> usize;
 
     /// Maximum dimension across all sectors on one leg.
     pub fn max_sector_dim_on_leg(&self, leg: usize) -> usize;
+
+    /// Iterator over (packed_sector_key, block) pairs.
+    /// Heavily used internally for structural operations (fuse, split, permute).
+    pub fn iter_keyed_blocks(&self)
+        -> impl Iterator<Item = (&PackedSectorKey, &DenseTensor<'static, T>)>;
 }
 ```
 
 ### 7.4 Structural Operations
 
-These operations return new `BlockSparseTensor`s with only metadata changes (strides, leg ordering) — no data is copied.
-
 ```rust
 impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
-    /// Permute tensor legs. Returns a new tensor with rearranged QIndices
-    /// and re-packed sector keys. Block data is permuted via DenseTensor::permute
-    /// (zero-copy stride permutation).
+    /// Permute tensor legs. Returns a new tensor with rearranged QIndices,
+    /// re-packed sector keys, and permuted leg directions.
+    ///
+    /// **Important:** For block-sparse tensors, `permute()` is NOT zero-copy.
+    /// Each block requires `block.permute(perm).into_owned()` because BLAS
+    /// kernels require contiguous (column-major or row-major) memory layout
+    /// within each block. The "zero-copy stride permutation" claim applies
+    /// only to dense tensors, not block-sparse tensors.
+    ///
+    /// Cost: O(nnz) — every stored element is copied once.
     pub fn permute(&self, perm: &[usize]) -> Self;
 
     /// Fuse (combine) a contiguous range of legs into one combined leg.
@@ -437,13 +484,32 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
     /// respecting the original leg directions: Incoming contributes q, Outgoing
     /// contributes q.dual(). The fused leg direction is always Incoming.
     /// Used to reshape MPS tensors before GEMM.
+    ///
+    /// **Algorithm complexity:** The fusion algorithm involves three phases:
+    /// 1. **Cartesian product enumeration** of quantum numbers across the fused
+    ///    legs to determine which combinations map to which fused quantum number.
+    /// 2. **Offset map construction** using `BTreeMap` (not `HashMap`) to ensure
+    ///    deterministic ordering of sectors within each fused block. The key is
+    ///    the fused quantum number; the value tracks the row/column offset within
+    ///    the fused dimension where each sub-block is placed.
+    /// 3. **Block scatter** — each original block's data is copied into the
+    ///    appropriate sub-region of the fused block at the offset determined
+    ///    in phase 2.
+    ///
+    /// The `BTreeMap` is chosen over `HashMap` to guarantee reproducible sector
+    /// ordering across runs, which is critical for numerical reproducibility in
+    /// DMRG sweeps.
     pub fn fuse_legs(&self, legs: std::ops::Range<usize>) -> Self;
 
     /// Split one fused leg back into its component legs.
     /// Inverse of fuse_legs. Requires the original QIndex and direction information
-    /// for each sub-leg. The directions are needed to reconstruct the fuse map
-    /// (which quantum-number combinations map to which fused quantum number and
-    /// at what offset within the fused dimension).
+    /// for each sub-leg.
+    ///
+    /// The `original_directions` parameter is essential: during fusion, per-sub-leg
+    /// direction information is lost (the fused leg always has direction Incoming).
+    /// To reconstruct the fuse map and determine which quantum-number combinations
+    /// map to which fused quantum number and at what offset, the original directions
+    /// must be provided.
     pub fn split_leg(
         &self,
         leg: usize,
@@ -471,11 +537,23 @@ pub struct FlatBlockStorage<'a, T: Scalar> {
     /// Allocated from SweepArena (pinned memory when backend-cuda is active),
     /// NOT from the pageable heap. This guarantees DMA-capable memory for
     /// GPU transfers without the NVIDIA driver's hidden pin-copy-unpin dance.
+    ///
+    /// **Safety:** The buffer is allocated via `alloc_slice_uninit` (unsafe)
+    /// and immediately populated by `copy_from_slice` in the `flatten()` method.
+    /// This is sound because every byte is written before any read occurs,
+    /// but callers must not access the buffer between allocation and population.
     data: &'a mut [T],
     /// Start index of each sector block within `data`.
     /// offsets[i] is the start index of sector_keys[i]'s block data.
     offsets: Vec<usize>,
     /// Dimensions (rows, cols) of each sector block.
+    ///
+    /// **Limitation:** For blocks with rank != 2, the shape is stored as
+    /// `(numel, 1)` — the original multi-dimensional shape is lost.
+    /// This means `flatten -> unflatten` is NOT a round-trip for tensors
+    /// with rank != 2: the unflattened blocks will have shape `(numel, 1)`
+    /// instead of their original shape. This is acceptable because `flatten`
+    /// is only used on the GEMM path where blocks are always rank-2 matrices.
     shapes: Vec<(usize, usize)>,
 }
 
@@ -534,6 +612,8 @@ pub fn check_flux_rule<Q: QuantumNumber>(
     fused == *expected_flux
 }
 
+/// Variants are `Incoming` and `Outgoing` (not abbreviated `In`/`Out`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LegDirection {
     Incoming,
     Outgoing,
@@ -648,9 +728,15 @@ impl SU2Irrep {
 /// Thread-safe, lazily populated cache of Clebsch-Gordan coefficients.
 /// Computing CG coefficients from scratch is expensive; caching amortizes
 /// the cost across the thousands of contractions in a DMRG sweep.
+///
+/// **Implementation note:** CG coefficients are computed using a hand-rolled
+/// Racah formula (direct algebraic evaluation), NOT the `lie-groups` crate.
+/// The cache uses `DashMap` for lock-free concurrent read/write access,
+/// replacing the original `RwLock<HashMap>` design for better multi-thread
+/// performance during `prefill` and concurrent `get` calls.
 pub struct ClebschGordanCache {
     /// Key: (j_a, j_b, j_c, m_a, m_b, m_c). Value: CG coefficient.
-    cache: std::sync::RwLock<HashMap<CgKey, f64>>,
+    cache: DashMap<CgKey, f64>,
 }
 
 #[cfg(feature = "su2-symmetry")]
@@ -727,6 +813,8 @@ These items are scoped to the `su2-symmetry` feature flag and do not affect the 
 
 `SymmetryError` wraps `tk_core::TkError` via the `#[from]` attribute, allowing any `TkError` raised by `tk-core` operations (e.g., `DenseTensor` construction or `SweepArena` allocation) to propagate transparently through `tk-symmetry` functions that return `SymResult<T>`. Downstream crates (`tk-linalg`, `tk-contract`, `tk-dmrg`, etc.) in turn wrap `SymmetryError` in their own error enums using the same `#[from]` pattern, forming a layered error chain that preserves the original error context across crate boundaries without requiring manual conversion logic.
 
+**Draft implementation note:** The current draft implementation uses panics over `Result` in many code paths, particularly constructors (`zeros`, `from_blocks`) and invariant-checking code (`check_flux_rule`). These panics fire on programmer errors (e.g., mismatched leg counts, flux rule violations) rather than recoverable runtime errors. Whether to convert some of these to `SymResult` returns is an open question (see Open Questions).
+
 ### 11.2 Error Enum Definition
 
 ```rust
@@ -796,7 +884,7 @@ pub use su2::{SU2Irrep, WignerEckartTensor, ClebschGordanCache};
 
 | Flag | Effect in tk-symmetry |
 |:-----|:----------------------|
-| `su2-symmetry` | Activates `SU2Irrep`, `WignerEckartTensor`, `ClebschGordanCache`; pulls in `lie-groups` crate |
+| `su2-symmetry` | Activates `SU2Irrep`, `WignerEckartTensor`, `ClebschGordanCache` (hand-rolled Racah formula; no external dependency) |
 
 No other `tk-symmetry`-specific feature flags. The `parallel` and backend flags are `tk-linalg` concerns.
 
@@ -812,7 +900,7 @@ tk-core = { path = "../tk-core" }
 smallvec = "1"
 hashbrown = "0.14"
 thiserror = "1"
-lie-groups = { version = "0.1", optional = true }
+dashmap = "5"
 
 [dev-dependencies]
 proptest = "1"
@@ -820,8 +908,10 @@ trybuild = "1"
 
 [features]
 default = []
-su2-symmetry = ["lie-groups"]
+su2-symmetry = []
 ```
+
+> **Implementation note:** The `lie-groups` dependency has been removed. CG coefficients are computed via a hand-rolled Racah formula. The `dashmap` dependency provides the thread-safe concurrent cache used by `ClebschGordanCache`.
 
 ### 14.2 Upstream Dependencies
 
@@ -842,6 +932,8 @@ su2-symmetry = ["lie-groups"]
 
 ### 15.1 Unit Tests
 
+The draft implementation has 40 passing tests, exceeding the original spec count of 19. The table below lists representative tests; the full test suite is in the implementation.
+
 | Test | Description |
 |:-----|:------------|
 | `u1_fuse_identity` | `U1(3).fuse(U1::identity()) == U1(3)` |
@@ -851,21 +943,34 @@ su2-symmetry = ["lie-groups"]
 | `z2_self_dual` | `Z2(b).dual() == Z2(b)` |
 | `u1z2_pack_round_trip` | Round-trip pack/unpack for all (u1, z2) combinations |
 | `packed_key_sort_order` | Keys packed for quantum-number-sorted inputs are in ascending order |
-| `packed_key_overflow_debug_panic` | Debug build panics when rank × BIT_WIDTH > 64 |
+| `packed_key_overflow_debug_panic` | Debug build panics when rank x BIT_WIDTH > 64 |
 | `block_sparse_get_block_present` | Lookup of a present sector returns the correct block |
 | `block_sparse_get_block_absent` | Lookup of an absent sector returns None |
 | `block_sparse_flux_rule_enforced` | Construction with flux-violating block panics in debug mode |
 | `block_sparse_sector_key_sorted` | After `insert_block`, `sector_keys` is always sorted |
 | `block_sparse_zeros_valid_sectors` | `zeros()` constructs blocks for all and only valid sectors |
+| `block_sparse_zeros_leg_directions` | `zeros()` stores leg directions and uses them in flux validation |
 | `block_sparse_permute_numel` | `permute()` preserves total element count |
+| `block_sparse_permute_copies_data` | `permute()` produces owned contiguous blocks (not views) |
 | `enumerate_sectors_completeness` | All valid sectors for a rank-3 U1 tensor are found |
 | `check_flux_rule_correct` | Correct sectors pass; flux-violating sectors fail |
+| `check_flux_rule_with_directions` | Flux rule correctly handles mixed Incoming/Outgoing legs |
+| `qindex_total_dim` | `total_dim()` returns correct cumulative dimension |
 | `qindex_offset_of` | `offset_of` returns correct cumulative offsets |
 | `flatten_contiguous_data` | `flatten()` produces contiguous buffer matching element-by-element iteration over fragmented blocks |
-| `unflatten_round_trip` | `unflatten(flatten(tensor))` recovers original blocks exactly |
+| `unflatten_round_trip` | `unflatten(flatten(tensor))` recovers original blocks for rank-2 tensors |
+| `flatten_non_rank2_shape_loss` | `flatten()` on non-rank-2 blocks stores shape as `(numel, 1)` |
 | `flatten_offsets_correct` | Each offset in `FlatBlockStorage` matches the cumulative element count |
+| `fuse_legs_cartesian_product` | Fused leg contains all valid quantum-number combinations |
+| `fuse_legs_deterministic_order` | Fused blocks have deterministic sector ordering across runs |
+| `split_leg_round_trip` | `split_leg(fuse_legs(t))` recovers the original tensor |
+| `split_leg_requires_original_directions` | `split_leg` uses original directions to reconstruct fuse map |
+| `iter_keyed_blocks_complete` | `iter_keyed_blocks()` yields all stored (key, block) pairs |
+| `from_raw_parts_bypasses_validation` | `from_raw_parts()` constructs without invariant checks |
 
 ### 15.2 Property-Based Tests
+
+**Status:** Property-based tests (`proptest`) are absent from the draft implementation. The following tests are planned but not yet implemented. Adding `proptest` coverage is a priority for the next iteration.
 
 ```rust
 proptest! {
@@ -886,6 +991,22 @@ proptest! {
     ) {
         // Build BlockSparseTensor, insert sectors at random valid quantum numbers,
         // verify get_block finds all of them.
+    }
+
+    #[test]
+    fn permute_preserves_block_data(
+        // Bounded: rank 2..=4, dims 1..=4 per sector
+    ) {
+        // Build BlockSparseTensor, permute, verify element values match
+        // the permuted dense equivalent.
+    }
+
+    #[test]
+    fn fuse_split_round_trip(
+        // Bounded: rank 3..=5, dims 1..=4 per sector
+    ) {
+        // Build BlockSparseTensor, fuse two legs, split them back,
+        // verify the result matches the original.
     }
 }
 ```
@@ -908,14 +1029,53 @@ This is called at the end of every constructor and mutation in debug/test builds
 | `get_block` | O(log N) — binary search over sorted `Vec<u64>`; no allocations |
 | `pack` for rank-8 U1 tensor | Single loop, ≤ 8 shifts and ORs — should compile to ~8 instructions |
 | `BlockSparseTensor::zeros` construction | One-time cost; not on hot path |
+| `permute` | O(nnz) — copies every stored element (NOT zero-copy for block-sparse) |
+| `fuse_legs` | O(nnz + S × P) where S = number of sectors, P = Cartesian product size of fused legs |
 | `flatten` | O(D_total²) single memcpy pass; negligible relative to O(D³) GEMM it feeds |
 | `SU2Irrep::fuse_all` | Returns an iterator; no heap allocation |
+| `iter_keyed_blocks` | O(1) per iteration step; zero allocations |
 
 CI Criterion benchmarks must verify that `get_block` on a 100-sector tensor completes in < 10 ns.
 
 ---
 
-## 17. Out of Scope
+## 17. Implementation Notes and Design Decisions
+
+### Note 1 — `leg_directions` Is a Required Field on `BlockSparseTensor`
+
+The original architecture document omitted `leg_directions` from the `BlockSparseTensor` struct. The draft implementation revealed that `leg_directions: Vec<LegDirection>` is essential: `check_flux_rule` requires knowing which legs are `Incoming` vs `Outgoing` to correctly fuse quantum numbers. All constructors (`zeros`, `from_blocks`) now require `leg_directions` as a parameter. This field is stored on the tensor and propagated through `permute`, `fuse_legs`, and `split_leg`.
+
+### Note 2 — `permute()` Copies Data for Block-Sparse Tensors
+
+The original spec claimed structural operations are zero-copy. This is true for dense tensors (stride permutation), but NOT for block-sparse tensors. BLAS requires contiguous memory within each block, so `permute()` must call `block.permute(perm).into_owned()` on every block. The cost is O(nnz) — every stored element is copied once.
+
+### Note 3 — `fuse_legs` Uses `BTreeMap` for Deterministic Ordering
+
+The fusion algorithm uses `BTreeMap` (not `HashMap`) for the offset map to guarantee deterministic sector ordering. This is critical for numerical reproducibility: `HashMap` iteration order is randomized, which would cause non-deterministic block layouts and, consequently, non-bitwise-reproducible DMRG sweeps.
+
+### Note 4 — All Blocks Use `'static` Lifetime
+
+`BlockSparseTensor<T, Q>` stores `Vec<DenseTensor<'static, T>>`. There are no arena-borrowed blocks. This simplifies ownership semantics at the cost of requiring heap allocation for every block. Arena-backed blocks remain a future optimization for the GPU path.
+
+### Note 5 — CG Coefficients Use Hand-Rolled Racah Formula
+
+The `ClebschGordanCache` computes Clebsch-Gordan coefficients using a direct algebraic Racah formula implementation rather than the `lie-groups` external crate. This eliminates an external dependency and gives full control over numerical precision and caching strategy.
+
+---
+
+## 18. Security Considerations
+
+### 18.1 Unsafe Code in `flatten()`
+
+The `flatten()` method uses `alloc_slice_uninit` to allocate uninitialized memory from the `SweepArena`. This is sound because every byte is immediately populated by `copy_from_slice` before any read occurs. The unsafe block is confined to the `flatten` method and does not leak uninitialized memory to callers.
+
+### 18.2 `from_raw_parts()` Bypasses Validation
+
+The `pub(crate)` method `from_raw_parts()` constructs a `BlockSparseTensor` without checking invariants (sorted keys, flux rule, shape consistency). It is used only by `unflatten` where the data is known to satisfy all invariants. This method must not be made `pub` without adding safety documentation.
+
+---
+
+## 19. Out of Scope
 
 The following are explicitly **not** implemented in `tk-symmetry`:
 
@@ -927,11 +1087,15 @@ The following are explicitly **not** implemented in `tk-symmetry`:
 
 ---
 
-## 18. Open Questions
+## 20. Open Questions
 
 | # | Question | Status |
 |:--|:---------|:-------|
 | 1 | Should `BlockSparseTensor` support mixed symmetry groups on different legs (e.g., leg 0 carries `U1`, leg 1 carries `Z2`)? Current design requires all legs to share the same `Q` type. | Deferred — workaround is to use `U1Z2` composite type |
 | 2 | Is `SmallVec<[SU2Irrep; 6]>` the right key for the `WignerEckartTensor` reduced-block map, or should it be a sorted `Vec` for a more complex rank pattern? | Deferred — to be decided when SU(2) is actively implemented |
-| 3 | Should `ClebschGordanCache` use `dashmap` for better concurrent write performance during `prefill`? | Open — profile under realistic multi-thread load first |
+| 3 | Should `ClebschGordanCache` use `dashmap` for better concurrent write performance during `prefill`? | Resolved — draft implementation uses `DashMap` for thread-safe lazy caching |
 | 4 | Does `enumerate_valid_sectors` need memoization for high-rank tensors (rank > 6)? | Open — benchmark on rank-8 MPO construction before optimizing |
+| 5 | Should constructors return `SymResult` instead of panicking on invariant violations (e.g., mismatched leg counts, flux rule violations)? Panics are appropriate for programmer errors, but may be unfriendly for downstream crate consumers. | Open — draft uses panics; evaluate whether `Result` returns improve ergonomics |
+| 6 | Should `FlatBlockStorage` store full multi-dimensional shapes for non-rank-2 blocks, or is the `(numel, 1)` fallback acceptable given that `flatten` is only used on the rank-2 GEMM path? | Open — current design loses shape for rank != 2 |
+| 7 | Should `from_raw_parts` remain `pub(crate)`, or should it be promoted to a public unsafe constructor for advanced use cases? | Open — currently `pub(crate)` escape hatch for `unflatten` |
+| 8 | Should property-based tests (`proptest`) be added as a priority before stabilizing the API? 40 unit tests pass, but no `proptest` coverage exists. | Open — planned for next iteration |

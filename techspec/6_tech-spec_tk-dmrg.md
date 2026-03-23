@@ -1,8 +1,8 @@
 # Technical Specification: `tk-dmrg`
 
 **Crate:** `tensorkraft/crates/tk-dmrg`
-**Version:** 0.1.0 (Pre-Implementation)
-**Status:** Specification
+**Version:** 0.1.0 (Post-Draft-Implementation)
+**Status:** Draft
 **Last Updated:** March 2026
 
 ---
@@ -120,15 +120,25 @@ pub struct BondCentered {
 ///
 /// # Type Parameters
 /// - `T`: scalar type (`f64`, `Complex<f64>`, etc.)
-/// - `Q`: quantum number type (`U1`, `Z2`, `U1Z2`, etc.)
+/// - `Q`: quantum number type (`U1`, `Z2`, `U1Z2`, etc.). All quantum number
+///   types are small `Copy` types; `BitPackable` requires `Copy` as a supertrait
+///   to avoid pervasive `.clone()` ergonomic friction (draft implementation finding).
 /// - `Gauge`: typestate marker encoding the current canonical form
 pub struct MPS<T: Scalar, Q: BitPackable, Gauge> {
     /// Site tensors. Leg ordering: (σ, α_left, α_right).
     /// σ ∈ 0..local_dim[site]; α_left/α_right are bond indices.
+    ///
+    /// **Implementation requirement:** `BlockSparseTensor<T, Q>` must implement
+    /// `Clone`. The draft implementation revealed that MPS cloning is needed for
+    /// excited-state DMRG (penalized states), checkpointing, energy variance
+    /// computation, and iDMRG bootstrap. This is HIGH SEVERITY: without `Clone`
+    /// on `BlockSparseTensor`, none of these features are implementable.
     tensors: Vec<BlockSparseTensor<T, Q>>,
     /// Bond matrices (singular value diagonal tensors) for BondCentered form.
     /// None in all other gauge forms.
-    bonds: Option<Vec<DenseTensor<T>>>,
+    /// Note: `DenseTensor<'a, T>` carries a lifetime for borrowed storage;
+    /// owned variants use `DenseTensor<'static, T>`.
+    bonds: Option<Vec<DenseTensor<'static, T>>>,
     /// Physical (local Hilbert space) dimension per site.
     local_dims: Vec<usize>,
     /// Total charge of the MPS (target quantum number sector).
@@ -243,7 +253,7 @@ impl<T: Scalar, Q: BitPackable> MPS<T, Q, MixedCanonical> {
 
 impl<T: Scalar, Q: BitPackable> MPS<T, Q, BondCentered> {
     /// Return a reference to the exposed bond matrix.
-    pub fn bond_matrix(&self) -> &DenseTensor<T>;
+    pub fn bond_matrix(&self) -> &DenseTensor<'_, T>;
 
     /// Absorb the bond matrix back into the left site tensor,
     /// returning to MixedCanonical form with center = `self.left`.
@@ -592,7 +602,10 @@ where
 /// - Support thick restarts when subspace is exhausted
 /// - Support warm-start initial vectors or subspace bases
 ///
-/// The trait is object-safe: `Box<dyn IterativeEigensolver<f64>>` is valid.
+/// The trait is object-safe: `Box<dyn IterativeEigensolver<f64>>` is valid
+/// because `f64` is a concrete type. Complex-valued TDVP would require a
+/// separate `Box<dyn IterativeEigensolver<Complex<f64>>>` field rather than
+/// making `DMRGConfig` generic over `T`.
 pub trait IterativeEigensolver<T: Scalar>: Send + Sync {
     /// Find the lowest eigenvalue and eigenvector.
     ///
@@ -661,6 +674,12 @@ pub struct EigenResult<T: Scalar> {
 ///
 /// A thick restart collapses the subspace to `restart_vectors` best Ritz
 /// vectors when `max_krylov_dim` is reached.
+///
+/// **Draft implementation status:** Lanczos is the only eigensolver with a
+/// working implementation. The tridiagonal solve currently uses Sturm
+/// bisection with O(n^2) complexity. This is acceptable for small Krylov
+/// dimensions (m <= 100) but should be replaced with LAPACK `dstev` (O(n))
+/// if Krylov dimensions grow significantly.
 pub struct LanczosSolver {
     /// Maximum Krylov dimension before thick restart. Default: 100.
     pub max_krylov_dim: usize,
@@ -695,6 +714,10 @@ where
 /// where r is the residual and D is the diagonal of A. Converges faster
 /// than Lanczos when H_eff is diagonal-dominant (typical for local
 /// Hamiltonians in the local Fock basis).
+///
+/// **Draft implementation status:** Currently delegates to `LanczosSolver`
+/// without applying the diagonal preconditioner. The preconditioner is not
+/// yet implemented.
 pub struct DavidsonSolver {
     /// Maximum Krylov subspace dimension. Default: 60.
     pub max_subspace: usize,
@@ -732,6 +755,9 @@ where
 /// compute-bound batched dgemm (BLAS Level 3) by operating on a block
 /// of `block_size` vectors simultaneously. Used for excited-state DMRG
 /// targeting the lowest k eigenstates (k = block_size).
+///
+/// **Draft implementation status:** Currently delegates to `LanczosSolver`
+/// without block structure or diagonal preconditioner.
 pub struct BlockDavidsonSolver {
     /// Number of target eigenstates (block size). Default: 1.
     pub block_size: usize,
@@ -869,7 +895,21 @@ impl BondDimensionSchedule {
 
 ```rust
 /// Configuration for a DMRG simulation run.
-#[derive(Clone, Debug)]
+///
+/// **Draft implementation finding:** This struct mixes immutable configuration
+/// with mutable runtime state. `bond_dim_schedule` changes across sweeps, and
+/// `eigensolver` (via `DavidsonSolver::diagonal`) carries mutable state.
+/// Recommend splitting into:
+/// - `DMRGConfig` — immutable parameters set before the run
+/// - `DMRGState` — mutable runtime state (current bond dim, eigensolver state)
+///
+/// **Derive limitation:** `Box<dyn IterativeEigensolver<f64>>` is not `Clone`,
+/// which prevents `#[derive(Clone)]` on `DMRGConfig`. The `Debug` impl must
+/// be manual or the `eigensolver` field must be excluded. All public config
+/// structs (`DMRGConfig`, `DMRGStats`, `TdvpStabilizationConfig`) should derive
+/// `Clone` and `Debug` to avoid blocking derives on downstream types.
+// Note: #[derive(Clone, Debug)] is the target but requires resolving the
+// Box<dyn IterativeEigensolver> Clone issue first.
 pub struct DMRGConfig {
     /// Bond dimension schedule across sweeps.
     pub bond_dim_schedule: BondDimensionSchedule,
@@ -930,6 +970,10 @@ pub enum UpdateVariant {
 /// The engine always holds the MPS in `MixedCanonical` form. The gauge
 /// center moves by one site after each sweep step. `BondCentered` form is
 /// used internally by `TdvpDriver` and is transparent to `DMRGEngine` users.
+/// **Draft implementation finding:** The engine owns the MPS, MPO, and backend
+/// by value. This limits flexibility: the backend cannot be shared across
+/// multiple engines, and the MPO cannot be reused without cloning. Consider
+/// `&B` or `Arc<B>` for the backend parameter to allow sharing.
 pub struct DMRGEngine<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> {
     pub mps: MPS<T, Q, MixedCanonical>,
     pub mpo: MPO<T, Q>,
@@ -977,9 +1021,14 @@ where
 
     /// Execute one two-site DMRG step at `site`.
     ///
-    /// Ownership boundary: SVD outputs (`al`, `ar`) must call `.into_owned()`
-    /// before `self.arena.reset()` at the end of this method.
-    /// The borrow checker enforces this statically.
+    /// **Ownership boundary (critical ordering constraint):** SVD outputs
+    /// (`al`, `ar`) must call `.into_owned()` before `self.arena.reset()` at
+    /// the end of this method. While the borrow checker catches some violations,
+    /// the draft implementation revealed that the ordering constraint between
+    /// `into_owned()` and `arena.reset()` is implicit and easy to violate.
+    /// Callers must ensure all arena-borrowed data is converted to owned form
+    /// before any arena reset. Consider a scoped-arena API or a guard type that
+    /// enforces this ordering at the type level.
     ///
     /// Steps:
     /// 1. Merge site tensors `site` and `site+1` into a two-site tensor Θ
@@ -1343,6 +1392,16 @@ pub fn build_heff_penalized<'arena, T: Scalar, Q: BitPackable, B: LinAlgBackend<
 /// Written atomically (temp file + rename) at the end of each full sweep
 /// when `DMRGConfig::checkpoint_path` is set. Enables restart after
 /// process interruption without losing converged state.
+///
+/// **Draft implementation finding:** Checkpointing is currently non-functional.
+/// `BlockSparseTensor` does not implement `serde::Serialize` or
+/// `serde::Deserialize`, which blocks the entire checkpoint pipeline.
+/// Resolution requires either:
+/// 1. Adding `serde` derives to `BlockSparseTensor` in `tk-core`/`tk-symmetry`
+///    (propagates a `serde` dependency into those crates), or
+/// 2. Defining a `SerializedBlockSparseTensor` proxy type in `tk-dmrg` that
+///    manually converts to/from a serializable representation.
+/// See Open Question #8.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct DMRGCheckpoint<T, Q>
 where
@@ -1442,6 +1501,13 @@ pub type DmrgResult<T> = Result<T, DmrgError>;
 
 ```rust
 // tk-dmrg/src/lib.rs
+//
+// **Draft implementation finding:** `tk-dmrg` does not re-export its upstream
+// dependencies (`tk-core`, `tk-symmetry`, `tk-linalg`, `tk-contract`, `tk-dsl`).
+// Downstream consumers must add each upstream crate as a direct dependency in
+// their own `Cargo.toml`. Consider re-exporting commonly used types (e.g.,
+// `BlockSparseTensor`, `Scalar`, `BitPackable`, `LinAlgBackend`, `U1`, `Z2`)
+// to reduce dependency management burden for downstream crates.
 
 pub mod mps;
 pub mod mpo;
@@ -1548,6 +1614,10 @@ pub type DefaultEngine = DMRGEngine<f64, tk_symmetry::U1, tk_linalg::DeviceFaer>
 | Two-site tensor Θ | 4 | (σ_i, σ_{i+1}, α_L, α_R) | merged for 2-site update |
 | Bond matrix S | 2 | (α_L, α_R) | diagonal; D × D |
 
+**Naming conventions (draft implementation corrections):**
+- `LegDirection` variants are `Incoming`/`Outgoing` (not the abbreviated `In`/`Out` used in earlier spec sketches).
+- `QIndex` exposes `total_dim()` (not `dim()`) for the total dimension across all sectors.
+
 ### 16.2 Quantum Number Flow in U(1)-Symmetric MPS
 
 The flux rule for each MPS site tensor A[i] with legs (σ, α_L, α_R):
@@ -1653,6 +1723,8 @@ let ground_energy: f64 = engine.run()?;
 ---
 
 ## 18. Testing Strategy
+
+**Draft implementation status:** 16 tests pass. The Lanczos eigensolver is fully functional. The sweep engine, environment management, TDVP driver, and MPO compilation are skeleton implementations only.
 
 ### 18.1 Unit Tests
 
@@ -1825,6 +1897,32 @@ pub type DefaultEngine = DMRGEngine<f64, tk_symmetry::U1, tk_linalg::DeviceFaer>
 
 Additional combinations (e.g., `Complex<f64>` for real-time TDVP, `Z2` for parity-symmetric models) are compiled only when explicitly requested via feature flags.
 
+### Note 9 — `BitPackable` Should Require `Copy`
+
+The draft implementation found that `BitPackable` not requiring `Clone` (let alone `Copy`) causes ergonomic friction everywhere quantum number values are passed around. All quantum number types (`U1`, `Z2`, `U1Z2`, `SU2Irrep`) are small stack-allocated types (typically 4-8 bytes). Adding `Copy` as a supertrait of `BitPackable` in `tk-symmetry` eliminates pervasive `.clone()` calls with no semantic cost. This is an upstream change in `tk-symmetry`.
+
+### Note 10 — `BlockSparseTensor` Must Implement `Clone`
+
+Without `Clone` on `BlockSparseTensor`, the following features are blocked:
+- Excited-state DMRG (penalized states must be cloned into `ExcitedStateConfig`)
+- Checkpointing (MPS/MPO snapshots)
+- Energy variance computation (`<H^2> - <H>^2` requires a scratch copy of the MPS)
+- iDMRG bootstrap (unit-cell tensors are duplicated during system growth)
+
+This is a HIGH SEVERITY issue in the upstream `tk-core` crate.
+
+### Note 11 — `DMRGConfig` Immutable/Mutable Split
+
+The draft implementation revealed that `DMRGConfig` conflates static user-specified configuration with mutable runtime state. Specifically:
+- `bond_dim_schedule` is consumed and mutated across sweeps
+- `eigensolver` (via `DavidsonSolver::diagonal`) is mutated before each step
+
+Recommend splitting into `DMRGConfig` (immutable, set once before `run()`) and `DMRGState` (mutable, updated by the engine during sweeps). This also resolves the `Clone`/`Debug` derive issue: `DMRGConfig` without `Box<dyn IterativeEigensolver>` can derive both traits. The eigensolver moves to `DMRGState` or is passed as a type parameter.
+
+### Note 12 — Dependency Re-Export Policy
+
+`tk-dmrg` does not re-export any upstream types. Downstream crates (`tk-dmft`, `tk-python`) must add `tk-core`, `tk-symmetry`, `tk-linalg`, `tk-contract`, and `tk-dsl` as direct dependencies to access types like `Scalar`, `BitPackable`, and `LinAlgBackend`. This is burdensome. A `pub use` facade re-exporting the most commonly needed upstream types would improve ergonomics without violating encapsulation.
+
 ---
 
 ## 20. Out of Scope
@@ -1850,10 +1948,16 @@ The following are explicitly **not** implemented in `tk-dmrg`:
 | # | Question | Status |
 |:--|:---------|:-------|
 | 1 | Should `Environments` support disk offloading for large systems (D > 1000, N > 100)? Current spec allocates all N environments in RAM. An LRU cache with disk eviction via `checkpoint.rs` may be required before Phase 3 benchmarks. | Open — benchmark environment memory at D=1000, N=100 first |
-| 2 | Should `DMRGConfig::eigensolver` be `Box<dyn IterativeEigensolver<f64>>` (current) or `Box<dyn IterativeEigensolver<T>>`? The former requires a separate eigensolver field for complex-valued TDVP; the latter propagates T into DMRGConfig. | Open — decide when implementing TDVP detail |
-| 3 | `DavidsonSolver::diagonal` is mutably set by the engine before each call. Is there a cleaner injection mechanism that does not require mutable state in the solver struct? A `DiagonalPreconditioner` strategy trait may be cleaner. | Deferred — refactor after Phase 3 prototype |
+| 2 | Should `DMRGConfig::eigensolver` be `Box<dyn IterativeEigensolver<f64>>` (current) or `Box<dyn IterativeEigensolver<T>>`? The former requires a separate eigensolver field for complex-valued TDVP; the latter propagates T into DMRGConfig. Draft finding: `Box<dyn IterativeEigensolver<f64>>` works for ground-state DMRG since `f64` is concrete. Complex TDVP needs a separate field. | Resolved — keep `f64` concrete type; add separate complex eigensolver field for TDVP |
+| 3 | `DavidsonSolver::diagonal` is mutably set by the engine before each call. Is there a cleaner injection mechanism that does not require mutable state in the solver struct? A `DiagonalPreconditioner` strategy trait may be cleaner. Draft finding: Davidson currently delegates to Lanczos with no preconditioner, so this is moot until the preconditioner is implemented. | Deferred — refactor after Davidson preconditioner is implemented |
 | 4 | Should `MpoCompiler` expose an `MpoCompressionStrategy` enum (FSA-only vs. FSA + SVD), or always apply SVD? For short-range models, FSA-only gives the exact minimal-bond-dim MPO; SVD adds overhead. | Open — determine whether the overhead is material during Phase 2 |
 | 5 | `run_idmrg` takes a unit-cell MPO (2 sites). For non-trivial unit cells (dimerized chains, multi-orbital Hubbard), the unit cell size should be configurable. Add `unit_cell_size: usize` to `IDmrgConfig`? | Deferred — required only when iDMRG is tested with non-trivial unit cells |
 | 6 | Should `energy_variance` be computed during the sweep (at the cost of one extra H² matvec per site, ~50% overhead per sweep) or only on-demand after convergence? The `variance_tol` criterion makes per-sweep computation useful. | Open — profile cost before choosing default |
 | 7 | `TruncationConfig::multiplet_info` (SU(2) only) introduces a `Vec<(SU2Irrep, usize)>` into the common truncation path. A `TruncationPolicy` trait (with `select_cutoff` method) may decouple the SU(2)-specific type from the generic code path. | Deferred — `su2-symmetry` is actively implemented |
-| 8 | Should `BlockSparseTensor` derive `serde::Serialize` (propagating a `serde` dependency into `tk-symmetry`) or should `tk-dmrg` define its own `SerializedBlockSparseTensor` serialization proxy? | Open — check `serde` feature-gating conventions used across the workspace |
+| 8 | Should `BlockSparseTensor` derive `serde::Serialize` (propagating a `serde` dependency into `tk-symmetry`) or should `tk-dmrg` define its own `SerializedBlockSparseTensor` serialization proxy? Draft finding: checkpointing is currently non-functional because `BlockSparseTensor` lacks `Serialize`. This is a blocking issue. | Open — HIGH PRIORITY; checkpointing is non-functional without resolution |
+| 9 | Should `BitPackable` require `Copy` as a supertrait? All quantum number types are small stack-allocated `Copy` types. The current lack of `Copy` causes pervasive `.clone()` calls and ergonomic friction. | Open — upstream change in `tk-symmetry`; recommend resolving before Phase 3 |
+| 10 | Should `DMRGConfig` be split into immutable config and mutable state? Current design mixes static configuration with runtime-mutable fields (`bond_dim_schedule`, `eigensolver.diagonal`). The split would also resolve `Clone`/`Debug` derive issues. | Open — recommend splitting before Phase 3 |
+| 11 | Should `DMRGEngine` take `&B` or `Arc<B>` for the backend instead of owning `B` by value? Owning limits backend sharing across engines and MPO reuse without cloning. | Open — evaluate ergonomic impact on downstream crates |
+| 12 | Should `tk-dmrg` re-export commonly used upstream types (`Scalar`, `BitPackable`, `LinAlgBackend`, `U1`, `Z2`, `BlockSparseTensor`)? Currently each upstream crate must be added as a direct dependency by downstream consumers. | Open — evaluate re-export facade approach |
+| 13 | Should `SweepArena` provide a scoped API or guard type to enforce the `into_owned()`-before-`reset()` ordering constraint? The current implicit ordering is easy to violate. | Open — evaluate type-level enforcement approaches |
+| 14 | Should the Lanczos tridiagonal solve be upgraded from Sturm bisection O(n^2) to LAPACK `dstev` O(n)? Current approach is fine for small Krylov dimensions but may become a bottleneck. | Deferred — profile after Krylov dimension requirements are established |

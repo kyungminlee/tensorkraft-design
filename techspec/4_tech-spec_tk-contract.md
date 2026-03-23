@@ -1,8 +1,8 @@
 # Technical Specification: `tk-contract`
 
 **Crate:** `tensorkraft/crates/tk-contract`
-**Version:** 0.1.0 (Pre-Implementation)
-**Status:** Specification
+**Version:** 0.1.0 (Post-Draft)
+**Status:** Draft
 **Last Updated:** March 2026
 
 ---
@@ -147,29 +147,44 @@ impl ContractionSpec {
     /// Number of input tensors.
     pub fn n_tensors(&self) -> usize;
 
-    /// Set of contracted index pairs: each element is a pair of
-    /// (TensorId, leg_position) for the two tensors sharing that IndexId.
+    /// Contracted indices: each element is a single `IndexId` that appears
+    /// on exactly two tensors and is therefore summed over. Because
+    /// `ContractionSpec` uses the same `IndexId` on both tensors to denote
+    /// contraction, each element here is a single `IndexId` — not a pair
+    /// of distinct IDs.
     ///
-    /// **Implementation note:** Consider caching this result during `new()`
-    /// rather than recomputing on every call, since optimizers may invoke
-    /// this repeatedly during candidate evaluation.
-    pub fn contracted_pairs(&self) -> Vec<(IndexId, (TensorId, usize), (TensorId, usize))>;
+    /// **Draft implementation note:** The original spec returned
+    /// `Vec<(IndexId, (TensorId, usize), (TensorId, usize))>` (pairs with
+    /// positions). The draft simplified this to `Vec<IndexId>` because the
+    /// shared `IndexId` convention makes the pair representation redundant.
+    /// Tensor-specific leg positions are derivable from the spec's
+    /// `tensors` field when needed.
+    ///
+    /// **Implementation note:** Cached during `new()` rather than
+    /// recomputed on every call, since optimizers invoke this repeatedly
+    /// during candidate evaluation.
+    pub fn contracted_indices(&self) -> &[IndexId];
 
     /// Free indices in order, with their (TensorId, leg_position).
     ///
-    /// **Implementation note:** Same caching consideration as `contracted_pairs()`.
+    /// **Implementation note:** Same caching consideration as `contracted_indices()`.
     pub fn free_indices(&self) -> Vec<(IndexId, TensorId, usize)>;
 
     /// Find all contracted indices shared between two specific tensors.
     ///
-    /// Required by optimizers during candidate-pair evaluation: the greedy
-    /// optimizer calls this O(n²) times per step to determine the M/K/N
-    /// dimensions of each candidate pairwise contraction.
+    /// **Added during draft implementation:** Not in the original spec but
+    /// needed by the `GreedyOptimizer` O(n^2) times per optimization step
+    /// to determine the M/K/N dimensions of each candidate pairwise
+    /// contraction.
     ///
-    /// For n ≤ 5 (DMRG), a linear scan over `contracted_pairs()` is fine.
+    /// Returns the `IndexId`s that appear on both tensor `a` and tensor `b`.
+    /// Since `ContractionSpec` uses shared `IndexId`s, the return type is
+    /// `Vec<IndexId>` rather than `Vec<(IndexId, IndexId)>`.
+    ///
+    /// For n <= 5 (DMRG), a linear scan over `contracted_indices()` is fine.
     /// For larger networks, consider building a `HashMap<(TensorId, TensorId),
-    /// Vec<ContractedPair>>` at construction time.
-    pub fn shared_indices(&self, a: TensorId, b: TensorId) -> Vec<ContractedPair>;
+    /// Vec<IndexId>>` at construction time.
+    pub fn shared_indices(&self, a: TensorId, b: TensorId) -> Vec<IndexId>;
 }
 ```
 
@@ -245,12 +260,14 @@ pub enum ContractionNode {
     Contraction {
         left: Box<ContractionNode>,
         right: Box<ContractionNode>,
-        /// Contracted index pairs. Each entry is a single `IndexId` that
+        /// Contracted index IDs. Each entry is a single `IndexId` that
         /// appears on both the left and right subtrees (shared indices are
         /// summed over during contraction). Since `ContractionSpec` uses the
         /// same `IndexId` on both tensors to denote contraction, each element
         /// here is the shared `IndexId` — not a pair of distinct IDs.
         /// Dimensions must match; validated during graph construction.
+        /// Type is `Vec<IndexId>`, consistent with
+        /// `ContractionSpec::contracted_indices()`.
         contracted_indices: Vec<IndexId>,
         /// Indices of the result tensor, in the order they will appear
         /// after the pairwise contraction. Free indices from `left` appear
@@ -606,10 +623,12 @@ impl PathOptimizer for TreeSAOptimizer {
 /// tensor has been extracted (via `.into_owned()` if it must survive the reset).
 ///
 /// **Lifetime design note (discovered during draft implementation):**
-/// The executor must hold both borrowed input tensors (`&'a DenseTensor<'a, T>`)
-/// and owned intermediate results (`DenseTensor<'static, T>`) simultaneously.
-/// These have incompatible lifetimes in the `DenseTensor<'a, T>` type. Two
-/// workable designs:
+/// `DenseTensor<'a, T>` carries a lifetime parameter `'a` because it can
+/// borrow its data storage. The executor must hold both borrowed input
+/// tensors (`&DenseTensor<'a, T>`) and owned intermediate results
+/// (`DenseTensor<'static, T>`) simultaneously. These have incompatible
+/// lifetimes, making a single `HashMap<TensorId, &DenseTensor<'a, T>>`
+/// insufficient for the executor's working set. Three workable designs:
 ///
 /// **Option A — Arena-unified:** All inputs are first copied into the
 /// `SweepArena` at the start of `execute`, giving every tensor the same
@@ -617,16 +636,28 @@ impl PathOptimizer for TreeSAOptimizer {
 /// lifetime mismatches. Recommended when the arena is already pre-sized
 /// to hold the full contraction working set.
 ///
-/// **Option B — Split storage:** The executor maintains separate
-/// `inputs: &HashMap<TensorId, &DenseTensor<T>>` (borrowed) and
-/// `intermediates: HashMap<TensorId, DenseTensor<'static, T>>` (owned).
-/// The `get_tensor` helper dispatches to the correct map by `TensorId`.
-/// No extra copies, but the two maps have different lifetime parameters,
-/// requiring either an enum wrapper or careful lifetime erasure.
+/// **Option B — Split storage (used in draft):** The executor maintains
+/// separate `inputs: &HashMap<TensorId, &DenseTensor<'a, T>>` (borrowed)
+/// and `intermediates: HashMap<TensorId, DenseTensor<'static, T>>` (owned).
+/// A `get_tensor` helper dispatches to the correct map by `TensorId`.
+/// No extra copies, but the two maps have different lifetime parameters.
+/// The draft used unsafe lifetime transmute to unify the types in a single
+/// lookup path; a safer approach uses an enum wrapper:
+/// ```rust
+/// enum TensorRef<'a, T: Scalar> {
+///     Borrowed(&'a DenseTensor<'a, T>),
+///     Owned(DenseTensor<'static, T>),
+/// }
+/// ```
 ///
-/// The current signature below uses Option A (arena parameter). Implementors
-/// choosing Option B should adjust the `execute` signature to omit the arena
-/// and return `DenseTensor<'static, T>` instead.
+/// **Option C — Always-owned via `Arc<[T]>`:** Change `DenseTensor` to
+/// use `Arc<[T]>` backing storage, making all tensors cheaply cloneable
+/// and eliminating the lifetime parameter entirely. This is the cleanest
+/// long-term solution but requires changes in `tk-core`.
+///
+/// The current signature below uses Option A (arena parameter). The draft
+/// implementation used Option B with unsafe transmute. Implementors
+/// choosing Option B or C should adjust the `execute` signature accordingly.
 pub struct ContractionExecutor<T: Scalar, B: LinAlgBackend<T>> {
     backend: B,
     _phantom: PhantomData<T>,
@@ -658,7 +689,7 @@ impl<T: Scalar, B: LinAlgBackend<T>> ContractionExecutor<T, B> {
     pub fn execute<'arena>(
         &self,
         graph: &ContractionGraph,
-        inputs: &HashMap<TensorId, &DenseTensor<T>>,
+        inputs: &HashMap<TensorId, &DenseTensor<'_, T>>,
         arena: &'arena mut SweepArena,
     ) -> ContractResult<TempTensor<'arena, T>>;
 
@@ -672,7 +703,7 @@ impl<T: Scalar, B: LinAlgBackend<T>> ContractionExecutor<T, B> {
     pub fn contract_once<'arena>(
         &self,
         spec: &ContractionSpec,
-        inputs: &HashMap<TensorId, &DenseTensor<T>>,
+        inputs: &HashMap<TensorId, &DenseTensor<'_, T>>,
         optimizer: &dyn PathOptimizer,
         cost: &CostMetric,
         max_memory_bytes: Option<usize>,
@@ -715,6 +746,14 @@ These are `pub(crate)` helpers in `reshape.rs` that implement the critical "resh
 ///   a heap-allocated `Vec<T>` is used as fallback. This is correct but
 ///   defeats the allocation-amortization benefit of the arena.
 ///
+/// **Draft implementation finding:** The draft only handled the contiguous
+/// fast path correctly. Non-contiguous inputs without an arena produced
+/// incorrect results because the fallback heap-allocation path was not
+/// implemented. The spec now requires that a `SweepArena` always be
+/// provided; the arena-less fallback is removed from the function signature.
+/// Callers that previously relied on arena-less execution (unit tests)
+/// should create a small temporary arena instead.
+///
 /// The optimizer's `CostMetric::bandwidth_weight` already penalizes paths
 /// that require transposes, so the slow path is triggered only when no
 /// transpose-free ordering exists.
@@ -725,7 +764,7 @@ These are `pub(crate)` helpers in `reshape.rs` that implement the critical "resh
 /// step requires A†), `is_conjugated` is set on the returned `MatRef` rather
 /// than performing an explicit conjugation pass.
 pub(crate) fn tensor_to_mat_ref<'a, T: Scalar>(
-    tensor: &'a DenseTensor<T>,
+    tensor: &'a DenseTensor<'_, T>,
     contracted_legs: &[usize],
     conjugated: bool,
     arena: &'a SweepArena,
@@ -738,7 +777,7 @@ pub(crate) fn tensor_to_mat_ref<'a, T: Scalar>(
 pub(crate) fn mat_to_tensor<T: Scalar>(
     mat: MatMut<'_, T>,
     output_shape: TensorShape,
-) -> DenseTensor<T>;
+) -> DenseTensor<'static, T>;
 
 /// Cache-oblivious block-transpose for non-contiguous inputs.
 ///
@@ -746,7 +785,7 @@ pub(crate) fn mat_to_tensor<T: Scalar>(
 /// Uses 16×16 cache tiles for L1-cache locality.
 /// Allocates the output buffer from `arena`.
 pub(crate) fn block_transpose<'a, T: Scalar>(
-    src: &DenseTensor<T>,
+    src: &DenseTensor<'_, T>,
     perm: &[usize],
     arena: &'a SweepArena,
 ) -> TempTensor<'a, T>;
@@ -924,15 +963,24 @@ impl<T: Scalar, Q: BitPackable> StructuralContractionHook<T, Q> for AbelianHook<
 /// scratch in that case. Shape changes are detected by comparing the stored
 /// `IndexMap` against the current tensor shapes; rebuild is triggered by
 /// `needs_rebuild`.
-pub struct ExecutionPlan<T: Scalar, Q: BitPackable = crate::NoQ> {
+///
+/// **Simplified from draft implementation:** The original spec parameterized
+/// `ExecutionPlan` over both `T: Scalar` and `Q: BitPackable` (with `NoQ` as
+/// a default). The draft found this unnecessary for the dense path and
+/// boilerplate-heavy when combined with borrowed backend references
+/// (PhantomData gymnastics). The simplified design uses `ExecutionPlan<T>`
+/// for plan construction and optimization (which are symmetry-agnostic),
+/// and dispatches to dense or sparse execution through separate methods
+/// that introduce the `Q` bound only where needed.
+pub struct ExecutionPlan<T: Scalar> {
     pub graph: ContractionGraph,
     pub steps: Vec<PairwiseStep>,
     /// The IndexMap used to build this plan. Stored for invalidation checks.
     index_map_snapshot: IndexMap,
-    _phantom: PhantomData<(T, Q)>,
+    _phantom: PhantomData<T>,
 }
 
-impl<T: Scalar, Q: BitPackable> ExecutionPlan<T, Q> {
+impl<T: Scalar> ExecutionPlan<T> {
     /// Build a new plan by running the optimizer.
     pub fn build(
         spec: &ContractionSpec,
@@ -949,12 +997,15 @@ impl<T: Scalar, Q: BitPackable> ExecutionPlan<T, Q> {
     pub fn execute_dense<'arena, B: LinAlgBackend<T>>(
         &self,
         backend: &B,
-        inputs: &HashMap<TensorId, &DenseTensor<T>>,
+        inputs: &HashMap<TensorId, &DenseTensor<'_, T>>,
         arena: &'arena mut SweepArena,
     ) -> ContractResult<TempTensor<'arena, T>>;
 
     /// Execute the plan over block-sparse inputs.
-    pub fn execute_sparse<B>(
+    /// The `Q: BitPackable` bound is introduced here rather than on the
+    /// struct, so that `ExecutionPlan<T>` remains usable without a quantum
+    /// number type on the dense path.
+    pub fn execute_sparse<Q: BitPackable, B>(
         &self,
         backend: &B,
         inputs: &HashMap<TensorId, &BlockSparseTensor<T, Q>>,
@@ -965,28 +1016,14 @@ impl<T: Scalar, Q: BitPackable> ExecutionPlan<T, Q> {
         B: LinAlgBackend<T> + SparseLinAlgBackend<T, Q>;
 }
 
-/// Sentinel quantum-number type for the dense (non-symmetric) execution path.
-/// Not exported; exists only to satisfy the `Q: BitPackable` type parameter
-/// when no symmetry is in use. `NoQ` implements `QuantumNumber` and
-/// `BitPackable` (zero-width packing) but does NOT implement `Scalar` —
-/// it is a quantum-number sentinel, not a numeric type.
-#[doc(hidden)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct NoQ;
-impl tk_symmetry::QuantumNumber for NoQ {
-    fn identity() -> Self { NoQ }
-    fn fuse(&self, _other: &Self) -> Self { NoQ }
-    fn dual(&self) -> Self { NoQ }
-}
-impl tk_symmetry::BitPackable for NoQ {
-    const BIT_WIDTH: usize = 0;
-    fn pack(&self) -> u64 { 0 }
-    fn unpack(_: u64) -> Self { NoQ }
-}
-
-/// Convenience type alias for the dense (non-symmetric) execution path.
-/// Downstream crates can use `DenseExecutionPlan<f64>` instead of
-/// `ExecutionPlan<f64, NoQ>`, since `NoQ` is not publicly exported.
+/// **`NoQ` sentinel removed:** With `ExecutionPlan<T>` no longer parameterized
+/// over `Q`, the `NoQ` sentinel type is unnecessary. The `Q: BitPackable`
+/// bound is introduced only on `execute_sparse`, not on the plan struct.
+/// Dense callers use `ExecutionPlan<f64>` directly without any quantum
+/// number type parameter.
+///
+/// `DenseExecutionPlan<T>` is retained as a type alias for backward
+/// compatibility but is now identical to `ExecutionPlan<T>`.
 pub type DenseExecutionPlan<T> = ExecutionPlan<T>;
 ```
 
@@ -1102,30 +1139,29 @@ pub use index::{IndexId, TensorId, IndexSpec, ContractionSpec, IndexMap};
 pub use graph::{ContractionNode, ContractionGraph};
 pub use cost::CostMetric;
 pub use optimizer::{PathOptimizer, GreedyOptimizer, DPOptimizer, TreeSAOptimizer};
-pub use executor::{ContractionExecutor, ExecutionPlan};
+pub use executor::{ContractionExecutor, ExecutionPlan, DenseExecutionPlan};
 pub use sparse::SparseContractionExecutor;
 pub use structural::{StructuralContractionHook, AbelianHook};
 pub use error::{ContractionError, ContractResult};
-
-// Re-export NoQ only within the crate; not part of the public API.
-pub(crate) use executor::NoQ;
 ```
 
 ---
 
 ## 13. Feature Flags
 
-| Flag | Effect in tk-contract |
-|:-----|:----------------------|
-| `backend-faer` | Enables `DeviceFaer`-backed `ContractionExecutor` (default) |
-| `backend-oxiblas` | Enables `DeviceOxiblas`-backed sparse executor (default) |
-| `backend-mkl` | Uses Intel MKL GEMM for dense pairwise steps |
-| `backend-openblas` | Uses OpenBLAS GEMM for dense pairwise steps |
-| `backend-cuda` | GPU-dispatched GEMM via `DeviceCuda`; arena uses pinned memory when budget allows |
-| `su2-symmetry` | Unlocks `SU2ContractionHook` for Clebsch-Gordan coefficient injection; enables non-Abelian sparse execution path |
-| `parallel` | Enables Rayon parallelism within `SparseContractionExecutor::execute` |
+| Flag | Status | Effect in tk-contract |
+|:-----|:-------|:----------------------|
+| `backend-faer` | **Implemented** | Enables `DeviceFaer`-backed `ContractionExecutor` (default) |
+| `backend-oxiblas` | **Implemented** | Enables `DeviceOxiblas`-backed sparse executor (default) |
+| `backend-mkl` | **Planned** | Uses Intel MKL GEMM for dense pairwise steps. Not yet implemented in `tk-linalg`; feature flag is declared but commented out in `Cargo.toml` until the upstream backend exists. |
+| `backend-openblas` | **Planned** | Uses OpenBLAS GEMM for dense pairwise steps. Not yet implemented in `tk-linalg`; same status as `backend-mkl`. |
+| `backend-cuda` | **Planned** | GPU-dispatched GEMM via `DeviceCuda`; arena uses pinned memory when budget allows. Not yet implemented in `tk-linalg`. |
+| `su2-symmetry` | **Planned** (Phase 5+) | Unlocks `SU2ContractionHook` for Clebsch-Gordan coefficient injection; enables non-Abelian sparse execution path |
+| `parallel` | **Implemented** | Enables Rayon parallelism within `SparseContractionExecutor::execute` |
 
 `backend-mkl` and `backend-openblas` are mutually exclusive. The `build.rs` in `tk-linalg` enforces this; `tk-contract` does not duplicate the check.
+
+**Draft implementation note:** The `backend-mkl`, `backend-openblas`, and `backend-cuda` feature flags reference backends that do not yet exist in `tk-linalg`. The draft had to comment these out to compile. These flags should remain declared in `Cargo.toml` (for forward compatibility) but should be documented as planned-only until the upstream backends are implemented.
 
 ---
 
@@ -1179,9 +1215,10 @@ approx    = "0.5"   # assert_abs_diff_eq! for f64 tensor comparison
 default = ["backend-faer", "backend-oxiblas", "parallel"]
 backend-faer     = ["tk-linalg/backend-faer"]
 backend-oxiblas  = ["tk-linalg/backend-oxiblas"]
-backend-mkl      = ["tk-linalg/backend-mkl"]
-backend-openblas = ["tk-linalg/backend-openblas"]
-backend-cuda     = ["tk-linalg/backend-cuda", "tk-core/backend-cuda"]
+# Planned backends — uncomment when upstream tk-linalg support is implemented:
+# backend-mkl      = ["tk-linalg/backend-mkl"]
+# backend-openblas = ["tk-linalg/backend-openblas"]
+# backend-cuda     = ["tk-linalg/backend-cuda", "tk-core/backend-cuda"]
 su2-symmetry     = ["tk-symmetry/su2-symmetry"]
 parallel         = ["tk-linalg/parallel", "rayon"]
 treesa           = ["rand", "rand_xoshiro"]                # TreeSAOptimizer requires RNG
@@ -1191,37 +1228,47 @@ treesa           = ["rand", "rand_xoshiro"]                # TreeSAOptimizer req
 
 ## 16. Testing Strategy
 
+**Draft implementation status:** 26 tests pass in the draft implementation,
+covering `ContractionSpec` validation, `GreedyOptimizer`, `PairwiseStep`
+abstraction, `StructuralContractionHook`, and `CostMetric`. The tests below
+are updated to reflect both the passing draft tests and the remaining
+planned tests.
+
 ### 16.1 Unit Tests
 
-| Test | Description |
-|:-----|:------------|
-| `spec_new_valid_two_tensor` | Two tensors with one contracted pair; verify `contracted_pairs()` and `free_indices()` |
-| `spec_new_index_too_many_times` | Three tensors sharing one index -> `IndexAppearsTooManyTimes` |
-| `spec_new_duplicate_on_tensor` | One tensor with repeated IndexId -> `DuplicateIndexOnTensor` |
-| `spec_new_output_index_not_free` | Output index is contracted -> `OutputIndexNotFree` |
-| `spec_dimension_mismatch_detected` | Contracted pair with dim 3 vs dim 4 -> `DimensionMismatch` |
-| `greedy_optimizer_two_tensor` | Two tensors; verify graph has one `Contraction` node |
-| `greedy_optimizer_three_tensor_order` | Three tensors of different sizes; verify greedily picked cheapest first |
-| `dp_optimizer_recovers_greedy_at_small_n` | n=3, verify DP gives same or lower cost than greedy |
-| `treesa_optimizer_seed_reproducible` | Same seed -> same graph for n=6 |
-| `cost_metric_flop_count` | `flop_count(4, 5, 6)` == 240 |
-| `cost_metric_zero_conjugation_cost` | Hermitian-transpose step -> `transpose_cost_bytes` == 0 |
-| `cost_metric_noncontiguous_has_cost` | Non-contiguous tensor -> positive `transpose_cost_bytes` |
-| `executor_two_tensor_outer_product` | No contracted indices -> result is outer product |
-| `executor_two_tensor_trace` | One contracted pair -> matrix multiply result matches manual computation |
-| `executor_three_tensor_chain` | A·B·C chain contraction; result matches numpy.einsum reference |
-| `executor_hermitian_flag_propagated` | Check that adjoint input sets `is_conjugated`, not a data copy |
-| `executor_arena_lifetime_enforced` | (compile-fail) Result TempTensor<'arena> must not outlive arena |
-| `execution_plan_no_rebuild_same_shapes` | `needs_rebuild` returns false for unchanged shapes |
-| `execution_plan_rebuild_after_bond_change` | Change one tensor's bond dim -> `needs_rebuild` returns true |
-| `sparse_executor_u1_two_site` | Block-sparse contraction with U1 symmetry; sector_keys sorted in output |
-| `sparse_executor_flux_conserved` | Output tensor flux == fuse(flux_a, flux_b) for all inputs |
-| `sparse_executor_flux_mismatch_error` | Mismatched input fluxes -> `FluxMismatch` error |
-| `abelian_hook_single_output` | `AbelianHook::compute_output_sectors` always returns exactly one entry |
-| `abelian_hook_unit_coefficient` | Coefficient from `AbelianHook` is always `T::one()` |
-| `block_transpose_round_trip` | Transpose then inverse-transpose -> original data |
-| `tensor_to_mat_ref_zero_copy_contiguous` | Contiguous input -> `MatRef` data pointer equals input slice pointer |
-| `tensor_to_mat_ref_copies_noncontiguous` | Non-contiguous input -> data pointer differs (copy performed) |
+| Test | Status | Description |
+|:-----|:-------|:------------|
+| `spec_new_valid_two_tensor` | **Passing** | Two tensors with one contracted pair; verify `contracted_indices()` and `free_indices()` |
+| `spec_new_index_too_many_times` | **Passing** | Three tensors sharing one index -> `IndexAppearsTooManyTimes` |
+| `spec_new_duplicate_on_tensor` | **Passing** | One tensor with repeated IndexId -> `DuplicateIndexOnTensor` |
+| `spec_new_output_index_not_free` | **Passing** | Output index is contracted -> `OutputIndexNotFree` |
+| `spec_shared_indices_two_tensors` | **Passing** | Verify `shared_indices(a, b)` returns correct shared `IndexId`s |
+| `spec_shared_indices_disjoint` | **Passing** | Two tensors with no shared indices -> empty result |
+| `spec_dimension_mismatch_detected` | Planned | Contracted pair with dim 3 vs dim 4 -> `DimensionMismatch` |
+| `greedy_optimizer_two_tensor` | **Passing** | Two tensors; verify graph has one `Contraction` node |
+| `greedy_optimizer_three_tensor_order` | **Passing** | Three tensors of different sizes; verify greedily picked cheapest first |
+| `dp_optimizer_recovers_greedy_at_small_n` | Planned | n=3, verify DP gives same or lower cost than greedy |
+| `treesa_optimizer_seed_reproducible` | Planned | Same seed -> same graph for n=6 |
+| `cost_metric_flop_count` | **Passing** | `flop_count(4, 5, 6)` == 240 |
+| `cost_metric_zero_conjugation_cost` | Planned | Hermitian-transpose step -> `transpose_cost_bytes` == 0 |
+| `cost_metric_noncontiguous_has_cost` | Planned | Non-contiguous tensor -> positive `transpose_cost_bytes` |
+| `executor_two_tensor_outer_product` | Planned | No contracted indices -> result is outer product |
+| `executor_two_tensor_trace` | Planned | One contracted pair -> matrix multiply result matches manual computation |
+| `executor_three_tensor_chain` | Planned | A-B-C chain contraction; result matches numpy.einsum reference |
+| `executor_single_tensor_identity` | Planned | Single tensor with no contraction -> return clone of input (requires `Clone` on `DenseTensor<'static, T>`) |
+| `executor_hermitian_flag_propagated` | Planned | Check that adjoint input sets `is_conjugated`, not a data copy |
+| `executor_arena_lifetime_enforced` | Planned | (compile-fail) Result TempTensor<'arena> must not outlive arena |
+| `execution_plan_no_rebuild_same_shapes` | **Passing** | `needs_rebuild` returns false for unchanged shapes |
+| `execution_plan_rebuild_after_bond_change` | **Passing** | Change one tensor's bond dim -> `needs_rebuild` returns true |
+| `sparse_executor_u1_two_site` | Planned | Block-sparse contraction with U1 symmetry; sector_keys sorted in output |
+| `sparse_executor_flux_conserved` | Planned | Output tensor flux == fuse(flux_a, flux_b) for all inputs |
+| `sparse_executor_flux_mismatch_error` | Planned | Mismatched input fluxes -> `FluxMismatch` error |
+| `sparse_executor_single_tensor_clone` | Planned | Single-tensor "contraction" returns clone of input (requires `Clone` on `BlockSparseTensor`) |
+| `abelian_hook_single_output` | **Passing** | `AbelianHook::compute_output_sectors` always returns exactly one entry |
+| `abelian_hook_unit_coefficient` | **Passing** | Coefficient from `AbelianHook` is always `T::one()` |
+| `block_transpose_round_trip` | Planned | Transpose then inverse-transpose -> original data |
+| `tensor_to_mat_ref_zero_copy_contiguous` | Planned | Contiguous input -> `MatRef` data pointer equals input slice pointer |
+| `tensor_to_mat_ref_copies_noncontiguous` | Planned | Non-contiguous input -> data pointer differs (arena copy performed) |
 
 ### 16.2 Property-Based Tests
 
@@ -1360,9 +1407,17 @@ An `ExecutionPlan` must be rebuilt when a bond dimension changes after SVD trunc
 
 The `StructuralContractionHook` trait is injected into `SparseContractionExecutor` from day one, keeping the Abelian code path completely unchanged when SU(2) support is added. The known Phase 5+ refactoring requirements (fusion-rule multiplicity fan-out, output-sector collision map-reduce) live inside the SU(2) implementation of `StructuralContractionHook`, not in the executor's task-generation loop. The Abelian `AbelianHook` implementation remains a zero-cost no-op. This design decision is traceable to design document §4.4 (non-Abelian roadmap) and §6 (contraction engine, structural callback).
 
-### Note 7 — `NoQ` Sentinel Type
+### Note 7 — `NoQ` Sentinel Type (Removed)
 
-The `NoQ` sentinel allows `ExecutionPlan` and `ContractionExecutor` to be uniformly generic over `Q: BitPackable` without requiring callers on the dense path to choose a quantum-number type. `NoQ` is not exported and carries no overhead (all its methods are `#[inline(always)]` trivial returns). It is an implementation artifact, not a design concept visible to consumers.
+The original spec used a `NoQ` sentinel type to allow `ExecutionPlan<T, Q>` to be uniformly generic over `Q: BitPackable`. The draft implementation found that the two-generic-parameter design created excessive boilerplate, especially when combined with borrowed backend references (requiring `PhantomData` hacks). The revised design simplifies `ExecutionPlan<T>` to be parameterized only over `T: Scalar`, with the `Q: BitPackable` bound introduced only on the `execute_sparse` method. This eliminates `NoQ` entirely and makes the dense path ergonomic without sacrificing the sparse path's generality.
+
+### Note 8 — `Clone` Requirement for Single-Tensor Contraction
+
+The draft discovered that `BlockSparseTensor` does not implement `Clone`, which prevents the executor from returning a copy of the input tensor in degenerate single-tensor "contraction" cases (identity contraction). The draft worked around this by returning an error for single-tensor cases. The recommended fix is to implement `Clone` for both `BlockSparseTensor` and `DenseTensor<'static, T>` in their respective crates (`tk-symmetry` and `tk-core`). Until `Clone` is available, executors must require at least two input tensors.
+
+### Note 9 — `DenseTensor` Lifetime and Executor Design
+
+`DenseTensor<'a, T>` carries a lifetime parameter because it can borrow its backing storage. This creates a fundamental tension in the executor: input tensors have lifetime `'a` (borrowed from the caller) while intermediate results have lifetime `'static` (owned). The draft used unsafe lifetime transmute to unify these in a single lookup map. Three clean alternatives exist (documented in the `ContractionExecutor` type's doc comment): arena-unified, split storage with enum wrapper, or `Arc<[T]>` always-owned. The choice affects `tk-core`'s `DenseTensor` design and should be resolved before stabilization.
 
 ---
 
@@ -1388,9 +1443,12 @@ The following are explicitly **not** implemented in `tk-contract`:
 | # | Question | Status |
 |:--|:---------|:-------|
 | 1 | Should `ContractionGraph::execution_order()` be made `pub` to allow `tk-dmrg` to inspect the planned GEMM sequence for diagnostic purposes, or should it remain `pub(crate)` to preserve encapsulation? | Deferred — keep `pub(crate)` for now; add accessor if `tk-dmrg` needs it |
-| 2 | Should `DPOptimizer` use a memoization cache keyed on tensor-subset bitvectors, or construct a flat DP table? Flat table is faster for n ≤ 12 but requires O(2^n) memory upfront. | Open — implement flat table; benchmark before optimizing |
+| 2 | Should `DPOptimizer` use a memoization cache keyed on tensor-subset bitvectors, or construct a flat DP table? Flat table is faster for n <= 12 but requires O(2^n) memory upfront. | Open — implement flat table; benchmark before optimizing |
 | 3 | `TreeSAOptimizer` requires a reproducible RNG for testing. Should it use `rand::SeedableRng::seed_from_u64` (portable) or `rand_xoshiro` (faster, also seedable)? | Resolved — use `rand_xoshiro256pp` for speed; seed stored in `TreeSAOptimizer::seed` |
 | 4 | For the `backend-cuda` path, should `SparseContractionExecutor` fall back to host-side GEMM for sectors smaller than a configurable threshold (to avoid kernel-launch overhead for tiny blocks)? | Open — benchmark on realistic DMRG sector distributions at D=1000 before deciding |
 | 5 | Should `ExecutionPlan::needs_rebuild` compare full `IndexMap` contents or only the dimensions (ignoring stride layout changes from permutations that don't affect shape)? | Resolved — compare only dimensions for invalidation |
-| 6 | Is `NoQ` the right mechanism for the "no symmetry" dense path, or should `ContractionExecutor` and `ExecutionPlan` have separate non-generic versions? | Resolved — keep `NoQ`; the generic approach prevents code duplication |
+| 6 | Is `NoQ` the right mechanism for the "no symmetry" dense path, or should `ContractionExecutor` and `ExecutionPlan` have separate non-generic versions? | Resolved — removed `NoQ`; `ExecutionPlan<T>` uses single generic; `Q` bound introduced only on `execute_sparse` method |
 | 7 | The current design does not support hyperedge contractions (a single `IndexId` connecting three or more tensors). Is this needed for any planned use case through Phase 4? | Resolved — DMRG and DMFT use only pairwise-decomposable networks; defer to Phase 5+ if needed |
+| 8 | Should `DenseTensor` use `Arc<[T]>` backing storage to eliminate the lifetime parameter? This would simplify executor generics substantially but requires changes in `tk-core`. | Open — draft implementation exposed the lifetime pain; evaluate `Arc<[T]>` vs arena-unified approach |
+| 9 | Should `Clone` be implemented for `BlockSparseTensor` and `DenseTensor<'static, T>`? Needed for single-tensor identity contraction and general ergonomics. | Open — implement in `tk-symmetry` and `tk-core` respectively |
+| 10 | Should `IndexMap` support registering intermediate tensor dimensions, or should optimizers always compute dimensions inline? | Resolved — optimizers compute inline; `IndexMap` remains read-only after construction |

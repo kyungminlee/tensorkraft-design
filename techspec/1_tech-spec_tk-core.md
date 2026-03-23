@@ -1,8 +1,8 @@
 # Technical Specification: `tk-core`
 
-**Crate:** `tensorkraft/crates/tk-core`
-**Version:** 0.1.0 (Pre-Implementation)
-**Status:** Specification
+**Crate:** `tensorkraft/tk-core`
+**Version:** 0.2.0 (Post-Draft-Implementation)
+**Status:** Draft
 **Last Updated:** March 2026
 
 ---
@@ -40,7 +40,7 @@ tk-core/
     ├── scalar.rs         Scalar trait + implementations
     ├── shape.rs          TensorShape, stride computation
     ├── storage.rs        TensorStorage<'a, T> (Owned/Borrowed CoW enum)
-    ├── tensor.rs         DenseTensor<T>, TempTensor<T>
+    ├── tensor.rs         DenseTensor<'a, T>, TempTensor<'a, T>
     ├── matview.rs        MatRef<T>, MatMut<T>, adjoint/conjugate
     ├── arena.rs          SweepArena, ArenaStorage, TempTensor ownership
     ├── pinned.rs         PinnedMemoryTracker (cfg: backend-cuda)
@@ -55,8 +55,8 @@ tk-core/
 
 ```rust
 /// Sealed marker for element types supported by tensorkraft.
-/// Implemented for: f32, f64, Complex<f32>, Complex<f64>,
-/// and optionally f128 when feature "backend-oxiblas" is active.
+/// Implemented for: f32, f64, Complex<f32>, Complex<f64>.
+/// f128 support is deferred pending Rust f128 stabilization.
 pub trait Scalar:
     Copy + Clone + Send + Sync
     + num_traits::Zero + num_traits::One
@@ -81,12 +81,24 @@ pub trait Scalar:
     /// Embed a real value into this scalar type.
     fn from_real(r: Self::Real) -> Self;
 
+    /// Construct a scalar from real and imaginary parts.
+    /// For real types, panics (debug) or returns `re` (release) if `im != 0`.
+    fn from_real_imag(re: Self::Real, im: Self::Real) -> Self;
+
+    /// Returns `Some(i)` where `i` is the imaginary unit for complex types,
+    /// or `None` for real types.
+    /// Essential for constructing operators such as SpinOp::Sy (which
+    /// contains factors of i) and Green's functions in tk-dmft.
+    fn imaginary_unit() -> Option<Self>;
+
     /// Returns true iff complex conjugation is a no-op (i.e., T is real).
     /// Used by the contraction engine to skip conjugation-flag propagation
     /// in tight loops over real-valued models.
     fn is_real() -> bool;
 }
 ```
+
+**Implementation note:** The `Sub`, `Neg`, `Debug`, and `'static` bounds were added during draft implementation because downstream crates (`tk-contract`, `tk-dsl`, `tk-dmft`) require subtraction for Hamiltonian assembly, negation for sign-flip operations, `Debug` for error messages, and `'static` for storage in long-lived data structures. The `from_real_imag` constructor and `imaginary_unit` method were discovered as essential by `tk-dsl` (for `SpinOp::Sy` which involves `i * sigma_y`) and `tk-dmft` (for Green's function construction).
 
 ### 3.2 Implementations
 
@@ -96,7 +108,8 @@ pub trait Scalar:
 | `f64` | `f64` | `true` | Default for most DMRG runs |
 | `Complex<f32>` | `f32` | `false` | |
 | `Complex<f64>` | `f64` | `false` | Quantum impurity solver |
-| `f128` | `f128` | `true` | `#[cfg(feature = "backend-oxiblas")]` only |
+
+**Implementation note:** `f128` support is deferred pending Rust `f128` stabilization. The `backend-oxiblas` feature flag is reserved but the `Scalar` implementation for `f128` is not yet provided.
 
 ### 3.3 Type Aliases
 
@@ -147,6 +160,8 @@ impl TensorShape {
 ```rust
 impl TensorShape {
     /// Total number of elements: product of all dims.
+    /// For rank-0 tensors (empty dims), returns 1 (the mathematical
+    /// convention for an empty product).
     pub fn numel(&self) -> usize;
 
     /// Number of dimensions.
@@ -156,6 +171,11 @@ impl TensorShape {
     pub fn offset(&self, index: &[usize]) -> usize;
 
     /// True if data is stored contiguously in row-major order.
+    /// Note: column-major tensors return `false` even though they are
+    /// physically contiguous in memory. This method checks specifically
+    /// for row-major (C-order) contiguity. A rename to
+    /// `is_row_major_contiguous()` is under consideration (see Open
+    /// Questions).
     pub fn is_contiguous(&self) -> bool;
 
     /// Returns a new TensorShape with dimensions permuted by `perm`.
@@ -179,6 +199,7 @@ impl TensorShape {
 
 - `TensorShape` is `Copy`-cheap enough for stack use. The internal `SmallVec<[usize; 6]>` avoids heap allocation for tensors up to rank 6, covering every tensor that appears in DMRG (rank-3 MPS tensors, rank-4 MPO tensors, rank-6 environment blocks).
 - Strides enable **zero-copy transpose**: swapping `strides[i]` and `strides[j]` without touching data is how `MatRef::adjoint()` works without allocating.
+- **Rank-0 edge case:** `numel()` returns 1 for empty dims (mathematically correct as the empty product). This currently works correctly but lacks dedicated test coverage.
 
 ---
 
@@ -190,6 +211,12 @@ impl TensorShape {
 /// TensorStorage has no shape knowledge — that lives exclusively in
 /// TensorShape. This strict separation means shape-manipulation
 /// operations never touch the data buffer.
+///
+/// The original architecture document proposed a three-type design
+/// (TensorStorage, TensorCow, DenseTensor). During implementation,
+/// TensorCow was merged into TensorStorage as a single enum with
+/// Owned/Borrowed variants, simplifying the type hierarchy without
+/// losing any functionality.
 pub enum TensorStorage<'a, T: Scalar> {
     /// Heap-allocated owned data. Mutable and freely movable.
     Owned(Vec<T>),
@@ -210,11 +237,19 @@ impl<'a, T: Scalar> TensorStorage<'a, T> {
     pub fn into_owned_vec(self) -> Vec<T>;
     pub fn is_owned(&self) -> bool;
     pub fn is_borrowed(&self) -> bool;
-    pub fn borrow(&self) -> TensorStorage<'_, T>;
+
+    /// Create a Borrowed view of this storage, regardless of whether
+    /// the underlying data is Owned or Borrowed. Key enabler for
+    /// zero-copy permute/reshape/slice_axis chains: each operation
+    /// calls borrow_storage() to produce a Borrowed variant pointing
+    /// at the same data, then attaches new shape metadata.
+    pub fn borrow_storage(&self) -> TensorStorage<'_, T>;
 }
 ```
 
-**Design:** `TensorStorage` unifies owned and borrowed storage into a single enum, eliminating the previous `TensorCow` wrapper. This enables `SweepArena::alloc_tensor` to produce `Borrowed` views pointing directly at bump-allocated memory with no intermediate heap `Vec`.
+**Design:** `TensorStorage` unifies owned and borrowed storage into a single enum, eliminating the previous `TensorCow` wrapper from the architecture document's three-type design. This enables `SweepArena::alloc_tensor` to produce `Borrowed` views pointing directly at bump-allocated memory with no intermediate heap `Vec`.
+
+**`borrow_storage()` pattern:** This method is the key enabler for zero-copy view chains. When `DenseTensor::permute()`, `reshape()`, or `slice_axis()` creates a new view, it calls `borrow_storage()` on the parent's storage to produce a `Borrowed` variant, then pairs it with the new `TensorShape`. This avoids cloning data even when the parent is `Owned`.
 
 **Rule:** Shape operations (permute, reshape, slice) always produce `Borrowed` views. Data is cloned into `Owned` only when strict ownership is required (e.g., persisting past an arena reset, or mutating in-place). This minimizes copies in the critical DMRG contraction path.
 
@@ -227,14 +262,23 @@ impl<'a, T: Scalar> TensorStorage<'a, T> {
 ```rust
 /// The primary N-dimensional dense tensor.
 /// Shape metadata is always owned; storage is Copy-on-Write.
+///
+/// The lifetime parameter 'a tracks the borrow lifetime of the
+/// underlying storage. This is required so the borrow checker can
+/// enforce arena safety — a DenseTensor borrowing from a SweepArena
+/// cannot outlive the arena's current allocation epoch.
+///
 /// The `offset` field tracks where this tensor's data begins within the
-/// underlying storage buffer (nonzero for sliced views).
+/// underlying storage buffer (nonzero for sliced views created by
+/// `slice_axis`).
 pub struct DenseTensor<'a, T: Scalar> {
     shape: TensorShape,
     storage: TensorStorage<'a, T>,
     offset: usize,
 }
 ```
+
+**Implementation note:** The lifetime parameter `'a` on `DenseTensor` is essential. An earlier design used `DenseTensor<T>` without a lifetime, but this failed to encode the borrow relationship between arena-allocated tensors and the arena itself, allowing use-after-reset bugs to compile. The `offset` field was added to support zero-copy `slice_axis` — without it, slicing would require creating a new storage allocation containing only the sliced region.
 
 Arena-allocated tensors use a shorter lifetime via `TempTensor<'a, T>`:
 
@@ -259,29 +303,51 @@ impl<'a, T: Scalar> DenseTensor<'a, T> {
     pub fn borrowed(shape: TensorShape, data: &'a [T]) -> Self;
 
     /// Return a zero-copy transposed view by permuting strides.
+    /// Calls borrow_storage() internally to produce a Borrowed view.
     pub fn permute(&self, perm: &[usize]) -> DenseTensor<'_, T>;
 
     /// Reshape to new dims. Returns Err if non-contiguous or numel mismatch.
+    /// Calls borrow_storage() internally to produce a Borrowed view.
     pub fn reshape(&self, new_dims: &[usize]) -> TkResult<DenseTensor<'_, T>>;
 
     /// Slice along one axis. Returns a zero-copy view with the offset
     /// advanced to the start of the sliced region.
+    /// Calls borrow_storage() internally to produce a Borrowed view.
     pub fn slice_axis(&self, axis: usize, start: usize, end: usize) -> DenseTensor<'_, T>;
 
     /// Materialize into heap-allocated owned storage.
     /// Must be called before SweepArena::reset() for any tensor
     /// whose data must survive past the current sweep step.
-    /// If the tensor has a nonzero offset or non-contiguous strides,
-    /// the owned copy gathers only the logical elements (contiguous,
-    /// row-major, offset reset to 0).
+    ///
+    /// Three code paths depending on internal state:
+    ///
+    /// 1. **Zero-cost move** — Storage is Owned, strides are contiguous
+    ///    (row-major), and offset is 0. The Vec is moved directly with
+    ///    no allocation or copy.
+    ///
+    /// 2. **Memcpy** — Storage is contiguous but offset is nonzero
+    ///    (e.g., from slice_axis). A single memcpy gathers the
+    ///    contiguous sub-region into a new Vec.
+    ///
+    /// 3. **Gather** — Strides are non-contiguous (e.g., after permute).
+    ///    Uses gather_elements() (see §6.4) to enumerate all logical
+    ///    elements via row-major multi-index iteration, copying each
+    ///    into a fresh Vec. Complexity: O(numel * rank).
+    ///
+    /// The owned copy is always contiguous, row-major, with offset 0.
     pub fn into_owned(self) -> DenseTensor<'static, T>;
 
     /// View as a 2-D matrix (row-major). Errors if rank != 2.
     pub fn as_mat_ref(&self) -> TkResult<MatRef<'_, T>>;
     pub fn as_mat_mut(&mut self) -> TkResult<MatMut<'_, T>>;
 
-    pub fn as_slice(&self) -> &[T];       // offset-adjusted
-    pub fn as_mut_slice(&mut self) -> &mut [T];  // offset-adjusted, panics if Borrowed
+    /// Returns a slice of the underlying data, adjusted by offset.
+    /// For a tensor with offset `k`, returns &storage[k..k+numel()]
+    /// when contiguous. For non-contiguous tensors, the returned slice
+    /// may contain elements that are not logically part of this tensor.
+    pub fn as_slice(&self) -> &[T];
+    /// Offset-adjusted mutable access. Panics if storage is Borrowed.
+    pub fn as_mut_slice(&mut self) -> &mut [T];
     pub fn shape(&self) -> &TensorShape;
     pub fn offset(&self) -> usize;
     pub fn numel(&self) -> usize;
@@ -294,13 +360,58 @@ impl<'a, T: Scalar> DenseTensor<'a, T> {
 Every DMRG step produces intermediate tensors (environment blocks, Krylov vectors, contraction results) that are temporary and one SVD output that must persist in the `MPS` struct. The invariant:
 
 ```
-ALL intermediates within one sweep step  →  allocated from SweepArena
-ONLY the final SVD result               →  .into_owned() before arena reset
+ALL intermediates within one sweep step  ->  allocated from SweepArena
+ONLY the final SVD result               ->  .into_owned() before arena reset
 ```
 
 The borrow checker enforces this statically. Any `TempTensor<'a>` that escapes the arena's lifetime `'a` is a compile error. Calling `.into_owned()` produces a `DenseTensor` with `'static` storage (heap-allocated), which may be stored anywhere.
 
 See §8.5 for the exact data-flow sequence.
+
+### 6.4 `gather_elements()` — Non-Contiguous Materialization
+
+```rust
+impl<'a, T: Scalar> DenseTensor<'a, T> {
+    /// Materializes a non-contiguous view into a contiguous Vec by
+    /// iterating over all logical elements in row-major order.
+    ///
+    /// Algorithm: For each logical element, compute its multi-index
+    /// via row-major enumeration, then compute the physical offset
+    /// as sum_i(index[i] * strides[i]) + self.offset. Copy the
+    /// element at that offset into the output Vec.
+    ///
+    /// Complexity: O(numel * rank) — for each of the numel elements,
+    /// the multi-index update and dot product with strides is O(rank).
+    ///
+    /// This method is called internally by into_owned() when strides
+    /// are non-contiguous (path 3 in §6.2).
+    fn gather_elements(&self) -> Vec<T>;
+}
+```
+
+### 6.5 Known Limitations
+
+**`DenseTensor` does not implement `Clone`.** The `Borrowed` variant's lifetime makes a blanket `Clone` impl unsound without careful handling. This is a known limitation affecting downstream crates:
+
+- `tk-contract` needs to clone intermediate tensors during contraction tree evaluation.
+- `tk-dsl` needs to clone operator tensors during Hamiltonian assembly.
+- `tk-dmrg` needs to clone MPS tensors for convergence checks.
+
+**Recommended resolution:** Implement `Clone` for `DenseTensor<'static, T>` only (owned tensors), which sidesteps the lifetime issue. Borrowed tensors that need cloning should use `into_owned()` first.
+
+```rust
+impl<T: Scalar> Clone for DenseTensor<'static, T> {
+    fn clone(&self) -> Self {
+        // Storage is guaranteed Owned for 'static lifetime.
+        // Clone the Vec and copy the shape.
+        DenseTensor {
+            shape: self.shape.clone(),
+            storage: TensorStorage::Owned(self.storage.as_slice().to_vec()),
+            offset: self.offset,
+        }
+    }
+}
+```
 
 ---
 
@@ -445,6 +556,8 @@ pub enum ArenaStorage {
     Pageable(bumpalo::Bump),
 }
 ```
+
+**Implementation note:** `PinnedArena` is currently a placeholder using standard `bumpalo::Bump` internally. The real CUDA-backed pinned memory implementation is deferred to Phase 5. The type exists now to establish the correct API surface and feature-flag plumbing.
 
 ### 8.3 Interface
 
@@ -781,8 +894,8 @@ pub use pinned::PinnedMemoryTracker;
 
 | Flag | Effect in tk-core |
 |:-----|:------------------|
-| `backend-cuda` | Enables `ArenaStorage::Pinned` variant and the entire `pinned` module |
-| `backend-oxiblas` | Adds `f128` to the `Scalar` implementations |
+| `backend-cuda` | Enables `ArenaStorage::Pinned` variant and the entire `pinned` module. Note: `PinnedArena` is currently a placeholder using standard `bumpalo`; real CUDA pinned memory is deferred to Phase 5. |
+| `backend-oxiblas` | Reserved for `f128` `Scalar` implementation; currently unimplemented pending Rust `f128` stabilization |
 
 `tk-core` does not activate `backend-faer`, `backend-mkl`, `backend-openblas`, or `parallel` directly — those are `tk-linalg` concerns.
 
@@ -841,9 +954,9 @@ The following workspace crates depend on `tk-core`:
 
 | Test | Description |
 |:-----|:------------|
-| `shape_row_major_strides` | Verify strides for a 3×4×5 row-major tensor |
+| `shape_row_major_strides` | Verify strides for a 3x4x5 row-major tensor |
 | `shape_permute_strides` | Permute [2,0,1], verify strides rearranged, numel unchanged |
-| `shape_reshape_ok` | 3×4×5 → 60 → 4×15, verify contiguity check |
+| `shape_reshape_ok` | 3x4x5 → 60 → 4x15, verify contiguity check |
 | `shape_reshape_noncontiguous_err` | Permuted view → reshape → must return `NonContiguous` |
 | `matref_adjoint_zero_copy` | Check rows, cols, strides swap; `is_conjugated` flipped; no allocation |
 | `matref_adjoint_real_type` | Adjoint of a real `MatRef<f64>` — `is_conjugated` flips but `is_real()` noted |
@@ -852,7 +965,6 @@ The following workspace crates depend on `tk-core`:
 | `storage_borrowed_mut_panics` | `as_mut_slice()` on `Borrowed` panics |
 | `arena_reset_reclaims` | `allocated_bytes()` returns to ~0 after `reset()` |
 | `matref_adjoint_roundtrip` | `mat.adjoint().adjoint()` recovers original strides and conjugation flag |
-| `arena_lifetime_compile_error` | (compile-fail test) TempTensor<'a> cannot escape past reset |
 | `pinned_budget_enforcement` | `PinnedMemoryTracker::try_reserve` returns false when budget exceeded (cfg: backend-cuda) |
 | `pinned_drop_releases_budget` | Dropping a pinned `SweepArena` releases budget via `PinnedMemoryTracker::release` (cfg: backend-cuda) |
 | `scalar_conj_complex` | `C64::conj()` produces correct imaginary sign flip |
@@ -861,7 +973,7 @@ The following workspace crates depend on `tk-core`:
 
 ### 14.2 Property-Based Tests
 
-Use `proptest` with **bounded strategies** (never unbounded random ranks/sizes — they inflate CI runtime):
+Use `proptest` with **bounded strategies** (never unbounded random ranks/sizes — they inflate CI runtime). Six property tests are implemented on `TensorShape`:
 
 ```rust
 proptest! {
@@ -883,15 +995,32 @@ proptest! {
         let s2 = s1.permute(&perm);
         assert_eq!(s1.numel(), s2.numel());
     }
+
+    // Additional property tests:
+    // - reshape_roundtrip: reshape to flat then back preserves numel
+    // - row_major_is_contiguous: freshly constructed row-major shapes
+    //   always report is_contiguous() == true
+    // - permute_twice_roundtrip: permute then inverse-permute recovers
+    //   original shape
+    // - slice_axis_reduces_dim: slicing along an axis reduces that
+    //   dimension's extent to (end - start)
 }
 ```
 
 ### 14.3 Compile-Fail Tests
 
-Use the `trybuild` crate to verify borrow-checker enforcement:
+Use the `trybuild` crate to verify borrow-checker enforcement. Five compile-fail tests are implemented:
+
+| Test | Description |
+|:-----|:------------|
+| `arena_tensor_outlives_reset` | `TempTensor<'a>` cannot be used after `arena.reset()` — borrow checker rejects |
+| `arena_tensor_escape_scope` | `TempTensor<'a>` cannot escape the scope where the arena is borrowed |
+| `borrowed_storage_outlives_data` | `TensorStorage::Borrowed` cannot outlive the slice it borrows from |
+| `slice_view_outlives_tensor` | A `DenseTensor` view from `slice_axis` cannot outlive the parent tensor |
+| `matref_outlives_tensor` | A `MatRef` obtained via `as_mat_ref()` cannot outlive the source `DenseTensor` |
 
 ```rust
-// tests/compile_fail/arena_escape.rs  (expected to fail compilation)
+// Example: tests/compile_fail/arena_tensor_outlives_reset.rs
 fn escape_temp_tensor() {
     let mut arena = SweepArena::new(1024);
     let t: TempTensor<f64> = arena.alloc_tensor(TensorShape::row_major(&[4, 4]));
@@ -913,10 +1042,36 @@ The following must be validated by CI benchmarks (Criterion, instruction-countin
 | `TensorStorage::as_slice` (Borrowed) | Zero allocations |
 | `SweepArena::reset` | O(1) wall time independent of number of prior allocations |
 | `SweepArena::alloc_tensor` | Single pointer-bump; no `malloc` system call |
+| `DenseTensor::into_owned` (path 1) | Zero allocations, zero copies (move only) |
+| `DenseTensor::borrow_storage` | Zero allocations |
 
 ---
 
-## 16. Out of Scope
+## 16. Implementation Notes and Design Decisions
+
+### Note 1 — TensorCow Merged into TensorStorage
+
+The architecture document's three-type design (TensorStorage, TensorCow, DenseTensor) was simplified during implementation. `TensorCow` as a separate type added indirection without clear benefit; its `Owned`/`Borrowed` semantics mapped directly onto `TensorStorage`'s enum variants. Merging them reduces the number of types callers must understand and eliminates a layer of wrapping in the `DenseTensor` struct.
+
+### Note 2 — Lifetime Parameter on DenseTensor
+
+The original spec used `DenseTensor<T>` without a lifetime. Implementation revealed that the lifetime must be visible on the type (`DenseTensor<'a, T>`) so that the borrow checker can enforce arena safety. Without the lifetime parameter, there is no static guarantee that a tensor borrowing from a `SweepArena` cannot outlive the arena's current epoch.
+
+### Note 3 — The `offset` Field
+
+The `offset` field on `DenseTensor` was not in the original architecture document but proved essential for zero-copy `slice_axis`. Without it, slicing along an axis would require either unsafe pointer arithmetic or creating a new storage allocation containing only the sliced region. The offset approach keeps `slice_axis` zero-copy and composable with `permute` and `reshape`.
+
+### Note 4 — `is_contiguous()` Semantics
+
+The current `is_contiguous()` method checks specifically for row-major (C-order) contiguity. A column-major tensor reports `false` even though its data is physically contiguous in memory. This is intentional for the current implementation (DMRG workloads use row-major layout exclusively), but the name is misleading. See Open Questions for the rename discussion.
+
+### Note 5 — PinnedArena Placeholder
+
+`PinnedArena` currently wraps a standard `bumpalo::Bump` rather than actual CUDA pinned memory. This placeholder allows the `backend-cuda` feature-flag plumbing and `ArenaStorage` enum to be tested and validated before CUDA SDK integration in Phase 5. The API surface is designed to be stable across the transition.
+
+---
+
+## 17. Out of Scope
 
 The following are explicitly **not** implemented in `tk-core`:
 
@@ -926,21 +1081,25 @@ The following are explicitly **not** implemented in `tk-core`:
 - BLAS/SVD/EVD dispatch (-> `tk-linalg`)
 - Index types or operator enums (-> `tk-dsl`)
 - `unsafe` blocks beyond those strictly required for arena bump-allocation or pinned memory (-> self-imposed constraint; all `unsafe` usage is reviewed and minimized within `tk-core`)
+- Real CUDA pinned memory allocation (-> Phase 5)
+- `f128` scalar support (-> deferred pending Rust `f128` stabilization)
 
 ---
 
-## 17. Open Questions
+## 18. Open Questions
 
 | # | Question | Status |
 |:--|:---------|:-------|
-| 1 | Should `TensorShape` support rank-0 (scalar) tensors? | Deferred — current code panics if `dims` is empty |
-| 2 | `f128` support via `backend-oxiblas`: does faer provide an `f128` GEMM path, or must it go through DeviceOxiblas exclusively? | Open — needs investigation before implementing `Scalar for f128` |
+| 1 | Should `TensorShape` support rank-0 (scalar) tensors? `numel()` currently returns 1 for empty dims (mathematically correct), but this behavior is untested. | Open — needs dedicated test coverage |
+| 2 | `f128` support via `backend-oxiblas`: does faer provide an `f128` GEMM path, or must it go through DeviceOxiblas exclusively? | Deferred — blocked on Rust `f128` stabilization |
 | 3 | Arena capacity growth policy: fixed `with_capacity`, or auto-doubling? `bumpalo::Bump` doubles internally; document expected initial size for a DMRG step at D=2000 | Deferred — to be benchmarked in Phase 2 |
 | 4 | NUMA-aware pinned allocation (`PinnedArena` binding to PCIe root NUMA node) | Deferred — deferred to Phase 5+ per architecture doc §10.2.6 |
+| 5 | Should `is_contiguous()` be renamed to `is_row_major_contiguous()`? Current name is misleading for column-major tensors. | Open — rename would be a breaking API change; consider adding `is_col_major_contiguous()` as an alternative |
+| 6 | `DenseTensor` `Clone` implementation: should `Clone` be implemented for `DenseTensor<'static, T>` only, or should a more general approach (e.g., `to_owned_clone()` method) be used? | Open — downstream crates (`tk-contract`, `tk-dsl`, `tk-dmrg`) all need this capability |
 
 ---
 
-## 18. Future Considerations
+## 19. Future Considerations
 
 - **`StorageDevice` trait (Phase 5):** The architecture document §10.1 introduces a `StorageDevice` trait that generalizes `TensorStorage` to support GPU and MPI device memory. A `StorageDevice` trait with associated `Allocator` type would define `HostDevice`, `CudaDevice`, and `MpiDevice` implementations. `TensorStorage` would gain a default type parameter `D: StorageDevice = HostDevice` for backward compatibility. In Phases 1–3, `TensorStorage<'a, T>` remains the `Owned(Vec<T>)` / `Borrowed(&'a [T])` enum defined in §5. The `StorageDevice` trait and `HostDevice` would be added to `tk-core`; `CudaDevice` and `MpiDevice` implementations would live in their respective backend crates.
 

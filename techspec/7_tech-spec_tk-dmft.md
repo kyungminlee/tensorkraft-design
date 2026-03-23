@@ -1,8 +1,8 @@
 # Technical Specification: `tk-dmft`
 
 **Crate:** `tensorkraft/crates/tk-dmft`
-**Version:** 0.1.0 (Pre-Implementation)
-**Status:** Specification
+**Version:** 0.1.0 (Post-Draft-Implementation)
+**Status:** Draft
 **Last Updated:** March 2026
 
 ---
@@ -96,6 +96,14 @@ impl<T: Scalar> BathParameters<T> {
     ///
     /// Δ(ω) = Σ_k |V_k|² / (ω - ε_k + i·broadening)
     ///
+    /// **Implementation note:** Returns `Vec<Complex<f64>>` rather than
+    /// `Vec<T>` because the `Scalar` trait lacks an imaginary unit
+    /// constructor (`i()` or `from_imaginary()`). Constructing the
+    /// complex denominator `ω - ε_k + i·broadening` requires explicit
+    /// `Complex::new(0.0, broadening)`, which breaks genericity over `T`.
+    /// This limitation is inherited from `tk-core` (see `tk-dsl` draft
+    /// notes for the same issue).
+    ///
     /// # Parameters
     /// - `omega`: frequency grid points
     /// - `broadening`: Lorentzian broadening δ replacing the i0⁺ regulator
@@ -103,7 +111,7 @@ impl<T: Scalar> BathParameters<T> {
         &self,
         omega: &[T::Real],
         broadening: T::Real,
-    ) -> Vec<T>;
+    ) -> Vec<Complex<f64>>;
 
     /// Compute the relative L∞ distance ‖Δ_self(ω) - Δ_other(ω)‖_∞ / ‖Δ_other(ω)‖_∞
     /// for convergence assessment of the DMFT self-consistency loop.
@@ -201,12 +209,25 @@ where
     ///
     /// Constructs the `OpSum` for the AIM in chain geometry via `tk-dsl`:
     ///
-    ///   H = ε_imp Σ_σ n_{0σ} + U n_{0↑} n_{0↓}
-    ///     + Σ_{k,σ} ε_k n_{kσ}
+    ///   H = ε_imp (n_{0↑} + n_{0↓}) + U n_{0↑} n_{0↓}
+    ///     + Σ_{k} ε_k (n_{k↑} + n_{k↓})
     ///     + Σ_{k,σ} V_k (c†_{0σ} c_{kσ} + h.c.)
     ///
     /// Site ordering: impurity at site 0, bath sites at 1..=n_bath.
-    /// Uses `FermionOp` from `tk-dsl` for all operator terms.
+    ///
+    /// **Operator mapping (implementation finding):** `FermionOp` variants
+    /// are spin-resolved: `CdagUp`, `CUp`, `CdagDn`, `CDn`, `Nup`, `Ndn`,
+    /// `Ntotal`. There is no `NPairInteraction` variant. The double-occupancy
+    /// term U n_{0↑} n_{0↓} is constructed via a `CustomOp` with a 4x4
+    /// diagonal matrix `diag(0, 0, 0, 1)` in the basis {|0>, |up>, |dn>,
+    /// |updn>} (see `nup_ndn_operator()` helper below).
+    ///
+    /// **`ScaledOpProduct` construction:** No convenience constructors
+    /// (`single()`, `two_site()`) exist on `ScaledOpProduct`. Terms must
+    /// be constructed via struct literal or local helper functions. The `*`
+    /// operator overloading for `FermionOp` is limited to `f64` coefficients
+    /// and does not work for generic `T: Scalar`. Generic Hamiltonian
+    /// construction must use direct `ScaledOpProduct { coeff, ops }` syntax.
     ///
     /// Delegates MPO compression to `tk-dmrg`'s `MpoCompiler`.
     ///
@@ -226,7 +247,101 @@ where
 }
 ```
 
-### 3.3 `BathDiscretizationConfig`
+### 3.3 `CustomOp` Pattern for Double Occupancy
+
+The double-occupancy interaction term U n_up n_dn has no built-in `FermionOp` variant. It must be constructed as a `CustomOp` with the 4x4 diagonal matrix representing the n_up n_dn operator in the {|0>, |up>, |dn>, |updn>} Fock basis.
+
+```rust
+/// Construct the n_up * n_dn operator as a 4x4 diagonal CustomOp.
+///
+/// In the single-orbital spin-1/2 Fock basis {|0>, |↑>, |↓>, |↑↓>},
+/// n_up * n_dn = diag(0, 0, 0, 1). Only the doubly-occupied state
+/// |↑↓> has eigenvalue 1.
+///
+/// This is required because `FermionOp` has no `NPairInteraction` or
+/// `NupNdn` variant. The `CustomOp` escape hatch handles any operator
+/// not covered by the built-in `FermionOp` enum.
+fn nup_ndn_operator<T: Scalar>() -> CustomOp<T>
+where
+    T: From<f64>,
+{
+    // 4x4 diagonal matrix: diag(0, 0, 0, 1)
+    let data = vec![
+        T::from(0.0), T::from(0.0), T::from(0.0), T::from(0.0),
+        T::from(0.0), T::from(0.0), T::from(0.0), T::from(0.0),
+        T::from(0.0), T::from(0.0), T::from(0.0), T::from(0.0),
+        T::from(0.0), T::from(0.0), T::from(0.0), T::from(1.0),
+    ];
+    let matrix = DenseTensor::from_shape_vec(vec![4, 4], data);
+    CustomOp { matrix, name: "nup_ndn".to_string() }
+}
+```
+
+**Example Hamiltonian construction with actual API:**
+
+```rust
+/// Construct the AIM OpSum using actual tk-dsl FermionOp variants.
+///
+/// Helper functions are needed because ScaledOpProduct has no
+/// convenience constructors and operator overloading is f64-only.
+fn build_aim_opsum<T: Scalar>(model: &AndersonImpurityModel<T>) -> OpSum<T>
+where
+    T: From<f64>,
+{
+    let mut terms = OpSum::new();
+
+    // Impurity on-site energy: epsilon_imp * (n_up + n_dn) at site 0
+    // Uses FermionOp::Nup and FermionOp::Ndn (not the abstract "N")
+    terms.push(ScaledOpProduct {
+        coeff: T::from(model.epsilon_imp.into()),
+        ops: smallvec![(0, FermionOp::Nup.into())],
+    });
+    terms.push(ScaledOpProduct {
+        coeff: T::from(model.epsilon_imp.into()),
+        ops: smallvec![(0, FermionOp::Ndn.into())],
+    });
+
+    // Interaction: U * n_up * n_dn at site 0 (CustomOp, not FermionOp)
+    terms.push(ScaledOpProduct {
+        coeff: T::from(model.u.into()),
+        ops: smallvec![(0, nup_ndn_operator::<T>().into())],
+    });
+
+    // Bath on-site energies and hybridization hopping terms
+    for k in 0..model.bath.n_bath {
+        let site = k + 1;
+        let eps_k = model.bath.epsilon[k];
+        let v_k = model.bath.v[k];
+
+        // Bath on-site: epsilon_k * (n_up + n_dn) at site k+1
+        terms.push(ScaledOpProduct {
+            coeff: T::from(eps_k.into()),
+            ops: smallvec![(site, FermionOp::Nup.into())],
+        });
+        terms.push(ScaledOpProduct {
+            coeff: T::from(eps_k.into()),
+            ops: smallvec![(site, FermionOp::Ndn.into())],
+        });
+
+        // Hybridization: V_k * (c†_{0,up} c_{k,up} + h.c.) + (dn channel)
+        // Uses FermionOp::CdagUp, FermionOp::CUp, etc.
+        terms.push(ScaledOpProduct {
+            coeff: v_k,
+            ops: smallvec![
+                (0, FermionOp::CdagUp.into()),
+                (site, FermionOp::CUp.into()),
+            ],
+        });
+        // ... hermitian conjugate and down-spin channel analogously
+    }
+
+    terms
+}
+```
+
+**Upstream recommendation:** Add `ScaledOpProduct::single(coeff, op, site)` and `ScaledOpProduct::two_site(coeff, op1, site1, op2, site2)` convenience constructors to `tk-dsl`, and extend operator overloading to generic `T: Scalar` (not just `f64`). Consider adding `NupNdn` (or `NPairInteraction`) as a `FermionOp` variant.
+
+### 3.4 `BathDiscretizationConfig`
 
 ```rust
 /// Configuration for Lanczos tridiagonalization bath discretization.
@@ -414,6 +529,12 @@ impl Default for ToeplitzSolver {
 ///   3. FFT → A_windowed(ω)
 ///   4. Regularized Lorentzian deconvolution → A_raw(ω)  [if η > 0]
 ///   5. Spectral positivity restoration → A(ω)  [always mandatory]
+///
+/// **Implementation note on field names:** The field names are
+/// `toeplitz_solver` (not `solver`) and `prediction_order` (not
+/// `lp_order`). The `ToeplitzSolver` variants `LevinsonDurbin` and
+/// `SvdPseudoInverse` are struct variants with named fields (not
+/// tuple variants).
 #[derive(Clone, Debug)]
 pub struct LinearPredictionConfig {
     /// Solver for the Toeplitz prediction system.
@@ -568,10 +689,25 @@ pub fn deconvolve_lorentzian(
 /// **Step 2 — Record Fermi level before clamping:**
 /// A_fermi_before = `spectral.value_at_omega_zero()`
 ///
-/// **Step 3 — Clamp and L₁ renormalize:**
+/// **Step 3 — Clamp and conditional L₁ renormalize:**
 /// A(ω) = max(A(ω), `config.positivity_floor`)
-/// scale = W_total_original / W_total_clamped
-/// A(ω) *= scale  (preserves ∫A(ω)dω = original sum rule)
+/// W_total_clamped = Σ A(ω) Δω  (after clamping)
+///
+/// **Edge case (implementation finding):** Only rescale when both
+/// `W_total_original` (pre-clamp sum) and `W_total_clamped` are
+/// positive. When the input spectrum is mostly negative, clamping
+/// can dramatically change the total weight (e.g., flipping sign),
+/// causing the rescaling factor `W_total_original / W_total_clamped`
+/// to be negative or near-zero. Unconditional rescaling in this case
+/// breaks idempotency and produces unphysical results. The conditional
+/// guard ensures graceful handling of pathological inputs while
+/// preserving the sum rule for physical spectra.
+///
+/// If both sums are positive:
+///   scale = W_total_original / W_total_clamped
+///   A(ω) *= scale  (preserves ∫A(ω)dω = original sum rule)
+/// Otherwise:
+///   No rescaling applied (clamped values used as-is)
 ///
 /// **Step 4 — Fermi-level distortion check:**
 /// A_fermi_after = value at ω = 0 after clamping + rescaling.
@@ -704,7 +840,11 @@ pub fn chebyshev_expand<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>>(
 /// Controls the total simulation time, time step size, and both the
 /// TDVP stabilization parameters and the Chebyshev cross-validation
 /// configuration.
-#[derive(Clone, Debug)]
+///
+/// **Implementation note:** Cannot derive `Clone` or `Debug` because
+/// the `tdvp_stabilization` field contains `TdvpStabilizationConfig`
+/// from `tk-dmrg`, which lacks these derives.
+// Cannot derive Clone, Debug — blocked by TdvpStabilizationConfig.
 pub struct TimeEvolutionConfig {
     /// Total simulation time t_max (in inverse energy units). Default: 20.0.
     pub t_max: f64,
@@ -770,7 +910,21 @@ impl Default for MixingScheme {
 
 ```rust
 /// Top-level configuration for a DMFT self-consistency run.
-#[derive(Clone, Debug)]
+///
+/// **Implementation note:** `DMFTConfig` cannot derive `Clone` or `Debug`
+/// because `DMRGConfig` from `tk-dmrg` lacks these derives. Specifically,
+/// `DMRGConfig` contains `Box<dyn IterativeEigensolver<f64>>` which is
+/// not `Clone`. `DMRGStats` and `TdvpStabilizationConfig` also lack
+/// `Clone`/`Debug`. This blocks parameter sweep workflows that need to
+/// clone configurations and debug-print them.
+///
+/// **Workaround:** `DMFTStats` uses a locally-defined `DmrgIterationSummary`
+/// type instead of embedding `DMRGStats` from `tk-dmrg`.
+///
+/// **Upstream recommendation:** Add `#[derive(Clone, Debug)]` to
+/// `DMRGConfig` (wrapping the eigensolver in `Arc<dyn ...>` for clonability),
+/// `DMRGStats`, and `TdvpStabilizationConfig` in `tk-dmrg`.
+// Cannot derive Clone, Debug — see note above.
 pub struct DMFTConfig {
     /// DMRG sweep configuration for ground-state computation at each iteration.
     pub dmrg_config: DMRGConfig,
@@ -982,7 +1136,29 @@ pub struct DMFTStats {
     /// Wall-clock seconds per iteration (DMRG + TDVP + Chebyshev).
     pub iteration_times_secs: Vec<f64>,
     /// DMRG sweep statistics per iteration.
-    pub dmrg_stats: Vec<DMRGStats>,
+    ///
+    /// **Implementation note:** Uses a locally-defined `DmrgIterationSummary`
+    /// instead of `DMRGStats` from `tk-dmrg`, because `DMRGStats` does not
+    /// derive `Clone` or `Debug`, which would block derives on `DMFTStats`.
+    pub dmrg_stats: Vec<DmrgIterationSummary>,
+}
+
+/// Locally-owned summary of DMRG iteration results.
+///
+/// Created as a workaround because `tk-dmrg::DMRGStats` does not derive
+/// `Clone` or `Debug`. Contains the essential statistics needed for DMFT
+/// convergence monitoring. Populated by extracting values from the
+/// `DMRGEngine` after each ground-state solve.
+#[derive(Clone, Debug, Default)]
+pub struct DmrgIterationSummary {
+    /// Ground-state energy after DMRG convergence.
+    pub energy: f64,
+    /// Number of DMRG sweeps performed.
+    pub n_sweeps: usize,
+    /// Maximum bond dimension reached.
+    pub max_bond_dim: usize,
+    /// Final truncation error (largest discarded weight across all bonds).
+    pub truncation_error: f64,
 }
 ```
 
@@ -1135,7 +1311,7 @@ pub use crate::spectral::chebyshev::{ChebyshevConfig, chebyshev_expand};
 pub use crate::r#loop::config::{DMFTConfig, TimeEvolutionConfig};
 pub use crate::r#loop::mixing::MixingScheme;
 pub use crate::r#loop::mod_::DMFTLoop;
-pub use crate::r#loop::stats::DMFTStats;
+pub use crate::r#loop::stats::{DMFTStats, DmrgIterationSummary};
 
 // Checkpointing
 pub use crate::r#loop::mod_::DMFTCheckpoint;
@@ -1272,8 +1448,14 @@ where
 ```toml
 [dependencies]
 tk-dmrg     = { path = "../tk-dmrg",     version = "0.1.0" }
-# tk-dmrg re-exports the full dependency chain:
-#   tk-core, tk-symmetry, tk-linalg, tk-contract, tk-dsl
+# tk-dmrg does NOT re-export its dependencies. Each upstream crate must
+# be added as a direct path dependency. Attempting `use tk_dmrg::tk_core::...`
+# will fail. This is a known ergonomic gap (see Note 7).
+tk-core     = { path = "../tk-core",     version = "0.1.0" }
+tk-symmetry = { path = "../tk-symmetry", version = "0.1.0" }
+tk-linalg   = { path = "../tk-linalg",   version = "0.1.0" }
+tk-contract = { path = "../tk-contract", version = "0.1.0" }
+tk-dsl      = { path = "../tk-dsl",      version = "0.1.0" }
 
 num-complex = "0.4"
 num-traits  = "0.2"
@@ -1320,10 +1502,17 @@ su2-symmetry    = ["tk-dmrg/su2-symmetry"]
 | `mpi` | `MpiComm` type in `initialize_dmft_node_budget` | `backend-mpi` |
 | `sys-info` | System RAM query for pinned-budget calculation | `backend-mpi` |
 | `tk-dmrg` | `DMRGEngine`, `TdvpDriver`, `MPO`, `MPS`, `TdvpStabilizationConfig`, `MpoCompiler`, `DmrgError` | always |
+| `tk-core` | `Scalar` trait, `DenseTensor` | always |
+| `tk-symmetry` | `BitPackable`, quantum number types (`U1`) | always |
+| `tk-linalg` | `LinAlgBackend`, `DeviceFaer` | always |
+| `tk-contract` | Contraction executor (transitive, via `tk-dmrg` API types) | always |
+| `tk-dsl` | `FermionOp`, `CustomOp`, `ScaledOpProduct`, `OpSum` | always |
 
 ---
 
 ## 16. Testing Strategy
+
+**Draft implementation status:** 39 tests pass as of the draft implementation. Core algorithms (Lanczos discretization, Levinson-Durbin solver, Jackson kernel, positivity restoration) have full test coverage. Tests requiring functional `DMRGEngine` or `TdvpDriver` (DMFT loop, TDVP spectral, Chebyshev expansion) are skeleton stubs pending `tk-dmrg` completion.
 
 ### 16.1 Unit Tests
 
@@ -1348,6 +1537,9 @@ su2-symmetry    = ["tk-dmrg/su2-symmetry"]
 | `positivity_warning_no_false_positive` | Verify no warning for a perfectly positive spectrum. |
 | `fermi_level_distortion_diagnostic` | Construct spectrum with concentrated negative ringing at |ω| > 5 (forces large rescaling near ω=0). Verify `FERMI_LEVEL_DISTORTION` warning fires when relative shift > 1%. Verify no warning when negative weight is small and uniformly distributed. |
 | `restore_positivity_idempotent` | Verify applying `restore_positivity` twice gives the same result as applying it once. |
+| `restore_positivity_mostly_negative` | Verify `restore_positivity` handles a mostly-negative input spectrum gracefully: no rescaling when `original_sum` or `clamped_sum` is non-positive, output is still non-negative everywhere, and idempotency holds. |
+| `nup_ndn_custom_op_diagonal` | Verify `nup_ndn_operator()` produces a 4x4 diagonal matrix with entries (0, 0, 0, 1) corresponding to the Fock basis {|0>, |up>, |dn>, |updn>}. |
+| `aim_hamiltonian_term_count` | Verify `build_aim_chain_hamiltonian` produces the correct number of `OpSum` terms: 2 (impurity n_up, n_dn) + 1 (U CustomOp) + 2*n_bath (bath n_up, n_dn) + 4*n_bath (hopping up+dn, each with h.c.). Uses `OpSum::n_terms()` (not `len()`). |
 | `chebyshev_sum_rule` | Run `chebyshev_expand` on a 6-site AIM. Verify ∫A(ω)dω = 1.0 ± 1e-4. |
 | `chebyshev_jackson_kernel` | Verify Jackson kernel reduces spectral oscillation variance for a sharp peak, compared to no kernel. |
 | `chebyshev_bandwidth_error` | Verify `DmftError::ChebyshevBandwidthError` fires when E_min >= E_max or when the DMRG ground state energy is outside [E_min, E_max]. |
@@ -1486,6 +1678,22 @@ The `TdvpStabilizationConfig` (v8.2 revision, design doc §8.1.1) added `adaptiv
 
 The current `weiss_field` implementation is specialized to the Bethe lattice (Phase 4 validation target). The general-lattice formula requires the k-resolved non-interacting Green's function and the full lattice self-consistency equation. The general path is stubbed with `todo!("Phase 5+: implement general lattice Weiss field via Dyson equation")`.
 
+### Note 7 — Dependency Strategy: Direct Path Dependencies Required
+
+`tk-dmrg` does not re-export its upstream dependencies (`tk-core`, `tk-symmetry`, `tk-linalg`, `tk-contract`, `tk-dsl`). Attempting to access upstream types via `tk-dmrg` (e.g., `use tk_dmrg::tk_core::Scalar`) fails. Every upstream crate must be added as a direct `[dependencies]` entry in `tk-dmft/Cargo.toml` with a workspace-relative `path = "../{crate}"`. This applies to any crate that needs types from multiple layers of the dependency chain.
+
+This was discovered during draft implementation when the initial `Cargo.toml` listed only `tk-dmrg` as a dependency. Five additional path dependencies were required: `tk-core` (for `Scalar`, `DenseTensor`), `tk-symmetry` (for `BitPackable`, `U1`), `tk-linalg` (for `LinAlgBackend`, `DeviceFaer`), `tk-contract` (transitive via API types), and `tk-dsl` (for `FermionOp`, `CustomOp`, `ScaledOpProduct`, `OpSum`).
+
+**Upstream recommendation:** Either add `pub use` re-exports of key downstream-facing types from `tk-dmrg` (e.g., `pub use tk_core::Scalar; pub use tk_dsl::{FermionOp, OpSum};`), or document the direct-dependency requirement in the workspace `ARCHITECTURE.md`.
+
+### Note 8 — `OpSum::n_terms()` Naming
+
+The method to query the number of terms in an `OpSum` is `n_terms()`, not `len()`. This deviates from the Rust `std` convention where collection-like types use `len()`. Code that attempts `opsum.len()` will fail to compile. This is a minor naming inconsistency in `tk-dsl` but must be accounted for in all downstream Hamiltonian construction code.
+
+### Note 9 — `CustomOp` Construction
+
+`CustomOp` has no `new()` constructor or `matrix_data()` accessor method. Construction must use struct literal syntax: `CustomOp { matrix: ..., name: ... }`. Matrix data access uses `op.matrix.as_slice()` rather than `op.matrix_data()`. This is a minor ergonomic issue; adding `CustomOp::new(name: &str, matrix: DenseTensor<T>) -> Self` is recommended for `tk-dsl`.
+
 ---
 
 ## 18. Out of Scope
@@ -1510,3 +1718,7 @@ The current `weiss_field` implementation is specialized to the Bethe lattice (Ph
 | 4 | Broyden mixing stores a history of bath-parameter vectors. Should these be stored as `Vec<BathParameters<T>>` (clean API) or as flat `Vec<f64>` (cache-friendly Jacobian update)? | Open — recommend flat storage for numerical efficiency; confirm with implementer |
 | 5 | `initialize_dmft_node_budget` uses `sys_info::mem_info()` which queries physical RAM. On HPC clusters with Slurm `--mem` constraints, the cgroup memory limit may be less than physical RAM. Should the function query the cgroup limit via `/proc/self/cgroup` instead? | Open — use `sys_info::mem_info()` for Phase 4; flag for HPC deployment review |
 | 6 | Should `DMFTCheckpoint` include the full MPS state (via `DMRGCheckpoint` from `tk-dmrg`) to enable DMRG warm-starting from the previous iteration's converged state? This would save 1-3 sweeps per iteration at the cost of larger checkpoint files. | Deferred — recommend bath-only checkpoint for Phase 4; MPS warm-start as Phase 5 optimization |
+| 7 | Should `tk-dsl` add a `NupNdn` (or `NPairInteraction`) variant to `FermionOp` to avoid the `CustomOp` workaround for the Hubbard interaction term? This is the most common operator needed by physics applications beyond single-particle terms. | Open — recommend adding to `tk-dsl`; the `CustomOp` workaround is functional but error-prone |
+| 8 | Should `tk-dmrg` add `#[derive(Clone, Debug)]` to `DMRGConfig`, `DMRGStats`, and `TdvpStabilizationConfig`? The `Box<dyn IterativeEigensolver>` field in `DMRGConfig` blocks `Clone`; options include wrapping in `Arc` or providing `clone_config_without_solver()`. | Open — blocks ergonomic config management in all downstream crates |
+| 9 | Should `tk-dmrg` re-export key types from its dependencies (e.g., `pub use tk_core::Scalar; pub use tk_dsl::OpSum;`) so that downstream crates need only depend on `tk-dmrg`? Current behavior requires 5+ direct path dependencies. | Open — one-time fix; recommend re-exports for ergonomics |
+| 10 | Should `tk-core`'s `Scalar` trait add an imaginary unit constructor (`fn imaginary_unit() -> Self` or `fn from_imaginary(re: Self::Real) -> Self`) to enable generic complex-frequency Green's function construction? Currently forces `Vec<Complex<f64>>` return types instead of `Vec<T>`. | Open — inherited from `tk-dsl` draft; affects all complex-frequency code |

@@ -1,8 +1,8 @@
 # Technical Specification: `tk-dsl`
 
 **Crate:** `tensorkraft/crates/tk-dsl`
-**Version:** 0.1.0 (Pre-Implementation)
-**Status:** Specification
+**Version:** 0.1.0 (Post-Draft-Implementation)
+**Status:** Draft
 **Last Updated:** March 2026
 
 ---
@@ -227,10 +227,16 @@ impl IndexRegistry {
 /// Provides an ITensor-style interface: pass two `IndexedTensor`s to
 /// `contract()` and the contraction pairs are identified automatically by
 /// matching `id` and the prime-level convention.
-#[derive(Clone, Debug)]
+///
+/// **Implementation note:** `DenseTensor` does not implement `Clone`.
+/// `IndexedTensor` stores `DenseTensor<'static, T>` and provides a
+/// `clone_owned()` method that performs a manual clone via
+/// `DenseTensor::from_vec(shape, slice.to_vec())`.
+#[derive(Debug)]
 pub struct IndexedTensor<T: Scalar> {
-    /// Underlying dense tensor data. Legs correspond 1-to-1 with `indices`.
-    pub data: DenseTensor<T>,
+    /// Underlying dense tensor data (owned, `'static` lifetime).
+    /// Legs correspond 1-to-1 with `indices`.
+    pub data: DenseTensor<'static, T>,
     /// Ordered list of indices, one per tensor leg.
     /// Invariant: `indices.len() == data.rank()`.
     pub indices: SmallVec<[Index; 6]>,
@@ -258,6 +264,12 @@ impl<T: Scalar> IndexedTensor<T> {
 
     /// Increment the prime level of every index sharing `id` by one in-place.
     pub fn prime_index(&mut self, id: IndexId);
+
+    /// Manual clone, required because `DenseTensor` does not implement `Clone`.
+    ///
+    /// Clones the underlying data via `DenseTensor::from_vec(shape, slice.to_vec())`
+    /// and copies all indices.
+    pub fn clone_owned(&self) -> Self;
 }
 ```
 
@@ -267,8 +279,12 @@ impl<T: Scalar> IndexedTensor<T> {
 /// Contract two `IndexedTensor`s by automatically pairing all index pairs
 /// where `a_index.contracts_with(b_index)` is true.
 ///
-/// Builds a `ContractionSpec` from the matched pairs and delegates to
-/// `tk-contract`'s `ContractionExecutor` for the actual numerical contraction.
+/// **Implementation note:** `tk-dsl` has no dependency on `tk-linalg`.
+/// The current implementation uses a naive O(n^3) GEMM loop rather than
+/// delegating to `tk-contract`'s `ContractionExecutor`. This is acceptable
+/// for the small operator matrices (2x2 to 4x4) typical in DSL usage.
+/// For performance-critical tensor contractions, use `tk-contract` directly.
+///
 /// This is a pairwise operation; it does not perform multi-tensor path
 /// optimization.
 ///
@@ -317,9 +333,14 @@ pub enum SpinOp {
     Sz,
     /// Sx = ½(S⁺ + S⁻)
     Sx,
-    /// Sy = −i/2 (S⁺ − S⁻).
-    /// For `T = f64`, `matrix::<f64>()` returns the zero matrix; imaginary
-    /// couplings require `T = Complex<f64>`.
+    /// Sy = −i/2 (S⁺ − S⁻) = [0, −i/2; i/2, 0].
+    /// **Implementation note (HIGH SEVERITY):** `Sy.matrix::<T>()` requires
+    /// `Scalar::from_real_imag` to construct purely imaginary values. For
+    /// `T = f64`, `from_real_imag` maps the imaginary part to zero, so
+    /// `matrix::<f64>()` returns the zero matrix (correct: Sy has no real
+    /// representation). For `T = Complex<f64>`, the full matrix is returned.
+    /// The `Scalar` trait must provide `fn from_real_imag(re: Self::Real,
+    /// im: Self::Real) -> Self` (see §17.9).
     Sy,
     /// Identity on the 2-dimensional spin-1/2 space.
     Identity,
@@ -334,9 +355,10 @@ impl SpinOp {
     ///
     /// # Note on `Sy` for `T = f64`
     ///
-    /// `Sy` has purely imaginary matrix elements. For `T = f64`, this
-    /// method returns a zero matrix. Use `T = Complex<f64>` for models
-    /// requiring `Sy`. See Open Question §19.4.
+    /// `Sy` has purely imaginary matrix elements. The implementation uses
+    /// `T::from_real_imag(re, im)` to construct matrix entries. For
+    /// `T = f64`, `from_real_imag` drops the imaginary part and returns
+    /// a zero matrix. Use `T = Complex<f64>` for models requiring `Sy`.
     pub fn matrix<T: Scalar>(self) -> Vec<T>;
 
     /// True iff this operator conserves the total U(1) charge (Sz quantum number).
@@ -440,33 +462,72 @@ impl BosonOp {
 /// the physics (e.g., spin-1 models, Holstein polarons, Kondo models with
 /// non-standard local spaces).
 ///
+/// **Implementation note:** `DenseTensor` does not implement `Clone`.
+/// `CustomOp` stores `DenseTensor<'static, T>` and provides `clone_owned()`
+/// for manual cloning. The `new()` constructor validates that the matrix is
+/// square.
+///
 /// # Example
 ///
 /// ```rust
 /// // Spin-1 Sz operator acting on a 3-dimensional local space:
-/// let sz1 = CustomOp::<f64> {
-///     matrix: DenseTensor::from_vec(
+/// let sz1 = CustomOp::new(
+///     "Sz_spin1",
+///     DenseTensor::from_vec(
 ///         TensorShape::row_major(&[3, 3]),
 ///         vec![1.0, 0.0, 0.0,
 ///              0.0, 0.0, 0.0,
 ///              0.0, 0.0, -1.0],
 ///     ),
-///     name: "Sz_spin1".into(),
-/// };
-/// opsum += J * op(sz1.clone(), i) * op(sz1, i + 1);
+/// );
+/// opsum += J * op(sz1.clone_owned(), i) * op(sz1, i + 1);
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CustomOp<T: Scalar> {
     /// Square matrix in row-major order. Shape must be `[d, d]` for some `d > 0`.
-    pub matrix: DenseTensor<T>,
+    matrix: DenseTensor<'static, T>,
     /// Display name used in error messages and debug formatting.
-    pub name: SmallString<[u8; 32]>,
+    name: SmallString<[u8; 32]>,
 }
 
 impl<T: Scalar> CustomOp<T> {
+    /// Construct a new custom operator.
+    ///
+    /// # Panics
+    /// Panics if `matrix` is not square (i.e., shape is not `[d, d]`).
+    pub fn new(
+        name: impl Into<SmallString<[u8; 32]>>,
+        matrix: DenseTensor<'static, T>,
+    ) -> Self {
+        let dims = matrix.shape().dims();
+        assert!(dims.len() == 2 && dims[0] == dims[1], "CustomOp matrix must be square");
+        Self { matrix, name: name.into() }
+    }
+
     /// Local Hilbert space dimension: the row count of `matrix`.
     pub fn local_dim(&self) -> usize {
         self.matrix.shape().dims()[0]
+    }
+
+    /// Read-only access to the underlying matrix data as a flat slice.
+    pub fn matrix_data(&self) -> &[T] {
+        self.matrix.as_slice()
+    }
+
+    /// Reference to the operator name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Manual clone, required because `DenseTensor` does not implement `Clone`.
+    pub fn clone_owned(&self) -> Self {
+        Self {
+            matrix: DenseTensor::from_vec(
+                self.matrix.shape().clone(),
+                self.matrix.as_slice().to_vec(),
+            ),
+            name: self.name.clone(),
+        }
     }
 }
 ```
@@ -594,6 +655,21 @@ impl<T: Scalar> Mul<T> for OpProduct<T> {
 }
 
 /// A scalar-weighted operator product: `coeff * O₁(i₁) * O₂(i₂) * ...`
+///
+/// **Convenience constructors:** The spec originally assumed `single()` and
+/// `two_site()` constructors. These do not exist in the draft implementation.
+/// Use struct literal construction or the `scaled()` free function instead:
+///
+/// ```rust
+/// // Single-site term:
+/// let term = ScaledOpProduct {
+///     coeff: 1.0,
+///     product: OpProduct { factors: smallvec![op(SpinOp::Sz, 0)] },
+/// };
+///
+/// // Or use the scaled() helper:
+/// let term = scaled(1.0, op(SpinOp::Sz, 0) * op(SpinOp::Sz, 1));
+/// ```
 #[derive(Clone, Debug)]
 pub struct ScaledOpProduct<T: Scalar> {
     pub coeff: T,
@@ -601,21 +677,54 @@ pub struct ScaledOpProduct<T: Scalar> {
 }
 
 /// Allow `J * op(Sz, i) * op(Sz, j)` by implementing `Mul<OpProduct<T>> for T`.
-impl<T: Scalar> Mul<OpProduct<T>> for T {
-    type Output = ScaledOpProduct<T>;
-    fn mul(self, product: OpProduct<T>) -> ScaledOpProduct<T> {
+///
+/// **Implementation note (Rust orphan rule limitation):** `impl<T: Scalar>
+/// Mul<OpProduct<T>> for T` cannot be written as a blanket impl because `T`
+/// is a foreign type. Only concrete implementations are possible. The draft
+/// implementation provides `impl Mul<OpProduct<f64>> for f64` (and
+/// similarly for `OpTerm`). For `Complex<f64>`, users must use the
+/// `scaled()` helper or `OpProduct::scale()` method instead (see below).
+impl Mul<OpProduct<f64>> for f64 {
+    type Output = ScaledOpProduct<f64>;
+    fn mul(self, product: OpProduct<f64>) -> ScaledOpProduct<f64> {
         ScaledOpProduct { coeff: self, product }
     }
 }
 
 /// Allow `J * op(Sz, i)` — scalar times a single `OpTerm`.
-impl<T: Scalar> Mul<OpTerm<T>> for T {
-    type Output = ScaledOpProduct<T>;
-    fn mul(self, term: OpTerm<T>) -> ScaledOpProduct<T> {
+impl Mul<OpTerm<f64>> for f64 {
+    type Output = ScaledOpProduct<f64>;
+    fn mul(self, term: OpTerm<f64>) -> ScaledOpProduct<f64> {
         ScaledOpProduct {
             coeff: self,
             product: OpProduct { factors: smallvec![term] },
         }
+    }
+}
+
+/// Convenience function for types where operator overloading is not
+/// available (e.g., `Complex<f64>`). Wraps a coefficient and an operator
+/// product into a `ScaledOpProduct`.
+///
+/// # Example
+///
+/// ```rust
+/// use num_complex::Complex;
+/// let t = Complex::new(0.5, 0.1);
+/// let term = scaled(t, op(FermionOp::CdagUp, 0) * op(FermionOp::CUp, 1));
+/// opsum += term;
+/// ```
+pub fn scaled<T: Scalar>(coeff: T, product: OpProduct<T>) -> ScaledOpProduct<T> {
+    ScaledOpProduct { coeff, product }
+}
+
+impl<T: Scalar> OpProduct<T> {
+    /// Attach a scalar coefficient to this product.
+    ///
+    /// Equivalent to `scaled(coeff, self)`. Useful when `T` does not
+    /// support `Mul<OpProduct<T>> for T` due to the orphan rule.
+    pub fn scale(self, coeff: T) -> ScaledOpProduct<T> {
+        ScaledOpProduct { coeff, product: self }
     }
 }
 ```
@@ -706,6 +815,11 @@ impl<T: Scalar> OpSum<T> {
     pub fn push_term(&mut self, term: ScaledOpProduct<T>) -> DslResult<()>;
 
     /// Number of terms in the sum (before any MPO-level simplification).
+    ///
+    /// **Naming note:** The method is named `n_terms()` rather than `len()`
+    /// to avoid confusion with the Rust convention where `len()` implies a
+    /// "size" semantic. `n_terms()` clarifies that this counts operator
+    /// product terms, not individual site operators.
     pub fn n_terms(&self) -> usize { self.terms.len() }
 
     /// Iterator over all terms.
@@ -819,7 +933,14 @@ pub struct OpSumPair<T: Scalar> {
 /// site ordering for a physical model.
 ///
 /// Object-safe: `Box<dyn Lattice>` is valid. No generic methods are defined.
-pub trait Lattice: Debug + Send + Sync {
+///
+/// **Clone support via `LatticeClone`:** `OpSum` stores `Box<dyn Lattice>`
+/// and requires `Clone`. Because `Clone` is not object-safe, a helper
+/// supertrait `LatticeClone` provides `fn clone_box(&self) -> Box<dyn Lattice>`.
+/// All `Lattice` implementations that also implement `Clone` receive a
+/// blanket `LatticeClone` implementation. An alternative design using
+/// `Arc<dyn Lattice>` was considered but deferred (see Open Question §19.8).
+pub trait Lattice: LatticeClone + Debug + Send + Sync {
     /// Total number of sites.
     fn n_sites(&self) -> usize;
 
@@ -840,6 +961,27 @@ pub trait Lattice: Debug + Send + Sync {
     /// Local Hilbert space dimension if uniform across all sites.
     /// Returns `None` for site-dependent dimensions (e.g., mixed spin/fermion).
     fn local_dim(&self) -> Option<usize> { None }
+}
+
+/// Helper trait enabling `Clone` for `Box<dyn Lattice>`.
+///
+/// Rust's `Clone` trait is not object-safe because `clone()` returns `Self`.
+/// `LatticeClone` provides `clone_box()` which returns `Box<dyn Lattice>`.
+/// A blanket impl covers all `T: Lattice + Clone`.
+pub trait LatticeClone {
+    fn clone_box(&self) -> Box<dyn Lattice>;
+}
+
+impl<T: Lattice + Clone + 'static> LatticeClone for T {
+    fn clone_box(&self) -> Box<dyn Lattice> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn Lattice> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }
 ```
 
@@ -1006,6 +1148,8 @@ impl Lattice for StarGeometry {
 ## 9. The `hamiltonian!{}` Proc-Macro
 
 ### 9.1 Purpose and Scope
+
+**Implementation status:** The proc-macro crate (`tk-dsl-macros`) is **deferred** and not yet implemented. The specification below describes the intended design for a future phase.
 
 The `hamiltonian!` proc-macro is a **pure syntax-level transformation**. It parses a lattice/Hamiltonian DSL at compile time and emits Rust statements that construct an `OpSum<T>` at runtime. No numerical computation occurs at compile time.
 
@@ -1226,10 +1370,10 @@ pub mod error;
 pub use index::{Index, IndexDirection, IndexRegistry};
 pub use indexed_tensor::{IndexedTensor, contract};
 pub use operators::{SpinOp, FermionOp, BosonOp, CustomOp, SiteOperator};
-pub use opterm::{op, OpTerm, OpProduct, ScaledOpProduct};
+pub use opterm::{op, scaled, OpTerm, OpProduct, ScaledOpProduct};
 pub use opsum::{OpSum, OpSumTerm, OpSumPair, HermitianConjugate, hc};
 pub use lattice::{
-    Lattice,
+    Lattice, LatticeClone,
     Chain, Square, Triangular, BetheLattice, StarGeometry,
     snake_path,
 };
@@ -1238,8 +1382,8 @@ pub use error::{DslError, DslResult};
 // Re-export IndexId from tk-contract (thin coupling; see §15 and §19.1):
 pub use tk_contract::IndexId;
 
-// Re-export the hamiltonian! proc-macro from the companion crate:
-pub use tk_dsl_macros::hamiltonian;
+// Re-export the hamiltonian! proc-macro from the companion crate (deferred):
+// pub use tk_dsl_macros::hamiltonian;
 ```
 
 ---
@@ -1249,7 +1393,7 @@ pub use tk_dsl_macros::hamiltonian;
 | Flag | Effect in `tk-dsl` |
 |:-----|:-------------------|
 | `su2-symmetry` | Enables validation of `IndexDirection::Incoming` / `Outgoing` against `SU2Irrep` quantum number assignments; transitively enables `tk-symmetry/su2-symmetry` |
-| `parallel` | No direct effect in `tk-dsl`; propagated to `tk-core` and `tk-symmetry` for downstream use |
+| `parallel` | No-op feature flag. Originally intended to propagate to `tk-core/parallel`, but `tk-core` does not define a `parallel` feature. Retained for forward compatibility; declaring it in `tk-dsl` prevents downstream breakage if `tk-core` adds the feature later |
 
 `tk-dsl` does not use any backend feature flags (`backend-faer`, `backend-mkl`, `backend-openblas`, `backend-cuda`). It has no linear algebra dependency.
 
@@ -1334,7 +1478,7 @@ thiserror = "1"
 
 [features]
 default      = ["parallel"]
-parallel     = ["tk-core/parallel"]
+parallel     = []   # no-op: tk-core/parallel does not exist yet; retained for forward compatibility
 su2-symmetry = ["tk-symmetry/su2-symmetry"]
 
 [dev-dependencies]
@@ -1402,9 +1546,13 @@ proc-macro2 = "1"
 | `op_scaled_by_scalar` | `2.0_f64 * op(SpinOp::Sz, 0)` produces `ScaledOpProduct { coeff: 2.0, ... }` |
 | `op_product_length` | `op(Sz, i) * op(Sz, j)` produces `OpProduct` with `factors.len() == 2` |
 
-### 16.2 Macro Expansion Tests (`trybuild`)
+### 16.2 Draft Implementation Test Status
 
-Located in `tests/ui/`. Each file is a self-contained Rust snippet compiled by `trybuild`.
+The draft implementation has **37 passing tests** covering the core abstractions: `Index`, `IndexedTensor`, `SpinOp`, `FermionOp`, `BosonOp`, `CustomOp`, `OpTerm`, `OpProduct`, `ScaledOpProduct`, `OpSum`, and all `Lattice` implementations. The proc-macro crate (`tk-dsl-macros`) is **deferred** and has no tests yet.
+
+### 16.3 Macro Expansion Tests (`trybuild`) — Deferred
+
+Located in `tests/ui/`. Each file is a self-contained Rust snippet compiled by `trybuild`. **Not yet implemented** — the proc-macro crate is deferred to a future phase.
 
 **Pass cases (`tests/ui/pass/`):**
 
@@ -1428,7 +1576,7 @@ Located in `tests/ui/`. Each file is a self-contained Rust snippet compiled by `
 | `hc_non_additive.rs` | `error: 'h.c.' must appear as '+ h.c.'` |
 | `boson_missing_nmax.rs` | `error: boson operator requires explicit n_max` |
 
-### 16.3 Property-Based Tests
+### 16.4 Property-Based Tests
 
 ```rust
 proptest! {
@@ -1491,7 +1639,7 @@ proptest! {
 }
 ```
 
-### 16.4 Integration Test Contracts
+### 16.5 Integration Test Contracts
 
 Integration tests combining `tk-dsl` with `tk-dmrg` live in `tests/` at the workspace root and are the responsibility of `tk-dmrg`'s test suite. From `tk-dsl`'s perspective, the following contracts must hold:
 
@@ -1509,7 +1657,7 @@ The absence of `tk-linalg` in `tk-dsl`'s dependency list is a load-bearing archi
 
 ### 17.2 `SmallString<[u8; 32]>` for Tags
 
-Index tags, operator names, and `CustomOp` names use `SmallString<[u8; 32]>` rather than `String`. Physical model identifiers are typically 2–12 characters ("phys", "bond_L", "σ_y"). The 32-byte inline buffer avoids heap allocation for all realistic tags, consistent with `tk-core`'s use of `SmallVec<[usize; 6]>` for tensor shapes.
+Index tags, operator names, and `CustomOp` names use `SmallString<[u8; 32]>` from the `smallstr` crate rather than `String`. Physical model identifiers are typically 2-12 characters ("phys", "bond_L", "Sz_spin1"). The 32-byte inline buffer avoids heap allocation for all realistic tags. The `smallstr 0.3` dependency has been validated in the draft implementation and works well for tags under 32 bytes, consistent with `tk-core`'s use of `SmallVec<[usize; 6]>` for tensor shapes.
 
 ### 17.3 Prime-Level Convention
 
@@ -1531,9 +1679,39 @@ The `hc()` function returns a zero-size marker struct. `Add<HermitianConjugate>`
 
 Rust requires proc-macro crates to be separate compilation units. `tk-dsl-macros` is the proc-macro implementation; `tk-dsl` re-exports `hamiltonian!` from it. The exact-version constraint `version = "=0.1.0"` in `Cargo.toml` prevents Cargo from silently resolving to a different patch of the macros crate, which could produce type mismatch errors between the generated code and the runtime types.
 
-### 17.8 `contract()` Delegates to `tk-contract`
+### 17.8 `contract()` Uses Naive GEMM
 
-The `IndexedTensor::contract` function builds a `ContractionSpec` from the matched `IndexId` pairs and delegates to `tk-contract`'s `ContractionExecutor`. This means `tk-dsl` does not implement any GEMM logic itself — it only handles the index-matching metadata layer. Actual numerical work flows through the established `tk-contract` / `tk-linalg` path.
+The draft implementation of `IndexedTensor::contract()` uses a naive O(n^3) triple-loop GEMM rather than delegating to `tk-contract`'s `ContractionExecutor`. This is a consequence of the no-linalg rule (§17.1): `tk-dsl` has no dependency on `tk-linalg` or `tk-contract`'s execution layer. The naive implementation is acceptable for the small operator matrices (2x2 spin, 4x4 fermion) typical in DSL usage. For large tensor contractions, users should use `tk-contract` directly.
+
+### 17.9 `Scalar::from_real_imag` Requirement
+
+The draft implementation revealed that the `Scalar` trait in `tk-core` lacks a constructor for purely imaginary values. `SpinOp::Sy` requires matrix elements `[0, -i/2; i/2, 0]`, but without `from_real_imag`, the `matrix::<T>()` method cannot construct these entries generically. The required addition to the `Scalar` trait:
+
+```rust
+pub trait Scalar: ... {
+    /// Construct a scalar from real and imaginary parts.
+    ///
+    /// For real types (`f32`, `f64`): returns `re`, discarding `im`.
+    /// For complex types (`Complex<f32>`, `Complex<f64>`): returns `Complex { re, im }`.
+    fn from_real_imag(re: Self::Real, im: Self::Real) -> Self;
+}
+```
+
+Without this method, `Sy.matrix::<Complex<f64>>()` returns zeros, which is **incorrect**. This is a high-severity issue that requires updating the `tk-core` tech spec. See `tk-core` tech spec for the corresponding change.
+
+### 17.10 `DenseTensor` Does Not Implement `Clone`
+
+`DenseTensor` in `tk-core` does not derive or implement `Clone`. Both `IndexedTensor<T>` and `CustomOp<T>` store `DenseTensor<'static, T>` and need to be cloneable. The workaround is a `clone_owned()` method that performs:
+
+```rust
+DenseTensor::from_vec(self.data.shape().clone(), self.data.as_slice().to_vec())
+```
+
+This pattern is used consistently across `IndexedTensor` and `CustomOp`. A future `tk-core` update adding `Clone` to `DenseTensor` would eliminate the need for this workaround.
+
+### 17.11 Operator Overloading Restricted to `f64`
+
+Due to Rust's orphan rule, `impl<T: Scalar> Mul<OpTerm<T>> for T` is not expressible when `T` is a foreign type. The draft implementation provides `Mul` impls only for `f64`. For `Complex<f64>` users, the `scaled(coeff, product)` free function and `OpProduct::scale(coeff)` method serve as workarounds. This is documented in §6.3.
 
 ---
 
@@ -1561,7 +1739,11 @@ The following are explicitly **not** implemented in `tk-dsl`:
 | 1 | Should `IndexId` be moved to `tk-core` instead of `tk-contract`, so that `tk-dsl`'s only linalg-adjacent dependency is severed? This would let `tk-dsl` compile independently of `tk-contract` changes. Cost: a one-line change to `tk-core` and a re-export update in `tk-contract`. | Deferred; assess after initial implementations of both crates |
 | 2 | Should `OpSum<T>` include an in-place simplification pass (combining terms with identical operator products by summing their coefficients)? This would reduce term count before MPO compilation. Cost: O(N² log N) de-duplication in `tk-dsl`. Alternative: a pre-pass inside `OpSum::compile_mpo` in `tk-dmrg`. | Deferred — defer to `tk-dmrg` as an MPO compiler pre-pass |
 | 3 | Should `hamiltonian!` support `next_nearest_neighbour` and `all_pairs` keywords as sugar for common double-sum patterns in frustrated magnetism models? | Deferred — survey user demand before Phase 2 |
-| 4 | `SpinOp::Sy` returns a zero matrix for `T = f64`. Should `op(SpinOp::Sy, i)` be a `compile_error!` when `T = f64` (enforced via a blanket impl with a `static_assertions` check)? The alternative — a runtime `DslError::IncompatibleScalarType` — is less ergonomic. | Open — decide before Phase 1 implementation; lean toward compile-time error |
-| 5 | `CustomOp<T>` stores a `DenseTensor<T>` by value, cloning it once per site into the `OpSum`. For uniform models with the same custom operator on 1000 sites, this is 1000 heap allocations. An `Arc<DenseTensor<T>>` would share the storage. Is the extra complexity worth it? | Open — profile against `n_sites = 1000` with a 4x4 custom operator before deciding |
+| 4 | `SpinOp::Sy` returns a zero matrix for `T = f64`. Should `op(SpinOp::Sy, i)` be a `compile_error!` when `T = f64` (enforced via a blanket impl with a `static_assertions` check)? The alternative — a runtime `DslError::IncompatibleScalarType` — is less ergonomic. | Resolved — `Scalar::from_real_imag` makes `Sy.matrix::<f64>()` return zeros by construction (correct behavior for real types); no compile-time error needed. Users must use `Complex<f64>` for models with `Sy`. See §17.9 |
+| 5 | `CustomOp<T>` stores a `DenseTensor<'static, T>` and requires manual `clone_owned()` because `DenseTensor` does not implement `Clone`. For uniform models with the same custom operator on 1000 sites, this means 1000 heap allocations. An `Arc<DenseTensor<T>>` would share the storage. | Open — profile against `n_sites = 1000` with a 4x4 custom operator before deciding. The `clone_owned()` pattern works but is ergonomically awkward |
 | 6 | The `Lattice` trait is currently object-safe because it has no generic methods. Adding a `visit_bonds<F: Fn(usize, usize)>` callback method for zero-allocation bond iteration would break object safety. Is the performance benefit worth the ergonomic cost of requiring `dyn Lattice` callers to use `bonds()` + iteration? | Resolved — keep `Lattice` object-safe; users can iterate `bonds()` slice directly |
 | 7 | Should `StarGeometry` expose a `map_to_chain` method that returns a `Chain` with reordered coupling arrays, reflecting the Lanczos tridiagonalization used in `tk-dmft`? This would make the AIM→chain mapping visible at the `tk-dsl` level, improving discoverability. Alternatively, this mapping belongs entirely in `tk-dmft`. | Resolved — belongs in `tk-dmft`; keep `tk-dsl` geometry-agnostic w.r.t. chain mapping |
+| 8 | `OpSum` stores `Box<dyn Lattice>` and needs `Clone`. The current implementation uses a `LatticeClone` helper trait with `clone_box()`. Should `Arc<dyn Lattice>` be used instead to avoid cloning lattice data? `Arc` would eliminate the `LatticeClone` boilerplate but adds reference-counting overhead and prevents mutable access. | Open — `clone_box()` pattern works; `Arc` may be preferable for large lattices |
+| 9 | Should `DenseTensor` in `tk-core` implement `Clone`? Both `IndexedTensor` and `CustomOp` need cloneable tensor data and currently use `clone_owned()` workarounds. Adding `Clone` to `DenseTensor` would simplify the API. | Open — requires `tk-core` tech spec update |
+| 10 | Should `ScaledOpProduct` provide convenience constructors `single(coeff, op, site)` and `two_site(coeff, op1, site1, op2, site2)` to reduce boilerplate? The draft implementation uses struct literals exclusively. The `scaled()` free function partially addresses this. | Open — assess user demand |
+| 11 | Should `Mul<OpTerm<T>> for T` and `Mul<OpProduct<T>> for T` be implemented for `Complex<f64>` via a newtype wrapper to work around the orphan rule? This would restore `z * op(Sz, i)` syntax for complex scalars. | Open — the `scaled()` workaround is functional but less ergonomic |

@@ -1,8 +1,8 @@
 # Technical Specification: `tk-python`
 
 **Crate:** `tensorkraft/crates/tk-python`
-**Version:** 0.1.0 (Pre-Implementation)
-**Status:** Specification
+**Version:** 0.1.0 (Post-Draft-Implementation)
+**Status:** Draft
 **Last Updated:** March 2026
 
 ---
@@ -79,6 +79,8 @@ pub type DefaultDevice = DeviceMKL;
 pub type DefaultDevice = DeviceOpenBLAS;
 ```
 
+**`DeviceAPI` instantiation:** `DeviceAPI` does not implement `Default`. All construction sites must call `DeviceAPI::new(DeviceFaer, DeviceFaer)` (or the appropriate backend pair) explicitly. This is relevant in `PyDmftLoop::new()` and the `#[staticmethod]` constructors.
+
 ### 3.2 `DmftLoopVariant`
 
 ```rust
@@ -90,11 +92,21 @@ pub type DefaultDevice = DeviceOpenBLAS;
 ///
 /// # Supported combinations
 ///
-/// | Variant        | Scalar          | Symmetry | Use case                              |
-/// |:---------------|:----------------|:---------|:--------------------------------------|
-/// | `RealU1`       | `f64`           | `U1`     | Standard single-orbital DMFT          |
-/// | `ComplexU1`    | `Complex<f64>`  | `U1`     | Complex hybridization, e.g., SOC      |
-/// | `RealZ2`       | `f64`           | `Z2`     | Particle-hole symmetric models        |
+/// | Variant        | Scalar          | Symmetry | Use case                              | Status  |
+/// |:---------------|:----------------|:---------|:--------------------------------------|:--------|
+/// | `RealU1`       | `f64`           | `U1`     | Standard single-orbital DMFT          | Active  |
+/// | `RealZ2`       | `f64`           | `Z2`     | Particle-hole symmetric models        | Active  |
+///
+/// ## Blocked combinations
+///
+/// | Variant        | Scalar          | Symmetry | Blocker                                             |
+/// |:---------------|:----------------|:---------|:----------------------------------------------------|
+/// | `ComplexU1`    | `Complex<f64>`  | `U1`     | `DeviceFaer` does not implement `LinAlgBackend<Complex<f64>>` |
+///
+/// `ComplexU1` is blocked until `DeviceFaer` (or another default backend)
+/// implements `LinAlgBackend<Complex<f64>>`. The variant has been removed
+/// from this enum to avoid a compile error. When the complex backend is
+/// available, re-add `ComplexU1(DMFTLoop<Complex<f64>, U1, DefaultDevice>)`.
 ///
 /// # Extending
 /// Add a new combination by appending one enum variant here and adding
@@ -102,7 +114,6 @@ pub type DefaultDevice = DeviceOpenBLAS;
 /// No recompilation of the underlying `tk-dmrg` / `tk-dmft` stack is required.
 pub(crate) enum DmftLoopVariant {
     RealU1(DMFTLoop<f64, U1, DefaultDevice>),
-    ComplexU1(DMFTLoop<Complex<f64>, U1, DefaultDevice>),
     RealZ2(DMFTLoop<f64, Z2, DefaultDevice>),
 }
 ```
@@ -112,17 +123,24 @@ pub(crate) enum DmftLoopVariant {
 To avoid boilerplate match arms across all `#[pymethods]` implementations, a declarative macro generates them:
 
 ```rust
-/// Generate a `match &mut self.inner { ... }` expression that calls `$method`
+/// Generate a `match $inner { ... }` expression that calls `$method`
 /// on the inner solver for every `DmftLoopVariant`.
+///
+/// # Borrow semantics
+///
+/// The macro uses `match $inner` (not `match &mut $inner`) to avoid a
+/// double-borrow error. When `$inner` is `self.inner` and the enclosing
+/// method takes `&mut self`, writing `match &mut self.inner` creates a
+/// second mutable borrow of `self`. Using `match $inner` lets the
+/// compiler infer the correct borrow from context.
 ///
 /// # Example
 ///
 /// ```rust
-/// // Instead of writing three identical match arms:
-/// match &mut self.inner {
-///     DmftLoopVariant::RealU1(s)    => s.solve_with_cancel_flag(&flag),
-///     DmftLoopVariant::ComplexU1(s) => s.solve_with_cancel_flag(&flag),
-///     DmftLoopVariant::RealZ2(s)    => s.solve_with_cancel_flag(&flag),
+/// // Instead of writing two identical match arms:
+/// match self.inner {
+///     DmftLoopVariant::RealU1(ref mut s) => s.solve_with_cancel_flag(&flag),
+///     DmftLoopVariant::RealZ2(ref mut s) => s.solve_with_cancel_flag(&flag),
 /// }
 ///
 /// // Write:
@@ -130,10 +148,9 @@ To avoid boilerplate match arms across all `#[pymethods]` implementations, a dec
 /// ```
 macro_rules! dispatch_variant {
     ($inner:expr, $method:ident ( $($arg:expr),* )) => {
-        match &mut $inner {
-            DmftLoopVariant::RealU1(s)    => s.$method($($arg),*),
-            DmftLoopVariant::ComplexU1(s) => s.$method($($arg),*),
-            DmftLoopVariant::RealZ2(s)    => s.$method($($arg),*),
+        match $inner {
+            DmftLoopVariant::RealU1(ref mut s) => s.$method($($arg),*),
+            DmftLoopVariant::RealZ2(ref mut s) => s.$method($($arg),*),
         }
     };
 }
@@ -278,8 +295,10 @@ pub struct PyDmftLoop {
 impl PyDmftLoop {
     /// Construct a real-valued U(1) DMFT solver (the standard single-orbital case).
     ///
-    /// For complex hybridization, use `DMFTLoop.complex_u1()`.
     /// For particle-hole symmetric models with Z₂ symmetry, use `DMFTLoop.real_z2()`.
+    ///
+    /// **Note:** `complex_u1()` is blocked — `DeviceFaer` does not implement
+    /// `LinAlgBackend<Complex<f64>>`. See §3.2 for details.
     ///
     /// # Parameters
     /// - `config`: `DMFTConfig` controlling all solver parameters.
@@ -288,13 +307,6 @@ impl PyDmftLoop {
     /// `tensorkraft.ConfigError` if any configuration field is out of range.
     #[new]
     pub fn new(config: &PyDmftConfig) -> PyResult<Self>;
-
-    /// Construct a complex-valued U(1) DMFT solver.
-    ///
-    /// Use when the hybridization function Δ(ω) is complex (e.g., spin-orbit
-    /// coupling or non-Hermitian baths).
-    #[staticmethod]
-    pub fn complex_u1(config: &PyDmftConfig) -> PyResult<Self>;
 
     /// Construct a real-valued Z₂ DMFT solver.
     ///
@@ -695,8 +707,18 @@ impl PyDmftConfig {
 
 #### `PyDmrgConfig` (`DMRGConfig` in Python)
 
+**Config mirror pattern:** The upstream `DMRGConfig` does not implement `Clone` (it contains a `Box<dyn Eigensolver>` field). `PyDmrgConfig` therefore maintains its own `Clone`-compatible fields (scalars and a string-based eigensolver name) and reconstructs a fresh `DMRGConfig` on demand via `to_rust_config()`, which boxes the eigensolver from the stored string name.
+
 ```rust
 /// DMRG sweep configuration, nested inside `DMFTConfig`.
+///
+/// # Mirror pattern
+///
+/// `DMRGConfig` is not `Clone` because it contains `Box<dyn Eigensolver>`.
+/// `PyDmrgConfig` stores its own copies of all scalar fields plus the
+/// eigensolver name as a `String`. The method `to_rust_config()` reconstructs
+/// a `DMRGConfig` on demand, including a fresh `Box<dyn Eigensolver>`
+/// dispatched from the stored string name (`"lanczos"`, `"davidson"`, etc.).
 ///
 /// # Python usage
 ///
@@ -707,9 +729,40 @@ impl PyDmftConfig {
 /// config.dmrg.energy_tol = 1e-8
 /// config.dmrg.eigensolver = "davidson"
 /// ```
+///
+/// # Nested getter limitation (PyO3)
+///
+/// **WARNING:** `config.dmrg.max_bond_dim = 300` silently modifies a
+/// temporary clone, NOT the original config. PyO3 `#[getter]` cannot
+/// return `&T` for `#[pyclass]` types; it returns an owned copy.
+/// To propagate mutations, reassign the nested config:
+///
+/// ```python
+/// dmrg = config.dmrg          # returns a clone
+/// dmrg.max_bond_dim = 300     # mutates the clone
+/// config.dmrg = dmrg          # writes back via #[setter]
+/// ```
+///
+/// Alternatively, `PyDmftConfig` provides flat setters for common fields:
+///
+/// ```python
+/// config.set_dmrg_max_bond_dim(300)   # direct mutation, no clone
+/// ```
 #[pyclass(name = "DMRGConfig")]
 pub struct PyDmrgConfig {
-    pub(crate) inner: DMRGConfig,
+    pub(crate) max_bond_dim: usize,
+    pub(crate) svd_cutoff: f64,
+    pub(crate) max_sweeps: usize,
+    pub(crate) energy_tol: f64,
+    pub(crate) eigensolver_name: String,
+    pub(crate) environment_offload: Option<String>,
+}
+
+impl PyDmrgConfig {
+    /// Reconstruct a `DMRGConfig` from the mirrored fields.
+    ///
+    /// Boxes the eigensolver from `eigensolver_name`.
+    pub(crate) fn to_rust_config(&self) -> DMRGConfig;
 }
 
 #[pymethods]
@@ -821,8 +874,23 @@ impl PyTimeEvolutionConfig {
 
 #### `PyLinearPredictionConfig` (`LinearPredictionConfig` in Python)
 
+**Field name mapping:** The upstream `LinearPredictionConfig` uses `prediction_order` (not `lp_order`) and `toeplitz_solver` (not `solver`). `ToeplitzSolver` variants are struct variants (e.g., `ToeplitzSolver::LevinsonDurbin { tikhonov_lambda }`, `ToeplitzSolver::Svd { rcond }`), not unit variants.
+
 ```rust
 /// Linear prediction pipeline configuration.
+///
+/// # Field name mapping (Rust → Python)
+///
+/// | Rust field name    | Python property name  | Notes                              |
+/// |:-------------------|:----------------------|:-----------------------------------|
+/// | `prediction_order` | `prediction_order`    | Was incorrectly called `lp_order` in early drafts |
+/// | `toeplitz_solver`  | `toeplitz_solver`     | Was incorrectly called `solver` in early drafts    |
+///
+/// `ToeplitzSolver` is an enum with struct variants:
+/// - `ToeplitzSolver::LevinsonDurbin { tikhonov_lambda: f64 }`
+/// - `ToeplitzSolver::Svd { rcond: f64 }`
+///
+/// Python exposes these as string names (`"levinson_durbin"`, `"svd"`).
 ///
 /// # Python usage
 ///
@@ -997,15 +1065,15 @@ pub(crate) fn extract_gf_imfreq(
 
 ## 7. Monomorphization Control (Architecture §5.4)
 
-`tk-python` is the sole crate in the workspace that determines which concrete `<T, Q, B>` combinations are compiled into the binary. The `DmftLoopVariant` enum enumerates exactly three:
+`tk-python` is the sole crate in the workspace that determines which concrete `<T, Q, B>` combinations are compiled into the binary. The `DmftLoopVariant` enum enumerates exactly two active combinations:
 
-| Variant | T | Q | B | Compiled |
-|:--------|:---|:---|:---|:---------|
-| `RealU1` | `f64` | `U1` | `DefaultDevice` | Always |
-| `ComplexU1` | `Complex<f64>` | `U1` | `DefaultDevice` | Always |
-| `RealZ2` | `f64` | `Z2` | `DefaultDevice` | Always |
+| Variant | T | Q | B | Status |
+|:--------|:---|:---|:---|:-------|
+| `RealU1` | `f64` | `U1` | `DefaultDevice` | Active |
+| `RealZ2` | `f64` | `Z2` | `DefaultDevice` | Active |
+| `ComplexU1` | `Complex<f64>` | `U1` | `DefaultDevice` | **Blocked** — `DeviceFaer` lacks `LinAlgBackend<Complex<f64>>` |
 
-All three variants are compiled regardless of feature flags, because Python users cannot opt out of type combinations at build time. `DefaultDevice` is a single concrete type (resolved at compile time by the active backend flag), so each variant generates exactly one machine-code path. For the PyPI wheel (`backend-faer` default), the binary contains three copies of the DMFT stack — not the theoretical maximum of 36 (3 scalars × 3 symmetries × 4 backends).
+Both active variants are compiled regardless of feature flags, because Python users cannot opt out of type combinations at build time. `DefaultDevice` is a single concrete type (resolved at compile time by the active backend flag), so each variant generates exactly one machine-code path. For the PyPI wheel (`backend-faer` default), the binary contains two copies of the DMFT stack — not the theoretical maximum of 36 (3 scalars x 3 symmetries x 4 backends).
 
 **Adding a new combination:**
 1. Add one enum variant to `DmftLoopVariant`.
@@ -1047,7 +1115,11 @@ tensorkraft.TensorkraftError  (base; subclass of Exception)
 KeyboardInterrupt                        ← DmftError::Cancelled  (call-site conversion)
 ```
 
-### 8.4 `PythonError` Conversion Type
+### 8.4 `PythonError` Conversion Type (Error Bridge Pattern)
+
+The error bridge pattern separates domain errors from their Python representations. `PythonError` is a newtype around `DmftError` that implements `From<PythonError> for PyErr`. This keeps error mapping centralized in `error.rs` and prevents ad-hoc `PyErr` construction scattered across `#[pymethods]` bodies.
+
+**Critical constraint:** `DmftError::Cancelled` must NEVER flow through `PythonError`. It is intercepted at the `solve()` call site and converted directly to `PyKeyboardInterrupt`. If `Cancelled` reaches `PythonError`, the `unreachable!` arm panics to surface the programming error.
 
 ```rust
 /// Conversion bridge from `DmftError` to `PyErr`.
@@ -1225,7 +1297,7 @@ pub(crate) mod error;
 | `su2-symmetry` | Propagates SU(2) symmetry into the underlying stack. No new Python API in Phase 4; not included in PyPI wheels. |
 | `parallel` | Rayon parallelism (propagated from `tk-linalg` via `tk-dmft`). Enabled by default and used in PyPI wheels. |
 | `triqs` | TRIQS `GfImFreq`/`GfReFreq` interop via runtime Python object inspection. Not included in PyPI wheels. |
-| `python-bindings` | Sentinel flag; activates `#[pymodule]` and `extension-module` in `pyo3`. Enabled by default and used in PyPI wheels. |
+| `python-bindings` | Sentinel flag; activates `#[pymodule]` and `extension-module` in `pyo3`. Enabled by default and used in PyPI wheels. **Must be disabled for `cargo test`** (see below). |
 
 **PyPI wheel constraint (architecture §2.3):** Pre-built wheels use `default-features = true` which resolves to `{backend-faer, backend-oxiblas, parallel, python-bindings}`. No FFI BLAS symbols are linked. Users requiring MKL, OpenBLAS, CUDA, or TRIQS must build from source:
 
@@ -1234,6 +1306,19 @@ pub(crate) mod error;
 pip install maturin
 maturin build --release --features backend-mkl,triqs
 ```
+
+**`extension-module` vs `cargo test` conflict:** PyO3's `extension-module` feature changes the linker behavior to produce a shared library loadable by the Python interpreter. This conflicts with `cargo test`, which builds a native executable. The `python-bindings` feature flag gates `extension-module` so that tests can be run without it:
+
+```sh
+# Running tests (disable extension-module via --no-default-features):
+cargo test -p tk-python --no-default-features --features backend-faer,parallel
+
+# On macOS, the Python shared library must be on the dylib search path:
+DYLD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')" \
+    cargo test -p tk-python --no-default-features --features backend-faer,parallel
+```
+
+This pattern is the standard PyO3 workaround for projects that need both `cargo test` and `maturin build`.
 
 ---
 
@@ -1323,7 +1408,7 @@ tk-dmft  = { path = "../tk-dmft", version = "0.1.0" }
 # tk-dmft re-exports the full dependency chain:
 #   tk-dmrg, tk-core, tk-symmetry, tk-linalg, tk-contract, tk-dsl
 
-pyo3         = { version = "0.21", features = ["extension-module", "abi3-py38"] }
+pyo3         = { version = "0.21", features = ["abi3-py38"] }
 numpy        = "0.21"      # rust-numpy; zero-copy NumPy array construction
 num-complex  = "0.4"
 thiserror    = "1"
@@ -1336,6 +1421,8 @@ criterion    = { version = "0.5", optional = true }
 
 [features]
 default          = ["backend-faer", "backend-oxiblas", "parallel", "python-bindings"]
+# extension-module is behind python-bindings so that cargo test works
+# without it. See §10 Feature Flags for the testing pattern.
 python-bindings  = ["pyo3/extension-module"]
 backend-faer     = ["tk-dmft/backend-faer"]
 backend-oxiblas  = ["tk-dmft/backend-oxiblas"]
@@ -1376,9 +1463,8 @@ triqs            = []
 | Test | Description |
 |:-----|:------------|
 | `dispatch_variant_real_u1` | Construct `PyDmftLoop::new(config)` (RealU1 variant). Verify `inner` matches `DmftLoopVariant::RealU1`. Verify `__repr__` contains `"DMFTLoop(RealU1)"`. |
-| `dispatch_variant_complex_u1` | Construct via `DMFTLoop.complex_u1(config)`. Verify `DmftLoopVariant::ComplexU1` is selected. |
 | `dispatch_variant_real_z2` | Construct via `DMFTLoop.real_z2(config)`. Verify `DmftLoopVariant::RealZ2` is selected. |
-| `dispatch_macro_n_iterations` | Call `dispatch_variant!(inner, n_iterations())` for each variant in a fresh solver. Verify 0 is returned in all three cases. |
+| `dispatch_macro_n_iterations` | Call `dispatch_variant!(inner, n_iterations())` for each variant in a fresh solver. Verify 0 is returned in both cases. |
 | `config_defaults_match_rust` | Construct `PyDmftConfig::new(6, 0.0, ...)` with all defaults. Verify all nested fields match the values in `DMFTConfig::default()` from `tk-dmft`. |
 | `config_nested_mutation_propagates` | Set `config.dmrg.max_bond_dim = 300`. Construct `PyDmftLoop`. Verify the underlying `DMFTConfig.dmrg_config.max_bond_dim == 300`. |
 | `config_solver_mode_roundtrip` | Set `solver_mode = "chebyshev"`. Read back and assert `"chebyshev"`. Repeat for `"tdvp"` and `"adaptive"`. |
@@ -1450,7 +1536,6 @@ Gated behind the `integration-tests` feature flag (slow; excluded from standard 
 | `python_chebyshev_promoted_metallic` | U=0 metallic run. Verify `stats.chebyshev_was_primary` contains only `True`. |
 | `python_tdvp_primary_mott` | U=8W Mott insulating run. Verify `stats.chebyshev_was_primary` contains predominantly `False`. |
 | `python_real_z2_variant_runs` | `DMFTLoop.real_z2(config)`. Verify it produces a valid spectral function with `sum_rule() ≈ 1.0`. |
-| `python_complex_u1_variant_runs` | `DMFTLoop.complex_u1(config)`. Verify it runs without error on a synthetic complex hybridization. |
 
 ### 14.5 TRIQS Interop Tests
 
@@ -1464,7 +1549,25 @@ Gated behind `features = ["triqs"]` and require a TRIQS installation. Run only i
 | `triqs_import_error_graceful` | Remove TRIQS from `sys.path`. Call `update_from_triqs_delta`. Verify `ImportError` is raised with an instructive message. |
 | `triqs_wrong_gf_type_raises` | Pass a `GfImTime` instead of `GfImFreq`. Verify `TypeError` is raised. |
 
-### 14.6 Property-Based Tests
+### 14.6 Test Execution
+
+**Draft implementation status:** 11 tests pass as of the draft implementation. The following are deferred to future phases:
+
+- TRIQS integration tests (requires TRIQS installation)
+- Custom exception hierarchy tests (exception classes registered but not yet fully tested)
+- Zero-copy NumPy tests (clone-on-getter implemented; pinned-view deferred)
+- SU(2) variant tests (feature propagated but no Python API)
+- `__init__.pyi` stub generation tests
+
+**Running tests:** Due to the `extension-module` conflict (§10), tests must be run with:
+
+```sh
+cargo test -p tk-python --no-default-features --features backend-faer,parallel
+```
+
+On macOS, prepend `DYLD_LIBRARY_PATH` as documented in §10.
+
+### 14.7 Property-Based Tests
 
 ```rust
 use proptest::prelude::*;
@@ -1509,7 +1612,7 @@ proptest! {
 }
 ```
 
-### 14.7 Memory Leak Tests
+### 14.8 Memory Leak Tests
 
 Python reference counting errors cause memory leaks invisible to Rust's drop checker. These tests use `tracemalloc` to verify allocations do not grow monotonically across repeated solve/GC cycles.
 
@@ -1547,7 +1650,43 @@ def test_no_memory_leak_spectral_function_arrays():
 
 ---
 
-## 15. Security Considerations
+## 15. Implementation Notes and Design Decisions
+
+### Note 1 — Config Mirror Pattern for Non-Clone Rust Types
+
+`DMRGConfig` contains `Box<dyn Eigensolver>` and is therefore not `Clone`. PyO3 `#[pyclass]` types benefit from being `Clone` (for getter returns) and from having simple, owned fields. `PyDmrgConfig` maintains its own scalar fields and a `String` eigensolver name. The method `to_rust_config()` reconstructs a fresh `DMRGConfig`, boxing the eigensolver from the string name. This pattern applies to any upstream Rust config that contains trait objects or other non-`Clone` fields.
+
+### Note 2 — Nested Config Getter Returns Clone, Not Reference
+
+PyO3 `#[getter]` for `#[pyclass]` return types cannot return `&T` — it must return an owned value. This means `config.dmrg` returns a clone, and `config.dmrg.max_bond_dim = 300` silently modifies the temporary, not the original config. This is a fundamental PyO3 limitation. Mitigations: (a) provide flat setters like `config.set_dmrg_max_bond_dim(300)`, or (b) document the reassignment pattern `dmrg = config.dmrg; dmrg.max_bond_dim = 300; config.dmrg = dmrg`.
+
+### Note 3 — String-Based Enum Dispatch
+
+Rust enums (e.g., `SpectralSolverMode`, `MixingScheme`, `ToeplitzSolver`, eigensolver selection) are exposed to Python as lowercase string identifiers (`"tdvp"`, `"chebyshev"`, `"adaptive"`, `"linear"`, `"broyden"`, `"levinson_durbin"`, `"svd"`, `"lanczos"`, `"davidson"`, `"block_davidson"`). The `#[setter]` methods parse the string and return `ValueError` for unrecognized names. This avoids exposing Rust enum types as Python classes while keeping the API pythonic.
+
+### Note 4 — `dispatch_variant_mut!` Borrow Semantics
+
+The dispatch macro must use `match $inner` (not `match &mut $inner`) to avoid double-borrow errors when `$inner` is `self.inner` and the enclosing method takes `&mut self`. Using `match &mut self.inner` creates a second mutable borrow of `self` in addition to the `&mut self` parameter. The `ref mut` binding pattern in each arm provides the needed mutability without the double borrow.
+
+### Note 5 — GIL Deadlock Prevention: `monitor.shutdown()` Placement
+
+`monitor.shutdown()` MUST be called inside `py.allow_threads()`, before the GIL is re-acquired. If `shutdown()` is called after `allow_threads` returns, the main thread holds the GIL while the monitor thread may be blocked on `Python::with_gil` — creating an AB/BA deadlock. This is the single most critical correctness invariant in `tk-python`. See §4.2 for the full pattern.
+
+### Note 6 — Error Bridge: `DmftError::Cancelled` Must Not Flow Through `PythonError`
+
+`DmftError::Cancelled` maps to `PyKeyboardInterrupt`, which is a subclass of `BaseException`, not `Exception`. All other `DmftError` variants map to subclasses of `tensorkraft.TensorkraftError` (itself a subclass of `Exception`). If `Cancelled` were routed through `PythonError`, it would be wrapped in `TensorkraftError`, making it uncatchable by bare `except KeyboardInterrupt:` handlers. The `unreachable!` arm in `PythonError` enforces this invariant at runtime.
+
+### Note 7 — `DeviceAPI` Has No `Default` Implementation
+
+`DeviceAPI` must be constructed explicitly via `DeviceAPI::new(DeviceFaer, DeviceFaer)`. There is no `Default` impl. All `PyDmftLoop` constructors (`new`, `real_z2`) must create the `DeviceAPI` explicitly when building the `DMFTLoop`.
+
+### Note 8 — `AndersonImpurityModel::new()` Takes 5 Arguments
+
+The upstream `AndersonImpurityModel::new()` signature requires 5 arguments (not 4 as initially assumed). The constructor must be called with the correct arity. Any signature change upstream will cause a compile error in `tk-python`, which is the desired behavior for catching drift.
+
+---
+
+## 16. Security Considerations
 
 **Trust boundary:** `tk-python` accepts Python objects from user code (configuration dicts, NumPy arrays, TRIQS objects). When the `triqs` feature is active, TRIQS object inspection uses Python's attribute protocol (`getattr`), not raw FFI. No `unsafe` code touches user-provided Python objects.
 
@@ -1559,34 +1698,39 @@ def test_no_memory_leak_spectral_function_arrays():
 
 ---
 
-## 16. Out of Scope
+## 17. Out of Scope
 
 - **MPI Mode B orchestration** — `tk-python` does not expose `initialize_dmft_node_budget` or MPI primitives. Multi-rank DMFT uses `mpi4py` at the application layer; each rank imports `tensorkraft` independently. `(-> application layer)`
 - **Multi-GPU management** — The `backend-cuda` feature is propagated from `tk-dmft`, but no GPU-specific Python API is added. GPU selection is transparent to the Python user. `(-> tk-dmft)`
 - **Interactive Jupyter widgets** — Progress bars and real-time convergence plots during `solve()` are out of scope. Users monitor convergence via `solver.stats()` after `solve()` returns. `(-> Phase 5+)`
-- **Complex bath parameters via `PyBathParameters`** — `PyBathParameters` exposes `f64` arrays only. A `PyBathParametersComplex` variant for the `ComplexU1` solver is deferred (Open Question #1). `(-> Phase 5+)`
+- **Complex-valued DMFT (`ComplexU1` variant)** — Blocked on `DeviceFaer` implementing `LinAlgBackend<Complex<f64>>`. `(-> blocked on tk-linalg)`
+- **Complex bath parameters via `PyBathParameters`** — `PyBathParameters` exposes `f64` arrays only. A `PyBathParametersComplex` variant for the `ComplexU1` solver is deferred (Open Question #1). `(-> Phase 5+, blocked on ComplexU1)`
 - **SU(2) Python API** — `su2-symmetry` is propagated into the underlying stack but no SU(2)-specific Python API (e.g., total spin constructors, multiplet-resolved bath parameters) is added in Phase 4. `(-> Phase 5+)`
+- **Custom exception hierarchy (full testing)** — Exception classes are registered but not yet fully tested in the draft implementation. `(-> Phase 4 completion)`
 - **Checkpoint load/reload API** — `DMFTCheckpoint` is not directly exposed. Checkpoint read/write is controlled via `DMFTConfig.checkpoint_path`; the binary format is opaque to Python users. `(-> Phase 5+)`
 - **`tensorkraft-stubs` package** — Hand-written `.pyi` stubs for IDE autocompletion are out of scope for the initial spec (Open Question #5). `(-> Phase 5+)`
 
 ---
 
-## 17. Open Questions
+## 18. Open Questions
 
 | # | Question | Status |
 |:--|:---------|:-------|
-| 1 | `PyBathParametersComplex` for `ComplexU1`: the complex hybridization variant is supported by `DmftLoopVariant::ComplexU1` but its bath parameter setter is unspecified. Should complex bath arrays be a separate class or a unified `PyBathParameters` with a `dtype` parameter? | Open |
+| 1 | `PyBathParametersComplex` for `ComplexU1`: blocked until `DeviceFaer` implements `LinAlgBackend<Complex<f64>>`. When unblocked, should complex bath arrays be a separate class or a unified `PyBathParameters` with a `dtype` parameter? | Blocked — depends on complex backend |
 | 2 | Clone-vs-pinned-view for NumPy getters: the clone-on-getter strategy is correct and simple (§12.3). Should we benchmark to confirm the ~80 KB clone is negligible for typical `n_omega`? If so, is this a CI benchmark or a one-time measurement? | Deferred — defer unless profiling shows it is an issue |
 | 3 | PyO3 v0.22 migration: the spec targets v0.21's `&'py PyAny` lifetime style. The v0.22 `Bound<'py, T>` API is the long-term standard. Should this spec target v0.22 for Phase 4, or migrate in Phase 5? | Deferred — use v0.21 for Phase 4; migrate in Phase 5 |
 | 4 | TRIQS duck-typing: §6.2 checks the TRIQS class by name. Should it instead check for a duck-typed protocol (presence of `.data`, `.mesh`, `.beta` attributes) to support compatible non-TRIQS Green's function objects? | Open |
-| 5 | Python stubs (`.pyi` files) for IDE autocompletion: should maturin auto-generate stubs via `pyo3-stub-gen`, or should hand-written stubs be committed to a `python/tensorkraft.pyi` file? | Open |
-| 6 | Config freeze-on-construct: if a Python user modifies `config.dmrg.max_bond_dim` while `solve()` is running on a different thread, PyO3 raises `PyRuntimeError("Already borrowed")`. Is this sufficient, or should `DMFTLoop` deep-copy the config on construction to make post-construction mutations a no-op? | Open — deep-copy on construction is safer; flag as design decision before Phase 4 implementation |
+| 5 | Python stubs (`.pyi` files) for IDE autocompletion: should maturin auto-generate stubs via `pyo3-stub-gen`, or should hand-written stubs be committed to a `python/tensorkraft.pyi` file? Deferred from draft implementation. | Open |
+| 6 | Config freeze-on-construct: `DMFTLoop` should deep-copy the config on construction (implemented in draft via the mirror pattern for `PyDmrgConfig`). The nested getter limitation (§5.4) means `config.dmrg.max_bond_dim = 300` silently modifies a temporary. Should flat setters (e.g., `config.set_dmrg_max_bond_dim(300)`) be the primary API? | Open — flat setters avoid the silent-copy footgun |
 | 7 | Checkpoint restart API: should `DMFTLoop.solve()` accept an optional `resume_from_checkpoint: str` parameter to restart from a saved checkpoint, rather than requiring the user to reconstruct the entire loop? | Open |
+| 8 | `AndersonImpurityModel::new()` takes 5 arguments (not 4 as originally assumed). The constructor signature must be kept in sync with the upstream `tk-dmft` crate. How should signature drift be detected automatically? | Resolved — verified in draft; document verbatim signature |
+| 9 | `DeviceFaer` complex backend: `DeviceFaer` does not implement `LinAlgBackend<Complex<f64>>`. This blocks the `ComplexU1` variant entirely. When will the complex backend be available? | Blocked — upstream `tk-linalg` |
 
 ---
 
-## 18. Future Considerations
+## 19. Future Considerations
 
+- **`ComplexU1` variant restoration** — When `DeviceFaer` (or another default backend) implements `LinAlgBackend<Complex<f64>>`, re-add `ComplexU1(DMFTLoop<Complex<f64>, U1, DefaultDevice>)` to `DmftLoopVariant`, restore the `DMFTLoop.complex_u1()` static method, and add `PyBathParametersComplex`. Blocked on `tk-linalg`.
 - **PyO3 v0.22 (`Bound<'py, T>`) migration** — The `Bound` API eliminates the implicit `py` lifetime on `&'py PyAny` and makes misuse a compile-time error rather than a runtime panic. Migration is non-breaking from the Python API perspective.
 - **`async def solve_async()`** — An async wrapper using `asyncio.run_in_executor` would allow `solve()` to be `await`-ed from async Python code without blocking the event loop. Requires no changes to the GIL protocol but needs Python 3.10+ and a compatible executor.
 - **Wheel portability matrix** — GitHub Actions CI matrix across `linux/amd64`, `linux/aarch64`, `macos/arm64`, and `windows/amd64` via `maturin build --release`. The `abi3-py38` tag ensures a single wheel per platform supports Python 3.8+.
