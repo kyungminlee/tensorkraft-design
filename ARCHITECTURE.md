@@ -2,7 +2,30 @@
 # Rust-Based Tensor Network Library
 **for Quantum Many-Body Physics — DMRG Algorithms & DMFT Impurity Solver Integration**
 
-*Version 8.4 — March 2026 | Status: Architectural Specification (Pre-Implementation)*
+*Version 8.5 — March 2026 | Status: Architectural Specification (Post-Draft-Implementation)*
+
+---
+## Revision Notes (v8.4 → v8.5)
+
+This revision incorporates cross-cutting findings from the draft implementation of all crates (tk-core through tk-python). Changes reflect lessons learned from actual Rust compilation and runtime behavior, not speculative design. Key changes include:
+
+- **§2.1** — Workspace layout corrected: crates live in top-level directories (`tk-core/`, `tk-symmetry/`, etc.), not under a `crates/` subdirectory.
+- **§3.1** — `TensorCow` eliminated: `TensorStorage<'a, T>` is now a single enum with `Owned(Vec<T>)` / `Borrowed(&'a [T])`. `DenseTensor` gains a lifetime parameter (`DenseTensor<'a, T>`) and an `offset: usize` field essential for zero-copy `slice_axis`. `TempTensor` is just `DenseTensor` with a shorter lifetime, not a distinct type.
+- **§3.4** — `Scalar` trait expanded: requires `Sub<Output=Self>`, `Neg<Output=Self>`, `Debug`, `'static`. `Real` associated type requires `PartialOrd` and `Float`. Added `from_real_imag()` for complex number construction (needed by `SpinOp::Sy`, Green's functions).
+- **§4.1** — `QuantumNumber` requires `'static` bound. `BitPackable` requires `Copy`.
+- **§4.2** — `BlockSparseTensor` gains `leg_directions: Vec<LegDirection>` field (essential for flux rule enforcement). Blocks are always `DenseTensor<'static, T>` (no arena-borrowed blocks). `permute()` is NOT zero-copy — requires `into_owned()` on each block for BLAS contiguity. `DenseTensor` and `BlockSparseTensor` require `Clone` (cross-cutting issue affecting tk-contract, tk-dsl, tk-dmrg, tk-dmft).
+- **§4.4** — CG cache uses hand-rolled Racah formula, not `lie-groups` dependency.
+- **§5.1** — `regularized_svd_inverse` requires `where Self: Sized` bound (breaks object-safety for that method only). Return types for SVD/eigh/QR are `DenseTensor<'static, T>` (always owned).
+- **§5.2** — `DefaultDevice` interim definition: `DeviceAPI<DeviceFaer, DeviceFaer>` (not `DeviceOxiblas`). `gesdd`→`gesvd` fallback is no-op with faer (only meaningful with MKL/OpenBLAS). faer `thin_svd()` returns ascending order; must re-sort descending.
+- **§5.3** — Threading uses simple binary heuristic for Phase 1–3, not partitioned scheduler.
+- **§7.3** — Operator overloading (`*`, `+` on `OpSum`) restricted to `f64` due to Rust orphan rules. `hamiltonian!{}` proc-macro deferred (not yet implemented).
+- **§8.3** — `DMRGConfig` should be split into immutable `DMRGConfig` and mutable `DMRGState`. `Box<dyn IterativeEigensolver>` prevents `Clone`. Davidson/Block-Davidson delegate to Lanczos (not yet independently implemented).
+- **§8.3** — Checkpoint non-functional: blocked by `BlockSparseTensor` lacking serde.
+- **§8.4** — Double-occupancy measurement requires `CustomOp` (no `NPairInteraction` in `FermionOp`). Positivity restoration edge case: only rescale when both sums are positive. `LinearPredictionConfig` field names: `prediction_order` (not `lp_order`), `toeplitz_solver` (not `solver`).
+- **§7.5** — `ComplexU1` variant blocked: `DeviceFaer` doesn't implement `LinAlgBackend<Complex<f64>>` yet. PyO3 `extension-module` vs test linking conflict requires feature flag pattern. Config mirror pattern needed because `DMRGConfig` is not `Clone`.
+- **§6** — `DenseTensor` lifetime makes executor generics painful; unsafe transmute workaround for lifetime unification.
+- **§11** — `lie-groups` dependency replaced by hand-rolled Racah formula for CG coefficients.
+- **General** — `DenseTensor Clone` is the #1 cross-cutting issue affecting tk-contract, tk-dsl, tk-dmrg, tk-dmft. Must be resolved.
 
 ---
 ## Revision Notes (v8.3 → v8.4)
@@ -158,7 +181,7 @@ The architecture leverages Rust's zero-cost abstractions, ownership-based memory
 
 The design is organized around five foundational pillars, each addressed by a dedicated sub-crate within a Cargo workspace:
 
-- **tk-core:** Tensor data structures with strict shape/storage separation, arena allocation, and Copy-on-Write semantics. Matrix views (`MatRef`) carry lazy conjugation flags for zero-copy Hermitian transposes.
+- **tk-core:** Tensor data structures with strict shape/storage separation (`DenseTensor<'a, T>` with CoW `TensorStorage<'a, T>`), arena allocation, and offset-based zero-copy slicing. Matrix views (`MatRef`) carry lazy conjugation flags for zero-copy Hermitian transposes.
 - **tk-symmetry:** Native Abelian symmetry support (U(1), Z₂) via block-sparse formats with bit-packed sector keys, with a clear extension path for non-Abelian SU(2) via Wigner-Eckart factorization.
 - **tk-linalg:** Trait-based linear algebra backend abstraction defaulting to faer (dense) and oxiblas (sparse), swappable via feature flags. GEMM dispatch propagates conjugation metadata to hardware micro-kernels. Includes regularized pseudo-inverse for numerically stable gauge restoration. Three-way partitioned LPT-scheduled block-sparse parallelism dynamically routes GPU-heavy sectors, CPU multithreaded BLAS sectors, and fragmented Rayon tails.
 - **tk-contract:** DAG-based contraction engine with separated path optimization and execution phases. Bosonic tensor legs only; fermionic sign rules encoded in MPO via Jordan-Wigner.
@@ -177,15 +200,14 @@ The library is structured as a Cargo workspace containing focused, independently
 ```
 tensorkraft/
 ├── Cargo.toml              # workspace root
-├── crates/
-│   ├── tk-core/             # Tensor shape, storage, memory mgmt, MatRef/MatMut
-│   ├── tk-symmetry/         # Quantum numbers, block-sparse formats
-│   ├── tk-linalg/           # Backend abstraction (faer, oxiblas), LPT scheduling
-│   ├── tk-contract/         # DAG engine, path optimization
-│   ├── tk-dsl/              # Macros, OpSum, lattice builders
-│   ├── tk-dmrg/             # DMRG sweeps, eigensolvers, MPS/MPO, OpSum→MPO compilation
-│   ├── tk-dmft/             # DMFT loop, bath discretization, TDVP/TEBD
-│   └── tk-python/           # PyO3 bindings for DMFT integration
+├── tk-core/                 # Tensor shape, storage, memory mgmt, MatRef/MatMut
+├── tk-symmetry/             # Quantum numbers, block-sparse formats
+├── tk-linalg/               # Backend abstraction (faer, oxiblas), LPT scheduling
+├── tk-contract/             # DAG engine, path optimization
+├── tk-dsl/                  # Macros, OpSum, lattice builders
+├── tk-dmrg/                 # DMRG sweeps, eigensolvers, MPS/MPO, OpSum→MPO compilation
+├── tk-dmft/                 # DMFT loop, bath discretization, TDVP/TEBD
+├── tk-python/               # PyO3 bindings for DMFT integration
 ├── benches/                 # Criterion benchmarks (local bare-metal only)
 ├── fixtures/                # Reference snapshot data (ED energies, spectra)
 ├── examples/                # Heisenberg chain, Hubbard DMFT, etc.
@@ -196,8 +218,8 @@ tensorkraft/
 
 | Crate | Responsibility | Depends On |
 |:------|:---------------|:-----------|
-| **tk-core** | Tensor shape/stride metadata, contiguous storage buffers, `MatRef`/`MatMut` with lazy conjugation flag, arena allocators with explicit ownership boundary (`TempTensor`/`.into_owned()`) and pinned-memory budget tracking, TensorCow (Copy-on-Write), element-type generics, error types | *(none — leaf crate)* |
-| **tk-symmetry** | QuantumNumber trait, BitPackable trait, U(1)/Z₂ implementations, PackedSectorKey, block-sparse storage, Wigner-Eckart scaffolding for SU(2) | tk-core |
+| **tk-core** | Tensor shape/stride metadata, `TensorStorage<'a, T>` with CoW semantics (`Owned`/`Borrowed`), `DenseTensor<'a, T>` with offset field, `MatRef`/`MatMut` with lazy conjugation flag, arena allocators with explicit ownership boundary (`.into_owned()`) and pinned-memory budget tracking, element-type generics, error types | *(none — leaf crate)* |
+| **tk-symmetry** | QuantumNumber trait (`'static` bound), BitPackable trait (`Copy` supertrait), U(1)/Z₂ implementations, PackedSectorKey, block-sparse storage with `leg_directions: Vec<LegDirection>` per tensor, `fuse_legs`/`split_leg` with BTreeMap-based deterministic ordering, `iter_keyed_blocks()` paired iterator, Wigner-Eckart scaffolding for SU(2) with DashMap-based CG cache (hand-rolled Racah formula) | tk-core |
 | **tk-linalg** | LinAlgBackend trait (conjugation-aware GEMM), SVD/EVD dispatch (gesdd default), regularized pseudo-inverse, DeviceFaer and DeviceOxiblas implementations, three-way partitioned LPT-scheduled block-sparse dispatch (GPU/CPU-BLAS/Rayon), Rayon-parallel element-wise ops | tk-core, tk-symmetry |
 | **tk-contract** | ContractionGraph DAG, PathOptimizer trait, greedy/TreeSA heuristics, ContractionExecutor with reshape-free GEMM, conjugation flag propagation. Bosonic legs only (§6.4); fermionic swap gates deferred to Phase 5+ | tk-core, tk-symmetry, tk-linalg |
 | **tk-dsl** | Index struct with unique IDs and prime levels, `hamiltonian!{}` proc-macro with span hygiene (§7.2.1) and diagnostic reporting (§7.2.2) — generates `OpSum` AST only, typed operator enums (`SpinOp`, `FermionOp`, `BosonOp`, `CustomOp`), OpSum builder, Lattice trait, snake-path mappers | tk-core, tk-symmetry |
@@ -207,15 +229,17 @@ tensorkraft/
 
 **Key architectural constraint (cyclic dependency prevention):** `tk-dsl` generates only uncompressed `OpSum` structures and lattice geometry mappings. It has no dependency on `tk-linalg` or `tk-dmrg`. The `OpSum → MPO` compilation step (which requires SVD compression via `LinAlgBackend`) lives entirely within `tk-dmrg`, which has access to both `tk-dsl` and `tk-linalg`.
 
+**Post-implementation note (dependency visibility):** `tk-dmrg` does not re-export its transitive dependencies. Downstream crates (tk-dmft, tk-python) that use types from tk-core, tk-symmetry, or tk-linalg must declare direct `[dependencies]` on those crates in their `Cargo.toml`, even though tk-dmrg already depends on them. This is standard Rust practice (no implicit transitive exports) but means each crate's `Cargo.toml` must list all directly-used upstream crates.
+
 ### 2.3 Feature Flags
 
 | Feature Flag | Effect | Default | Exclusivity |
 |:-------------|:-------|:--------|:------------|
 | **backend-faer** | Enables DeviceFaer for dense SVD/EVD/QR using the pure-Rust faer crate | Yes | — |
-| **backend-oxiblas** | Enables DeviceOxiblas for sparse BSR/CSR operations and extended-precision (f128) math | Yes | — |
+| **backend-oxiblas** | Enables DeviceOxiblas for sparse BSR/CSR operations and extended-precision (f128) math. **Post-implementation note:** DeviceOxiblas is not yet implemented; `DefaultDevice` uses `DeviceAPI<DeviceFaer, DeviceFaer>` as interim | Yes | — |
 | **backend-mkl** | Links Intel MKL via FFI for vendor-optimized BLAS on Intel hardware | No | Conflicts with `backend-openblas` |
 | **backend-openblas** | Links OpenBLAS via FFI for broad HPC cluster compatibility | No | Conflicts with `backend-mkl` |
-| **su2-symmetry** | Activates non-Abelian SU(2) support with Clebsch-Gordan caching (depends on lie-groups crate) | No | — |
+| **su2-symmetry** | Activates non-Abelian SU(2) support with Clebsch-Gordan caching (hand-rolled Racah formula, no external dependency) | No | — |
 | **python-bindings** | Builds tk-python via PyO3/maturin for TRIQS integration | No | — |
 | **parallel** | Enables Rayon-based data parallelism for element-wise tensor operations | Yes | — |
 | **backend-cuda** | Enables DeviceCuda for GPU-accelerated GEMM (cuBLAS), SVD (cuSOLVER), and sparse ops (cuSPARSE); requires CUDA toolkit. Activates `PinnedMemoryTracker` for budget-managed pinned allocations | No | — |
@@ -248,7 +272,7 @@ compile_error!(
 
 The foundational design principle is a strict separation between tensor shape/stride metadata and contiguous memory storage. All tensor data resides as a single flat buffer, irrespective of dimensionality. Element offsets are computed via inner products of index coordinates and strides. This separation enables zero-copy view operations (transpose, permutation, slicing) that mutate only metadata.
 
-**Scope discipline:** `tk-core` is the leaf crate upon which the entire workspace depends. To prevent compilation-cache invalidation cascading through the workspace, `tk-core` is strictly limited to: memory allocation (`SweepArena`, `PinnedMemoryTracker`), dimensional metadata (`TensorShape`, `TensorStorage`, `TensorCow`), matrix view types (`MatRef`, `MatMut` with conjugation flags), the `Scalar` trait hierarchy, and shared error types. Mathematical operations on tensors (addition, trace, contraction) belong in `tk-linalg` or `tk-contract`.
+**Scope discipline:** `tk-core` is the leaf crate upon which the entire workspace depends. To prevent compilation-cache invalidation cascading through the workspace, `tk-core` is strictly limited to: memory allocation (`SweepArena`, `PinnedMemoryTracker`), dimensional metadata (`TensorShape`, `TensorStorage<'a, T>`), the primary tensor type (`DenseTensor<'a, T>`), matrix view types (`MatRef`, `MatMut` with conjugation flags), the `Scalar` trait hierarchy, and shared error types. Mathematical operations on tensors (addition, trace, contraction) belong in `tk-linalg` or `tk-contract`.
 
 ### 3.1 Core Type Definitions
 
@@ -259,23 +283,43 @@ pub struct TensorShape {
     strides: SmallVec<[usize; 6]>,  // row-major by default
 }
 
-/// Contiguous memory buffer, generic over element type.
-pub struct TensorStorage<T: Scalar> {
-    data: Vec<T>,  // or ArenaVec<T> when arena-allocated
+/// Copy-on-Write storage: a single enum merging the original TensorStorage
+/// and TensorCow into one type. The Borrowed variant holds a direct &[T]
+/// slice (not a reference to a wrapper struct), eliminating double indirection.
+///
+/// Post-implementation note: The v8.4 design used a separate TensorCow<'a, T>
+/// wrapping &'a TensorStorage<T>. Implementation showed this indirection adds
+/// complexity with no benefit. The tech spec's flatter design is adopted.
+pub enum TensorStorage<'a, T: Scalar> {
+    Owned(Vec<T>),          // materialized, heap-allocated data
+    Borrowed(&'a [T]),      // zero-copy view into existing buffer
 }
 
 /// The primary dense tensor: shape metadata + owned/borrowed storage.
-pub struct DenseTensor<T: Scalar> {
+///
+/// Post-implementation note: The lifetime parameter 'a is essential —
+/// it surfaces the borrow lifetime to the type level so the borrow checker
+/// can enforce arena safety. Every function returning a view (permute,
+/// reshape, slice_axis) returns DenseTensor<'_, T>.
+///
+/// The `offset` field is essential for zero-copy `slice_axis`: slicing
+/// accumulates offsets rather than creating new borrowed sub-slices,
+/// enabling chained slicing without re-slicing complexity.
+///
+/// TempTensor<'a, T> (arena-allocated temporaries) is simply
+/// DenseTensor<'a, T> with a shorter lifetime — not a distinct type.
+pub struct DenseTensor<'a, T: Scalar> {
     shape: TensorShape,
-    storage: TensorCow<T>,  // Cow semantics: Borrowed view or Owned data
-}
-
-/// Copy-on-Write storage wrapper.
-pub enum TensorCow<'a, T: Scalar> {
-    Borrowed(&'a TensorStorage<T>),   // zero-copy view
-    Owned(TensorStorage<T>),           // materialized copy
+    storage: TensorStorage<'a, T>,
+    /// Byte offset into the storage buffer for the first logical element.
+    /// Accumulates across chained slice_axis calls. as_slice() applies
+    /// this offset; into_owned() gathers only logical elements when
+    /// offset is nonzero.
+    offset: usize,
 }
 ```
+
+**`Clone` requirement (cross-cutting issue):** `DenseTensor` must implement `Clone`. This is the #1 cross-cutting issue discovered during draft implementation — `Clone` is required by tk-contract (executor temporaries), tk-dsl (operator matrix copies), tk-dmrg (MPS site tensor duplication), and tk-dmft (spectral function copies). For `DenseTensor<'static, T>` (owned data), `Clone` clones the `Vec<T>`. For `DenseTensor<'a, T>` (borrowed), `Clone` produces another borrowed view with the same lifetime.
 
 The `Scalar` trait constrains `T` to types supporting the required arithmetic: `f32`, `f64`, `Complex<f32>`, `Complex<f64>`, and optionally `f128` when the `backend-oxiblas` feature is active.
 
@@ -363,7 +407,7 @@ pub enum ArenaStorage {
 impl SweepArena {
     pub fn alloc_tensor<'a, T: Scalar>(
         &'a self, shape: TensorShape
-    ) -> DenseTensor<T> { /* ... */ }
+    ) -> DenseTensor<'a, T> { /* ... */ }
 
     /// O(1) reset: reclaims all arena memory.
     pub fn reset(&mut self) {
@@ -389,19 +433,53 @@ The architecture enforces an explicit ownership transfer at the sweep-step bound
 ```rust
 /// Arena-allocated temporary: borrows from SweepArena.
 /// Cannot outlive the arena's current allocation epoch.
-pub type TempTensor<'a, T> = DenseTensor<T>;  // with TensorCow::Borrowed(&'a ...)
+/// Post-implementation note: TempTensor is just DenseTensor with a
+/// shorter lifetime — not a distinct type.
+pub type TempTensor<'a, T> = DenseTensor<'a, T>;
 
-impl<'a, T: Scalar> DenseTensor<T> {
+impl<'a, T: Scalar> DenseTensor<'a, T> {
+    /// Create a borrowed view of this tensor's storage.
+    /// The key enabler for zero-copy permute/reshape/slice_axis chains:
+    /// even an Owned tensor produces a Borrowed view — the original Vec
+    /// stays alive as long as the original tensor is alive, and the view
+    /// borrows from it. This is why `tensor.permute(p1).slice_axis(0, 1, 3)`
+    /// compiles: each operation borrows from the previous, and Rust's
+    /// lifetime chain ensures the original data outlives all views.
+    pub fn borrow_storage(&self) -> TensorStorage<'_, T> {
+        match &self.storage {
+            TensorStorage::Owned(v) => TensorStorage::Borrowed(v.as_slice()),
+            TensorStorage::Borrowed(s) => TensorStorage::Borrowed(s),
+        }
+    }
+
     /// Materialize into heap-allocated owned storage.
     /// Called exactly once per sweep step on the final SVD output
     /// before SweepArena::reset() reclaims all temporaries.
-    pub fn into_owned(self) -> DenseTensor<T> {
+    ///
+    /// Three-way fast/slow path:
+    /// 1. Move path: already owned, contiguous, offset 0 → zero-cost move
+    /// 2. Memcpy path: contiguous with nonzero offset → single to_vec() on subslice
+    /// 3. Gather path: non-contiguous strides → element-by-element gather
+    ///    via gather_elements(), which uses row-major multi-index enumeration:
+    ///    maintain a vec![0; rank] counter, compute sum(index[i] * strides[i])
+    ///    for each element, increment the counter with carry from the last axis.
+    ///    Cost: O(numel × rank) due to per-element multi-index arithmetic.
+    ///    For rank-6 tensors this adds meaningful overhead vs the memcpy path.
+    pub fn into_owned(self) -> DenseTensor<'static, T> {
         match self.storage {
-            TensorCow::Owned(_) => self,
-            TensorCow::Borrowed(storage) => DenseTensor {
+            TensorStorage::Owned(data) if self.offset == 0 => DenseTensor {
                 shape: self.shape,
-                storage: TensorCow::Owned(storage.clone()),
+                storage: TensorStorage::Owned(data),
+                offset: 0,
             },
+            _ => {
+                let gathered = self.gather_elements();
+                DenseTensor {
+                    shape: TensorShape::contiguous(&self.shape.dims),
+                    storage: TensorStorage::Owned(gathered),
+                    offset: 0,
+                }
+            }
         }
     }
 }
@@ -411,20 +489,38 @@ The rule is simple: everything computed within a DMRG step lives in the arena. T
 
 #### 3.3.3 Copy-on-Write (Cow) Semantics
 
-Shape-manipulation operations (transpose, permute, reshape) return `TensorCow::Borrowed` views whenever the operation can be expressed as a pure stride permutation. Data is cloned into `TensorCow::Owned` only when a contiguous memory layout is strictly required (e.g., as input to a GEMM kernel). This pattern, modeled after the rstsr framework, ensures copies are generated only when mathematically necessary.
+Shape-manipulation operations (transpose, permute, reshape) return `TensorStorage::Borrowed` views whenever the operation can be expressed as a pure stride permutation. Data is cloned into `TensorStorage::Owned` only when a contiguous memory layout is strictly required (e.g., as input to a GEMM kernel). This pattern, modeled after the rstsr framework, ensures copies are generated only when mathematically necessary.
 
 ### 3.4 The Scalar Trait Hierarchy
 
 ```rust
+/// Post-implementation note: The original spec had only Add + Mul.
+/// Draft implementation revealed that Sub, Neg, Debug, and 'static
+/// are all required by downstream crates. The Real associated type
+/// needs PartialOrd (truncation thresholds) and Float (epsilon, sqrt).
+/// from_real_imag() is needed for complex number construction
+/// (SpinOp::Sy matrix, Green's function assembly).
 pub trait Scalar:
-    Copy + Clone + Send + Sync + num::Zero + num::One
+    Copy + Clone + Send + Sync + 'static + Debug
+    + num::Zero + num::One
     + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
     + std::ops::Mul<Output = Self>
+    + std::ops::Neg<Output = Self>
 {
-    type Real: Scalar;  // f64 for Complex<f64>, f64 for f64
+    type Real: Scalar + PartialOrd + num::Float;
     fn conj(self) -> Self;
     fn abs_sq(self) -> Self::Real;
     fn from_real(r: Self::Real) -> Self;
+    /// Construct from real and imaginary parts.
+    /// For real types, panics if imag != 0. Essential for building
+    /// complex operator matrices (e.g., SpinOp::Sy = -i|↑⟩⟨↓| + i|↓⟩⟨↑|).
+    fn from_real_imag(re: Self::Real, im: Self::Real) -> Self;
+    /// Return the imaginary unit if this type supports complex numbers.
+    /// Returns `Some(i)` for Complex<f32>/Complex<f64>, `None` for f32/f64.
+    /// Useful for constructing operator matrices (e.g., SpinOp::Sy = -i|up><dn| + i|dn><up|)
+    /// without branching on is_real().
+    fn imaginary_unit() -> Option<Self>;
     /// Whether complex conjugation is a no-op for this type.
     /// Returns true for f32/f64, false for Complex<f32>/Complex<f64>.
     fn is_real() -> bool;
@@ -432,6 +528,8 @@ pub trait Scalar:
 ```
 
 The `is_real()` method allows the contraction engine to skip setting `is_conjugated` entirely for real-valued models, avoiding unnecessary flag checks in tight loops.
+
+**Operator overloading limitation (Rust orphan rules):** `std::ops::Mul<OpTerm<T>>` for arbitrary `T` cannot be implemented outside the crate defining `T`. In practice, operator overloading on `OpSum` (e.g., `J * op(SpinOp::Sz, i)`) is restricted to `f64` coefficients. Complex coefficients require explicit `OpSum::add_term(coeff, term)` calls.
 
 ---
 
@@ -442,8 +540,10 @@ In quantum systems with global symmetries, tensors become block-sparse: elements
 ### 4.1 Quantum Number Trait & Bit-Packing
 
 ```rust
+/// Post-implementation note: 'static bound required because QuantumNumber
+/// appears in struct definitions needing owned storage.
 pub trait QuantumNumber:
-    Clone + Eq + Hash + Ord + Debug + Send + Sync
+    Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static
 {
     fn identity() -> Self;
     fn fuse(&self, other: &Self) -> Self;
@@ -453,7 +553,9 @@ pub trait QuantumNumber:
 /// Extension trait: compresses a quantum number into a fixed-width bitfield.
 /// Enables O(log N) sector lookup via single-cycle u64 comparisons
 /// instead of element-by-element SmallVec traversal.
-pub trait BitPackable: QuantumNumber {
+/// Post-implementation note: Copy bound added — all quantum number types
+/// (U1, Z2, U1Z2) are small value types that should be Copy.
+pub trait BitPackable: QuantumNumber + Copy {
     /// Number of bits required to store this quantum number.
     const BIT_WIDTH: usize;
     /// Compress into the lower bits of a u64.
@@ -548,14 +650,30 @@ impl PackedSectorKey {
     }
 }
 
+/// Post-implementation note: LegDirection is essential for the flux rule.
+/// Each tensor leg is either incoming or outgoing; the flux rule sums
+/// incoming quantum numbers and subtracts outgoing ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegDirection { Incoming, Outgoing }
+
 /// INVARIANT: sector_keys is always sorted for O(log N) binary search.
 /// Keys are contiguous u64s in a cache-friendly array; the CPU prefetcher
 /// pulls the entire key array into L1 cache, and search resolves via
 /// single-cycle register comparisons.
+///
+/// Post-implementation notes:
+/// - leg_directions field added (omitted in original spec). Essential for
+///   flux rule enforcement in contractions and permutations.
+/// - Blocks are always DenseTensor<'static, T> (owned, no arena-borrowed blocks).
+/// - permute() is NOT zero-copy: requires into_owned() on each block to
+///   ensure BLAS-compatible contiguous layout.
+/// - BlockSparseTensor must implement Clone (required by tk-contract,
+///   tk-dmrg, tk-dmft).
 pub struct BlockSparseTensor<T: Scalar, Q: BitPackable> {
     indices: Vec<QIndex<Q>>,
+    leg_directions: Vec<LegDirection>,
     sector_keys: Vec<PackedSectorKey>,
-    sector_blocks: Vec<DenseTensor<T>>,
+    sector_blocks: Vec<DenseTensor<'static, T>>,
     flux: Q,
 }
 
@@ -569,8 +687,19 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
             .ok()
             .map(|idx| &self.sector_blocks[idx])
     }
+
+    /// Iterate over (key, block) pairs. Heavily used in fuse_legs, split_leg,
+    /// flatten, and block_gemm task generation. More ergonomic than separate
+    /// sector_keys()/sector_block(key) lookups and avoids repeated key searches.
+    pub fn iter_keyed_blocks(&self) -> impl Iterator<Item = (PackedSectorKey, &DenseTensor<'static, T>)> {
+        self.sector_keys.iter().copied().zip(self.sector_blocks.iter())
+    }
 }
 ```
+
+**`fuse_legs` algorithm complexity:** The `fuse_legs` operation combines adjacent tensor legs into a single fused leg via Cartesian product of quantum numbers. The implementation has three phases: (1) Cartesian product enumeration — iterates all combinations of sector indices on the fused legs to produce fused quantum numbers, cost O(product of sector counts on fused legs); (2) BTreeMap-based offset mapping — maps each fused quantum number to a dimension offset, using `BTreeMap` (not `HashMap`) for deterministic ordering that ensures reproducible DMRG sweeps across runs; (3) block scatter — for each original sector, determines the fused quantum number, looks up the offset, and copies data into the fused block at the correct position.
+
+**`split_leg` requires `original_directions` parameter:** The `split_leg(leg_index, original_indices, original_directions)` method takes an additional `original_directions: &[LegDirection]` parameter beyond what the original spec showed. This is needed because fusing loses per-sub-leg direction information — the fused leg has a single direction, but the original sub-legs may have had mixed directions (`Incoming`/`Outgoing`), and unfusing must reconstruct the correct flux rule for each sub-leg.
 
 **Capacity note:** With 8 tensor legs and 8 bits per quantum number (the U(1) default), bit-packing fits in exactly 64 bits. For models requiring larger charge range or higher-rank tensors (e.g., multi-orbital Hubbard with U(1)\_charge ⊗ U(1)\_spin, rank > 8), the `PackedSectorKey` can be promoted to `u128`, giving 16 bits per leg at rank 8 or supporting rank 16 at 8 bits per leg.
 
@@ -665,6 +794,8 @@ pub struct WignerEckartTensor<T: Scalar> {
 
 **Note:** `SU2Irrep` implements `QuantumNumber` but not `BitPackable`. Its `BlockSparseTensor` uses a separate `SmallVec`-keyed variant behind the `su2-symmetry` feature flag. This is acceptable because non-Abelian contractions are dominated by Clebsch-Gordan coefficient evaluation, not sector lookup.
 
+**Post-implementation note (CG coefficients):** The `ClebschGordanCache` uses a hand-rolled Racah formula for computing Clebsch-Gordan coefficients, rather than depending on the `lie-groups` crate. This eliminates an external dependency for a relatively small amount of well-known numerical code. The cache uses `DashMap`-based thread-safe lazy caching for concurrent access from Rayon workers, with exact rational arithmetic via factorials and standard CG series summation. Triangle inequality and selection rules are validated before computation.
+
 **Known refactoring requirement (fusion-rule multiplicity):** The Abelian block-sparse GEMM (§5.3.1) assumes a one-to-one mapping in `compute_fusion_rule(*key_a, *key_b) -> Option<PackedSectorKey>`: each input sector pair produces at most one output sector. For SU(2), the tensor product of irreps yields *multiple* output sectors: j₁ ⊗ j₂ = |j₁−j₂| ⊕ (|j₁−j₂|+1) ⊕ ... ⊕ (j₁+j₂). The `SectorGemmTask` generation loop in §5.3.1 must be generalized to produce a `Vec<SectorGemmTask>` per input pair, with each task's output block weighted by the corresponding Clebsch-Gordan coefficient. The `structural_contraction` callback handles the coefficient evaluation, but the task-generation fan-out is a structural change to the LPT scheduling phase. This refactoring is scoped to the `su2-symmetry` feature flag and does not affect the Abelian code path.
 
 **Output-sector collision hazard:** Because multiple input pairs (j_a, j_b) can map to the *same* output sector j_c, a naive `Vec<SectorGemmTask>` fed to `par_iter` creates a data race: two threads writing to the same output block. The SU(2) task generation must use a map-reduce pattern — group tasks by output sector key, then accumulate (reduce) partial contributions within each group before writing the final block. This is a structural change to the LPT scheduling phase that does not affect the Abelian code path, where fusion is always one-to-one.
@@ -723,20 +854,27 @@ pub trait LinAlgBackend<T: Scalar>: Send + Sync {
         beta: T, c: &mut MatMut<T>,
     );
 
-    fn eigh_lowest(&self, mat: &MatRef<T>, k: usize) -> (Vec<T::Real>, DenseTensor<T>);
-    fn qr(&self, mat: &MatRef<T>) -> (DenseTensor<T>, DenseTensor<T>);
+    /// Post-implementation note: Return types are DenseTensor<'static, T>
+    /// (always owned). SVD/eigh/QR results are freshly allocated.
+    fn eigh_lowest(&self, mat: &MatRef<T>, k: usize) -> (Vec<T::Real>, DenseTensor<'static, T>);
+    fn qr(&self, mat: &MatRef<T>) -> (DenseTensor<'static, T>, DenseTensor<'static, T>);
 
     /// Tikhonov-regularized pseudo-inverse for TDVP gauge restoration.
     /// Computes s_i / (s_i² + δ²) instead of 1/s_i, preventing NaN
     /// explosion when singular values approach machine zero.
     /// See §8.1 for usage context.
+    ///
+    /// Post-implementation note: `where Self: Sized` is required because
+    /// this method has a default implementation, which breaks object safety
+    /// for this method only. Callers using `dyn LinAlgBackend<T>` cannot
+    /// call this method through the trait object.
     fn regularized_svd_inverse(
         &self,
         s_values: &[T::Real],
-        u: &DenseTensor<T>,
-        vt: &DenseTensor<T>,
+        u: &DenseTensor<'static, T>,
+        vt: &DenseTensor<'static, T>,
         cutoff: T::Real,  // δ: the Tikhonov parameter
-    ) -> DenseTensor<T> {
+    ) -> DenseTensor<'static, T> where Self: Sized {
         let mut inv_s = Vec::with_capacity(s_values.len());
         let delta_sq = cutoff * cutoff;
         for &s in s_values {
@@ -763,6 +901,10 @@ pub trait SparseLinAlgBackend<T: Scalar, Q: BitPackable>: LinAlgBackend<T> {
 ```
 
 **SVD algorithm selection rationale:** The divide-and-conquer algorithm (`gesdd`) is substantially faster than QR-iteration (`gesvd`) for the moderately sized dense matrices arising from DMRG two-site updates (typically 2D² × 2D², where D is bond dimension 100–2000). The trade-off is higher workspace memory (O(n²) vs O(n)), which is acceptable given the arena allocation strategy. Convergence failure with `gesdd` is rare but can occur with highly degenerate singular values; the automatic fallback to `gesvd` handles this gracefully.
+
+**Post-implementation notes (faer backend):**
+- **SVD ordering correctness trap:** faer's `thin_svd()` returns singular values in *ascending* order (smallest first). DMRG truncation requires descending order (largest first) to correctly discard small singular values. The `svd_truncated` wrapper must re-sort the singular values and permute the corresponding U/V columns into descending order. Failing to do so silently keeps the *wrong* singular values, producing subtly incorrect physics.
+- **`gesdd`→`gesvd` fallback is a no-op with faer:** The fallback mechanism is only meaningful when using MKL or OpenBLAS FFI backends, where `gesdd` and `gesvd` are distinct LAPACK routines. The pure-Rust faer crate uses a single SVD algorithm; the fallback path simply re-invokes the same code.
 
 **Silent inaccuracy guard:** `gesdd` can occasionally return without signaling an error while producing inaccurate small singular values for pathologically ill-conditioned matrices. The architecture employs two layers of validation:
 
@@ -926,8 +1068,10 @@ impl DeviceMKL {
 ```rust
 pub struct DeviceAPI<D, S> { dense: D, sparse: S }
 
+/// Post-implementation note: Interim Phase 1-3 default uses DeviceFaer
+/// for both dense and sparse backends (DeviceOxiblas integration deferred).
 #[cfg(all(feature = "backend-faer", feature = "backend-oxiblas"))]
-pub type DefaultDevice = DeviceAPI<DeviceFaer, DeviceOxiblas>;
+pub type DefaultDevice = DeviceAPI<DeviceFaer, DeviceFaer>;
 
 /// DefaultDevice delegates LinAlgBackend<T> to its dense component.
 impl<T: Scalar> LinAlgBackend<T> for DefaultDevice
@@ -935,6 +1079,8 @@ where DeviceFaer: LinAlgBackend<T> { /* delegate to self.dense */ }
 ```
 
 ### 5.3 Hybrid Parallelism & Heterogeneous Dispatch
+
+**Post-implementation note (Phase 1–3 status):** The full partitioned LPT scheduler described below is the target architecture. The draft implementation uses a simpler binary heuristic (threshold-based switch between single-threaded Rayon dispatch and multithreaded BLAS) which is adequate for Phase 1–3 workloads. The partitioned scheduler will be implemented as part of the Phase 4 performance optimization pass.
 
 Mixing Rayon's work-stealing scheduler with multithreaded BLAS backends creates severe resource contention if not carefully orchestrated. Rather than using a rigid binary switch based on overall tensor topology, the architecture partitions the Longest Processing Time (LPT) queue dynamically.
 
@@ -1096,6 +1242,7 @@ where DeviceFaer: LinAlgBackend<T>
 
         BlockSparseTensor {
             indices: compute_output_indices(&a.indices, &b.indices),
+            leg_directions: compute_output_leg_directions(&a.leg_directions, &b.leg_directions),
             sector_keys: out_keys,
             sector_blocks: out_blocks,
             flux: a.flux.fuse(&b.flux),
@@ -1132,6 +1279,8 @@ pub type DefaultEngine = DMRGEngine<f64, U1, DeviceFaer>;
 ---
 
 ## 6. Contraction Engine (tk-contract)
+
+**Post-implementation note (lifetime friction):** The `DenseTensor<'a, T>` lifetime parameter makes executor generics painful. When the executor holds tensors with different lifetimes (input borrows vs intermediate owned results), Rust's type system cannot unify them without explicit lifetime bounds. The current workaround uses `unsafe` transmute to unify lifetimes in controlled contexts where the executor guarantees the borrow validity. This is a known ergonomic cost of the CoW design and may motivate a future refactor to separate borrowed-view types from owned-tensor types.
 
 The contraction engine separates: (1) finding the optimal contraction sequence (NP-hard), and (2) executing each pairwise contraction.
 
@@ -1253,6 +1402,8 @@ pub fn contract<T: Scalar>(a: &IndexedTensor<T>, b: &IndexedTensor<T>) -> Indexe
 ```
 
 ### 7.2 The `hamiltonian!{}` Macro: Scope, Hygiene, and Diagnostics
+
+**Post-implementation note:** The `hamiltonian!{}` proc-macro is deferred and not yet implemented. The `OpSum` builder pattern (§7.3) with operator overloading provides adequate ergonomics for Phase 1–3. The macro design below remains the target specification.
 
 The `hamiltonian!{}` proc-macro performs *exclusively* compile-time syntax-tree transformation. It parses a lattice/Hamiltonian DSL and emits Rust code that constructs an `OpSum` at runtime. No numerical computation — no SVD, no FSA minimization, no matrix construction — occurs at compile time. Because physics parameters (J, U, V_k) are evaluated dynamically at runtime, the macro must safely interact with the user's surrounding lexical scope.
 
@@ -1408,13 +1559,20 @@ PyO3's `#[pyclass]` cannot be applied to generic structs. The tk-python crate br
 ```rust
 enum DmftLoopVariant {
     RealU1(DMFTLoop<f64, U1, DefaultDevice>),
-    ComplexU1(DMFTLoop<Complex64, U1, DefaultDevice>),
+    // Post-implementation note: ComplexU1 variant is currently blocked
+    // because DeviceFaer does not yet implement LinAlgBackend<Complex<f64>>.
+    // Uncomment when complex backend support is added.
+    // ComplexU1(DMFTLoop<Complex64, U1, DefaultDevice>),
     RealZ2(DMFTLoop<f64, Z2, DefaultDevice>),
 }
 
 #[pyclass(name = "DMFTLoop")]
 pub struct PyDmftLoop { inner: DmftLoopVariant }
 ```
+
+**Post-implementation notes (Python bindings):**
+- **`extension-module` vs test linking conflict:** PyO3's `extension-module` feature (required for building `.so`/`.dylib` shared libraries) conflicts with test linking — `cargo test` cannot link against a cdylib. The workaround is a `pyo3-extension-module` feature flag that is only activated during `maturin build`, not during `cargo test`.
+- **Config mirror pattern:** `DMRGConfig` contains `Box<dyn IterativeEigensolver>`, which prevents `Clone`. Python bindings cannot pass Rust config structs directly. Instead, `PyDmftConfig` mirrors the config fields as plain Python-compatible types, and constructs the Rust `DMRGConfig` internally when `solve()` is called.
 
 **GIL release:** A `DMFTLoop::solve()` call can run for hours. Holding the Python GIL for the entire duration freezes the Jupyter kernel, prevents `Ctrl+C` handling, and starves OS-level context switching. All compute-heavy methods release the GIL before entering Rust numerics.
 
@@ -1793,6 +1951,18 @@ pub struct DMRGEngine<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> {
     krylov_workspace: KrylovWorkspace<T>,
 }
 
+/// Post-implementation note: DMRGConfig should be split into immutable
+/// DMRGConfig (parameters) and mutable DMRGState (convergence history,
+/// sweep counters). The Box<dyn IterativeEigensolver> field prevents
+/// Clone, which causes friction in tk-python (config mirroring needed).
+///
+/// Additionally, Davidson and Block-Davidson eigensolvers currently
+/// delegate to Lanczos internally — they are not yet independently
+/// implemented. The Lanczos solver is the only production-ready eigensolver.
+///
+/// Checkpoint functionality is non-functional: blocked by
+/// BlockSparseTensor lacking serde support. Serialization of MPS
+/// state for restart requires serde derives on all tensor types.
 pub struct DMRGConfig {
     pub max_bond_dim: usize,
     pub svd_cutoff: f64,
@@ -1857,6 +2027,8 @@ where T: Scalar, Q: BitPackable, B: LinAlgBackend<T>
 ```
 
 ### 8.4 DMFT Self-Consistency Loop
+
+**Post-implementation note (double-occupancy measurement):** The `FermionOp` enum does not include an `NPairInteraction` variant. Measuring double occupancy ⟨n↑n↓⟩ requires constructing a `CustomOp` with the explicit 4×4 matrix. This is adequate for DMFT but less ergonomic than a dedicated variant.
 
 #### 8.4.1 Adaptive TDVP/Chebyshev Solver Selection
 
@@ -2076,7 +2248,15 @@ fn restore_positivity(
         .map(|&v| v.max(config.positivity_floor))
         .collect();
     let new_weight: f64 = clamped.iter().sum();
-    let scale = total_weight.max(1.0) / new_weight;
+    // Post-implementation note: Only rescale when both total_weight and
+    // new_weight are positive. Edge case: if the original spectrum is
+    // entirely negative (pathological deconvolution failure), rescaling
+    // with a negative scale factor would flip signs and create nonsense.
+    let scale = if total_weight > 0.0 && new_weight > 0.0 {
+        total_weight / new_weight
+    } else {
+        1.0
+    };
     for v in &mut clamped { *v *= scale; }
 
     // Fermi-level distortion diagnostic: the global L₁ rescaling uniformly
@@ -2365,9 +2545,10 @@ This is deferred to the multi-GPU (NCCL) extension behind the `backend-cuda` fea
 | **smallvec** | tk-core | Stack-allocated small vectors for shapes/strides |
 | **rayon** | tk-linalg, tk-contract | Data-parallel iterators (with partitioned LPT scheduling) |
 | **num / num-complex** | tk-core | Complex<f64>, numeric traits |
+| **dashmap** | tk-symmetry (optional, su2-symmetry) | Thread-safe concurrent hash map for CG coefficient cache |
 | **omeco** | tk-contract | Greedy + TreeSA contraction path optimization |
 | **cotengrust** | tk-contract | DP-based path optimization |
-| **lie-groups** | tk-symmetry (optional) | SU(N) CG coefficients, Casimirs |
+| ~~**lie-groups**~~ | ~~tk-symmetry (optional)~~ | ~~SU(N) CG coefficients, Casimirs~~ — **Replaced:** CG coefficients computed via hand-rolled Racah formula; no external dependency needed |
 | **pyo3** | tk-python | Python bindings for TRIQS integration |
 | **rust-numpy** | tk-python | Zero-copy NumPy array interop |
 | **spenso** | tk-contract (reference) | Structural tensor graph inspiration |
@@ -2549,8 +2730,8 @@ tool = "criterion"     # wall-clock, bare-metal only
 
 This architecture provides a rock-solid foundation for a Rust tensor network library that is modular, safe, and performant. By decoupling tensor shape from storage, abstracting linear algebra backends behind traits, separating contraction path optimization from execution, and encoding physical gauge conditions in the type system, the design eliminates entire categories of bugs at compile time while preserving the computational intensity required for state-of-the-art quantum many-body simulations.
 
-The v8.4 revision addresses three points from the thirteenth external review: (1) the `flatten()` method now accepts a `&SweepArena` parameter and packs fragmented blocks directly into pinned arena memory (when `backend-cuda` is active), preventing the NVIDIA driver's hidden pin-copy-unpin staging dance that would halve PCI-e bandwidth if flat buffers were naively allocated on the pageable heap; (2) SVD validation gains a third physics-triggered layer for TDVP — if truncation error spikes by >10× or energy variance jumps between consecutive time steps, an immediate out-of-band residual check is forced, closing the K-step blind spot that would allow corrupted gauge restorations to compound exponentially and destroy the MPS tangent space before the periodic modulo counter catches it; and (3) the `PinnedMemoryTracker` is explicitly documented as a process-local guard enforcing a statically pre-negotiated per-rank budget slice, clarifying that the `AtomicUsize` does not and cannot coordinate across MPI ranks at runtime.
+The v8.5 revision incorporates cross-cutting findings from the draft implementation of all crates (tk-core through tk-python). Key changes include: `TensorCow` eliminated in favor of a single `TensorStorage<'a, T>` enum; `DenseTensor` gains lifetime parameter and offset field for zero-copy slicing; `BlockSparseTensor` gains `leg_directions` for flux rule enforcement; `Scalar` trait expanded with `Sub`, `Neg`, `Debug`, `'static`, `from_real_imag()`, and `imaginary_unit()`; CG cache uses hand-rolled Racah formula with DashMap-based thread-safe caching; `DenseTensor` and `BlockSparseTensor` `Clone` identified as the #1 cross-cutting issue affecting four downstream crates; `DMRGConfig` needs split into immutable config and mutable state; and `ComplexU1` variant blocked pending `LinAlgBackend<Complex<f64>>` implementation. The previous v8.4 revision addressed: (1) the `flatten()` method now accepts a `&SweepArena` parameter and packs fragmented blocks directly into pinned arena memory (when `backend-cuda` is active), preventing the NVIDIA driver's hidden pin-copy-unpin staging dance that would halve PCI-e bandwidth if flat buffers were naively allocated on the pageable heap; (2) SVD validation gains a third physics-triggered layer for TDVP — if truncation error spikes by >10× or energy variance jumps between consecutive time steps, an immediate out-of-band residual check is forced, closing the K-step blind spot that would allow corrupted gauge restorations to compound exponentially and destroy the MPS tangent space before the periodic modulo counter catches it; and (3) the `PinnedMemoryTracker` is explicitly documented as a process-local guard enforcing a statically pre-negotiated per-rank budget slice, clarifying that the `AtomicUsize` does not and cannot coordinate across MPI ranks at runtime.
 
-Across thirteen revision cycles, the design has been hardened against: dimensional inconsistencies in TDVP subspace expansion, scaling violations in null-space projection, symmetry-sector corruption from dense expansion SVD, bond-dimension oscillation at truncation thresholds, soft D_max decay coupling to adaptive time-stepping, flat-buffer reallocation penalty during structural mutations, flat-buffer allocation on pageable heap bypassing pinned DMA path, Rust object-safety violations in backend traits, cyclic crate dependencies, GIL deadlocks (Rayon workers, monitor thread shutdown ordering) and thread leaks in Python bindings, pinned-memory exhaustion under multi-rank MPI, MPI atomic process-isolation confusion, silent pinned-memory performance cliffs, NUMA-blind GPU allocations, Rayon long-tail starvation from binomial sector distributions, thread-pool oversubscription from binary regime switching, BLAS global thread-count race conditions, GPU kernel launch overhead on fragmented sectors, GPU heterogeneous-batch silent serialization, O(N) conjugation memory bandwidth waste, Fourier transform errors in spectral windowing, deconvolution noise amplification, negative spectral weight from deconvolution ringing, Fermi-level spectral distortion from global L₁ rescaling, static Tikhonov regularization masking physics in product-state bonds, unreliable TDVP linear prediction for metallic phases, SVD silent inaccuracy escaping into production builds, SVD corruption blind spot compounding through TDVP gauge restoration, SU(2) task generation memory blow-up, SU(2) fusion-rule multiplicity in task generation, linear prediction instability in metallic phases, eigensolver Krylov workspace heap fragmentation, environment memory scaling exceeding node RAM, memory blow-up in contraction path optimization, MPI barrier load imbalance, arena lifetime conflicts with persistent state, monomorphization-driven compile-time explosion, SVD gauge freedom in cross-backend tests, FFI linker collisions between vendor BLAS libraries, block storage heap fragmentation for GPU transfers, proc-macro variable shadowing, and cryptic DSL error diagnostics.
+Across fourteen revision cycles, the design has been hardened against: dimensional inconsistencies in TDVP subspace expansion, scaling violations in null-space projection, symmetry-sector corruption from dense expansion SVD, bond-dimension oscillation at truncation thresholds, soft D_max decay coupling to adaptive time-stepping, flat-buffer reallocation penalty during structural mutations, flat-buffer allocation on pageable heap bypassing pinned DMA path, Rust object-safety violations in backend traits, cyclic crate dependencies, GIL deadlocks (Rayon workers, monitor thread shutdown ordering) and thread leaks in Python bindings, pinned-memory exhaustion under multi-rank MPI, MPI atomic process-isolation confusion, silent pinned-memory performance cliffs, NUMA-blind GPU allocations, Rayon long-tail starvation from binomial sector distributions, thread-pool oversubscription from binary regime switching, BLAS global thread-count race conditions, GPU kernel launch overhead on fragmented sectors, GPU heterogeneous-batch silent serialization, O(N) conjugation memory bandwidth waste, Fourier transform errors in spectral windowing, deconvolution noise amplification, negative spectral weight from deconvolution ringing, Fermi-level spectral distortion from global L₁ rescaling, static Tikhonov regularization masking physics in product-state bonds, unreliable TDVP linear prediction for metallic phases, SVD silent inaccuracy escaping into production builds, SVD corruption blind spot compounding through TDVP gauge restoration, SU(2) task generation memory blow-up, SU(2) fusion-rule multiplicity in task generation, linear prediction instability in metallic phases, eigensolver Krylov workspace heap fragmentation, environment memory scaling exceeding node RAM, memory blow-up in contraction path optimization, MPI barrier load imbalance, arena lifetime conflicts with persistent state, monomorphization-driven compile-time explosion, SVD gauge freedom in cross-backend tests, FFI linker collisions between vendor BLAS libraries, block storage heap fragmentation for GPU transfers, proc-macro variable shadowing, cryptic DSL error diagnostics, TensorCow double-indirection overhead, missing DenseTensor/BlockSparseTensor Clone implementations, DenseTensor lifetime friction in contraction executor generics, and DMRGConfig non-clonability blocking Python bindings.
 
 The clear crate boundaries and feature-flag system ensure that the library can evolve incrementally—adding non-Abelian symmetries, GPU backends, and additional lattice geometries—without destabilizing the core infrastructure. The phased implementation roadmap prioritizes delivering a working DMRG solver as early as Phase 3, enabling real physics research to begin while the DMFT integration matures in parallel.
