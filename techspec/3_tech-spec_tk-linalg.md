@@ -176,7 +176,7 @@ pub trait LinAlgBackend<T: Scalar>: Send + Sync {
     /// to each input before multiplication:
     ///
     /// | `a.is_conjugated` | `b.is_conjugated` | Operation |
-    /// |:-----------------:|:-----------------:|:----------|
+    /// |:------------------|:------------------|:----------|
     /// | false             | false             | C = α·A·B + β·C |
     /// | true              | false             | C = α·conj(A)·B + β·C |
     /// | false             | true              | C = α·A·conj(B) + β·C |
@@ -264,7 +264,7 @@ pub trait LinAlgBackend<T: Scalar>: Send + Sync {
     ///
     /// **Tikhonov regularization behavior:**
     /// - When `s_i ≫ δ`: `s_i / (s_i² + δ²) ≈ 1/s_i` (accurate inverse)
-    /// - When `s_i → 0`: `s_i / (s_i² + δ²) → s_i/δ² → 0` (safe, no NaN)
+    /// - When `s_i -> 0`: `s_i / (s_i² + δ²) -> s_i/δ² -> 0` (safe, no NaN)
     ///
     /// # Parameters
     ///
@@ -549,7 +549,7 @@ struct SectorGemmTask<'a, T: Scalar> {
 /// the fusion rule is one-to-many: j₁ ⊗ j₂ = |j₁−j₂| ⊕ ... ⊕ (j₁+j₂).
 /// This function returns `Option<PackedSectorKey>` (single output) and handles
 /// only the Abelian case. The SU(2) path must fan out to a `Vec<SectorGemmTask>`
-/// per input pair (see §14 Open Questions).
+/// per input pair (see §19 Open Questions).
 fn compute_fusion_rule<Q: BitPackable>(
     key_a: PackedSectorKey,
     key_b: PackedSectorKey,
@@ -991,7 +991,65 @@ pub type LinAlgResult<T> = Result<T, LinAlgError>;
 
 ---
 
-## 10. Build Script: Mutual Exclusivity Enforcement
+## 10. Public API Surface (`lib.rs`)
+
+```rust
+// tk-linalg/src/lib.rs
+
+pub mod traits;
+pub mod results;
+pub mod threading;
+pub mod tasks;
+pub mod device;
+pub mod error;
+
+// Flat re-exports:
+pub use traits::{LinAlgBackend, SparseLinAlgBackend};
+pub use results::{SvdResult, EighResult, QrResult, SvdConvergenceError};
+pub use threading::ThreadingRegime;
+pub use error::{LinAlgError, LinAlgResult};
+
+// Device re-exports (conditional on feature flags):
+#[cfg(feature = "backend-faer")]
+pub use device::faer::DeviceFaer;
+
+#[cfg(feature = "backend-oxiblas")]
+pub use device::oxiblas::DeviceOxiblas;
+
+#[cfg(all(feature = "backend-faer", feature = "backend-oxiblas"))]
+pub use device::{DeviceAPI, DefaultDevice};
+
+#[cfg(feature = "backend-mkl")]
+pub use device::mkl::DeviceMKL;
+
+#[cfg(feature = "backend-openblas")]
+pub use device::openblas::DeviceOpenBLAS;
+
+#[cfg(feature = "backend-cuda")]
+pub use device::cuda::DeviceCuda;
+```
+
+---
+
+## 11. Feature Flags
+
+| Flag | Effect in `tk-linalg` |
+|:-----|:----------------------|
+| `backend-faer` | Enables `DeviceFaer`; pure-Rust SVD/GEMM/QR; default on |
+| `backend-oxiblas` | Enables `DeviceOxiblas`; sparse formats, SIMD, f128; default on |
+| `backend-mkl` | Enables `DeviceMKL`; Intel MKL FFI; mutually exclusive with `backend-openblas` |
+| `backend-openblas` | Enables `DeviceOpenBLAS`; OpenBLAS FFI; mutually exclusive with `backend-mkl` |
+| `backend-cuda` | Enables `DeviceCuda`; cuBLAS + cuSOLVER via `cudarc`; requires CUDA toolkit |
+| `parallel` | Enables Rayon for block-sparse sector dispatch in FragmentedSectors mode |
+| `su2-symmetry` | Propagates SU(2) feature flag from `tk-symmetry`; see §11.1 |
+
+### 11.1 `su2-symmetry` Feature in `tk-linalg`
+
+When `su2-symmetry` is active, `compute_fusion_rule` must be generalized. The current Abelian implementation returns `Option<PackedSectorKey>` (one-to-one). For SU(2), j₁ ⊗ j₂ produces multiple output irreps. The `SectorGemmTask` generation loop must fan out to `Vec<SectorGemmTask>` per input pair, each weighted by the corresponding Clebsch-Gordan coefficient. This is a structural change to `tasks.rs`, scoped behind the `su2-symmetry` feature flag and does not affect the Abelian code path (see §19 Open Questions).
+
+---
+
+## 12. Build-Level Concerns
 
 ```rust
 // tk-linalg/build.rs
@@ -1010,9 +1068,35 @@ fn main() {
 }
 ```
 
+### Monomorphization Budget
+
+#### 12.1 The Problem
+
+The compute stack is generic over `<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>>`. With 4 scalar types × 3 quantum-number types × 4 backend types, naive full monomorphization produces up to 48 copies of any generic function that reaches through all three parameters.
+
+#### 12.2 Mitigation Strategy
+
+`tk-linalg` applies two strategies:
+
+**1. Macro-generated scalar implementations.** Each backend struct (DeviceFaer, DeviceOxiblas, etc.) implements `LinAlgBackend<T>` for each of the four scalar types. Rather than writing 4 separate `impl` blocks with identical bodies differing only in type, a `macro_rules!` template generates all four. This does not reduce monomorphization but keeps the source manageable.
+
+**2. Feature-gated type combinations.** The `DefaultDevice` type alias compiles only when both `backend-faer` and `backend-oxiblas` are active. Users requiring only `DeviceFaer` (e.g., for debugging) use it directly. The `tk-python` crate's `DmftLoopVariant` enum explicitly enumerates only the user-facing combinations, preventing the compiler from generating all 48 variants.
+
+**3. `dyn`-eligible at sweep level.** Since `LinAlgBackend<T>` is object-safe, the sweep scheduler in `tk-dmrg` can accept `Box<dyn LinAlgBackend<f64>>` if compile times become problematic. The inner GEMM loops remain statically dispatched.
+
+**4. CI compile-time monitoring.** A CI job tracks per-crate compile times in release mode. If `tk-linalg` exceeds 60 seconds, `cargo-llvm-lines` is run to identify the largest generic expansions. The threshold for remediation action is 60 seconds single-crate compile in release.
+
+#### 12.3 Common Combination
+
+```rust
+// The combination compiled by default (the vast majority of users):
+#[cfg(all(feature = "backend-faer", not(feature = "backend-mkl")))]
+pub type DefaultEngine = DMRGEngine<f64, U1, DefaultDevice>;
+```
+
 ---
 
-## 11. Helper Functions (Internal)
+## 13. Internal Helpers
 
 These are `pub(crate)` functions in `src/traits.rs` or `src/device/mod.rs` used by backend implementations.
 
@@ -1053,37 +1137,9 @@ pub(crate) fn set_blas_num_threads(n: usize);
 
 ---
 
-## 12. Monomorphization Budget
+## 14. Dependencies and Integration
 
-### 12.1 The Problem
-
-The compute stack is generic over `<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>>`. With 4 scalar types × 3 quantum-number types × 4 backend types, naive full monomorphization produces up to 48 copies of any generic function that reaches through all three parameters.
-
-### 12.2 Mitigation Strategy
-
-`tk-linalg` applies two strategies:
-
-**1. Macro-generated scalar implementations.** Each backend struct (DeviceFaer, DeviceOxiblas, etc.) implements `LinAlgBackend<T>` for each of the four scalar types. Rather than writing 4 separate `impl` blocks with identical bodies differing only in type, a `macro_rules!` template generates all four. This does not reduce monomorphization but keeps the source manageable.
-
-**2. Feature-gated type combinations.** The `DefaultDevice` type alias compiles only when both `backend-faer` and `backend-oxiblas` are active. Users requiring only `DeviceFaer` (e.g., for debugging) use it directly. The `tk-python` crate's `DmftLoopVariant` enum explicitly enumerates only the user-facing combinations, preventing the compiler from generating all 48 variants.
-
-**3. `dyn`-eligible at sweep level.** Since `LinAlgBackend<T>` is object-safe, the sweep scheduler in `tk-dmrg` can accept `Box<dyn LinAlgBackend<f64>>` if compile times become problematic. The inner GEMM loops remain statically dispatched.
-
-**4. CI compile-time monitoring.** A CI job tracks per-crate compile times in release mode. If `tk-linalg` exceeds 60 seconds, `cargo-llvm-lines` is run to identify the largest generic expansions. The threshold for remediation action is 60 seconds single-crate compile in release.
-
-### 12.3 Common Combination
-
-```rust
-// The combination compiled by default (the vast majority of users):
-#[cfg(all(feature = "backend-faer", not(feature = "backend-mkl")))]
-pub type DefaultEngine = DMRGEngine<f64, U1, DefaultDevice>;
-```
-
----
-
-## 13. Dependencies & Integration
-
-### 13.1 Dependencies (Cargo.toml)
+### 14.1 Dependencies (Cargo.toml)
 
 ```toml
 [dependencies]
@@ -1122,31 +1178,13 @@ parallel        = ["rayon"]
 su2-symmetry    = ["tk-symmetry/su2-symmetry"]
 ```
 
-### 13.2 Downstream Consumers
+### 14.2 Downstream Consumers
 
 | Crate | Usage |
 |:------|:------|
 | `tk-contract` | `LinAlgBackend::gemm` for each pairwise contraction step; `SparseLinAlgBackend::block_gemm` for block-sparse contraction |
 | `tk-dmrg` | `LinAlgBackend::svd_truncated` for two-site SVD truncation; `regularized_svd_inverse` for TDVP gauge restoration; `SparseLinAlgBackend::spmv` for environment contraction |
 | `tk-dmft` | `LinAlgBackend::svd_truncated` for bath discretization; inherits all `tk-dmrg` usage transitively |
-
----
-
-## 14. Feature Flags (tk-linalg)
-
-| Flag | Effect |
-|:-----|:-------|
-| `backend-faer` | Enables `DeviceFaer`; pure-Rust SVD/GEMM/QR; default on |
-| `backend-oxiblas` | Enables `DeviceOxiblas`; sparse formats, SIMD, f128; default on |
-| `backend-mkl` | Enables `DeviceMKL`; Intel MKL FFI; mutually exclusive with `backend-openblas` |
-| `backend-openblas` | Enables `DeviceOpenBLAS`; OpenBLAS FFI; mutually exclusive with `backend-mkl` |
-| `backend-cuda` | Enables `DeviceCuda`; cuBLAS + cuSOLVER via `cudarc`; requires CUDA toolkit |
-| `parallel` | Enables Rayon for block-sparse sector dispatch in FragmentedSectors mode |
-| `su2-symmetry` | Propagates SU(2) feature flag from `tk-symmetry`; see §14.1 |
-
-### 14.1 `su2-symmetry` Feature in tk-linalg
-
-When `su2-symmetry` is active, `compute_fusion_rule` must be generalized. The current Abelian implementation returns `Option<PackedSectorKey>` (one-to-one). For SU(2), j₁ ⊗ j₂ produces multiple output irreps. The `SectorGemmTask` generation loop must fan out to `Vec<SectorGemmTask>` per input pair, each weighted by the corresponding Clebsch-Gordan coefficient. This is a structural change to `tasks.rs`, scoped behind the `su2-symmetry` feature flag and does not affect the Abelian code path (see §15 Open Questions).
 
 ---
 
@@ -1171,18 +1209,18 @@ When `su2-symmetry` is active, `compute_fusion_rule` must be generalized. The cu
 | `regularized_inverse_large_s` | For `s >> δ`: result ≈ true inverse `V·diag(1/s)·U†` |
 | `regularized_inverse_zero_s` | For `s = 0`: result is 0 (no NaN, no Inf) |
 | `regularized_inverse_formula` | `s/(s² + δ²)` vs analytically computed values for δ=1e-8 |
-| `threading_regime_fat` | Large max_sector_dim > 500 + few sectors → FatSectors |
-| `threading_regime_fragmented` | Small max_sector_dim or many sectors → FragmentedSectors |
+| `threading_regime_fat` | Large max_sector_dim > 500 + few sectors -> FatSectors |
+| `threading_regime_fragmented` | Small max_sector_dim or many sectors -> FragmentedSectors |
 | `lpt_sort_descending_flops` | After LPT sort, tasks[0].flops ≥ tasks[n-1].flops |
 | `block_gemm_sector_presence` | All valid output sectors present; absent sectors absent |
 | `block_gemm_sector_sorted` | Output `sector_keys` are in ascending order |
 | `block_gemm_equivalence_dense` | Block-sparse result matches manually assembled dense matrix product |
 | `block_gemm_flux` | Output tensor flux equals `a.flux.fuse(b.flux)` |
 | `spmv_correctness` | Sparse matvec matches dense reference |
-| `blas_layout_col_major_no_conjugate` | `resolve_blas_layout` for col-major, no conjugation → CblasNoTrans |
-| `blas_layout_row_major_with_conjugate` | `resolve_blas_layout` for row-major, conjugated → CblasConjTrans |
-| `blas_layout_arbitrary_stride_panics` | Non-unit strides in both dimensions → panic |
-| `build_mutual_exclusivity` | (trybuild compile-fail) enabling both `backend-mkl` and `backend-openblas` → compile_error! |
+| `blas_layout_col_major_no_conjugate` | `resolve_blas_layout` for col-major, no conjugation -> CblasNoTrans |
+| `blas_layout_row_major_with_conjugate` | `resolve_blas_layout` for row-major, conjugated -> CblasConjTrans |
+| `blas_layout_arbitrary_stride_panics` | Non-unit strides in both dimensions -> panic |
+| `build_mutual_exclusivity` | (trybuild compile-fail) enabling both `backend-mkl` and `backend-openblas` -> compile_error! |
 
 ### 15.2 Property-Based Tests
 
@@ -1211,7 +1249,7 @@ proptest! {
         delta_small in 1e-12f64..=1e-8,
         delta_large in 1e-4f64..=1.0,
     ) {
-        // Smaller delta → result closer to true inverse for s > delta
+        // Smaller delta -> result closer to true inverse for s > delta
         let inv_small = s / (s * s + delta_small * delta_small);
         let inv_large = s / (s * s + delta_large * delta_large);
         prop_assert!(inv_small >= inv_large);
@@ -1253,7 +1291,9 @@ macro_rules! assert_svd_equivalent {
 }
 ```
 
-### 15.4 Performance Invariants (Criterion + iai)
+---
+
+## 16. Performance Invariants
 
 | Operation | Invariant |
 |:----------|:----------|
@@ -1267,67 +1307,27 @@ CI uses `iai` (instruction counting) for regression gating (±2% threshold). `cr
 
 ---
 
-## 16. Implementation Notes & Design Decisions
+## 17. Implementation Notes and Design Decisions
 
-### 16.1 Why faer as Default
+### 17.1 Why faer as Default
 
 `faer` is a pure-Rust crate with state-of-the-art cache-oblivious GEMM and multithreaded SVD performance comparable to MKL on large matrices. Its native lazy conjugation support (`.conjugate()` flips one bit in the view struct) maps directly to `MatRef::is_conjugated`, eliminating the need for any conjugation-flag translation logic in `DeviceFaer`. MKL/OpenBLAS are available as optional FFI backends for users on Intel Xeon or HPC clusters where vendor-tuned BLAS libraries are available and already installed.
 
-### 16.2 Why Tikhonov Regularization Instead of Simple Cutoff
+### 17.2 Why Tikhonov Regularization Instead of Simple Cutoff
 
 A simple singular-value cutoff (discard s_i < ε, invert the rest) produces a pseudo-inverse that can still diverge: if s_i = 2ε, the inverse is 1/(2ε) which may be 10⁸ for ε = 5×10⁻⁹. This generates large tensor entries that corrupt all subsequent contractions. The Tikhonov formula `s/(s² + δ²)` has a bounded maximum value of `1/(2δ)` (achieved at s = δ), providing a hard ceiling on inverse magnitudes regardless of the input. For well-conditioned singular values (s >> δ), the Tikhonov formula approximates the true inverse to relative error O(δ²/s²).
 
-### 16.3 LPT vs Work-Stealing Alone
+### 17.3 LPT vs Work-Stealing Alone
 
 Rayon's work-stealing ensures that idle threads steal tasks from busy threads. However, if the task list is sorted in ascending FLOP order (quantum-number order, which is the natural storage order), the last few tasks in the queue are the heaviest. Threads that finish their light early tasks steal from the tail — but the stealing itself is not free, and a single massive sector at the end will still serialize the final phase of execution. Sorting in descending order (LPT) ensures the heaviest tasks are dispatched first, when all threads are free, and the tail consists only of cheap tasks. Analytical worst-case analysis shows LPT scheduling achieves at most (4/3 - 1/(3m)) × OPT makespan for m machines, a well-known bound from scheduling theory.
 
-### 16.4 SVD Residual Check in Debug Builds
+### 17.4 SVD Residual Check in Debug Builds
 
 The `debug_assert!` reconstruction check after `gesdd` catches a known failure mode: `gesdd` can return `Info = 0` (success) while producing subtly inaccurate small singular values for pathologically ill-conditioned inputs. This is distinct from non-convergence (which sets `Info ≠ 0` and triggers the `gesvd` fallback). The residual check detects the "silent inaccuracy" case. It is compiled out in `--release` (`debug_assert` is a no-op), adding zero production overhead. If the assertion fires during development or CI, it indicates the matrix passed to SVD has a numerical quality issue that should be investigated at the call site, not masked by Tikhonov regularization downstream.
 
-### 16.5 Arbitrary-Stride Matrices and BLAS
+### 17.5 Arbitrary-Stride Matrices and BLAS
 
 Standard BLAS (MKL, OpenBLAS) requires at least one unit stride per matrix (either row-major or column-major layout). Tensors that have been permuted via `DenseTensor::permute` may have non-unit strides in both dimensions. The BLAS backends panic in this case with a clear error message directing the caller to use `TensorCow::into_owned()` (which materializes a contiguous copy) before passing to BLAS. `DeviceFaer` handles arbitrary strides natively via faer's strided view constructors and is the correct backend for post-permute operations.
-
----
-
-## 17. Public API Surface (`lib.rs`)
-
-```rust
-// tk-linalg/src/lib.rs
-
-pub mod traits;
-pub mod results;
-pub mod threading;
-pub mod tasks;
-pub mod device;
-pub mod error;
-
-// Flat re-exports:
-pub use traits::{LinAlgBackend, SparseLinAlgBackend};
-pub use results::{SvdResult, EighResult, QrResult, SvdConvergenceError};
-pub use threading::ThreadingRegime;
-pub use error::{LinAlgError, LinAlgResult};
-
-// Device re-exports (conditional on feature flags):
-#[cfg(feature = "backend-faer")]
-pub use device::faer::DeviceFaer;
-
-#[cfg(feature = "backend-oxiblas")]
-pub use device::oxiblas::DeviceOxiblas;
-
-#[cfg(all(feature = "backend-faer", feature = "backend-oxiblas"))]
-pub use device::{DeviceAPI, DefaultDevice};
-
-#[cfg(feature = "backend-mkl")]
-pub use device::mkl::DeviceMKL;
-
-#[cfg(feature = "backend-openblas")]
-pub use device::openblas::DeviceOpenBLAS;
-
-#[cfg(feature = "backend-cuda")]
-pub use device::cuda::DeviceCuda;
-```
 
 ---
 
@@ -1335,13 +1335,13 @@ pub use device::cuda::DeviceCuda;
 
 The following are explicitly **not** implemented in `tk-linalg`:
 
-- Tensor contraction path optimization or DAG execution (→ `tk-contract`)
-- In-house iterative eigensolvers (Lanczos, Davidson, Block-Davidson) for the DMRG ground-state problem (→ `tk-dmrg`; these require zero-allocation matvec closures and tight `SweepArena` integration)
-- Krylov matrix-exponential for TDVP time evolution (→ `tk-dmft`)
-- MPS/MPO data structures or gauge canonicalization (→ `tk-dmrg`)
-- Any physical model logic, quantum number types, or block-sparse tensor construction (→ `tk-symmetry`)
-- DMFT self-consistency loop, bath discretization, or spectral function computation (→ `tk-dmft`)
-- Python bindings (→ `tk-python`)
+- Tensor contraction path optimization or DAG execution (-> `tk-contract`)
+- In-house iterative eigensolvers (Lanczos, Davidson, Block-Davidson) for the DMRG ground-state problem (-> `tk-dmrg`; these require zero-allocation matvec closures and tight `SweepArena` integration)
+- Krylov matrix-exponential for TDVP time evolution (-> `tk-dmft`)
+- MPS/MPO data structures or gauge canonicalization (-> `tk-dmrg`)
+- Any physical model logic, quantum number types, or block-sparse tensor construction (-> `tk-symmetry`)
+- DMFT self-consistency loop, bath discretization, or spectral function computation (-> `tk-dmft`)
+- Python bindings (-> `tk-python`)
 
 ---
 
@@ -1353,6 +1353,6 @@ The following are explicitly **not** implemented in `tk-linalg`:
 | 2 | **SU(2) output-sector collision (map-reduce):** Multiple input pairs (j_a, j_b) can map to the same output sector j_c. Naive parallel dispatch over all tasks creates a data race. The SU(2) task generation must group tasks by output sector key and accumulate partial contributions sequentially within each group before writing. The three-phase algorithm must be extended with a reduce phase between Phases 2 and 3. | Deferred to Phase 5; does not affect Abelian code path |
 | 3 | **GPU dispatch threshold calibration:** The `GPU_DISPATCH_THRESHOLD = 500` constant routing small GEMM calls to CPU is based on general cuBLAS launch overhead estimates. This should be calibrated empirically on the target hardware (consumer A100 vs data-center H100 vs older V100) using Criterion benchmarks at D = 100, 200, 500, 1000. | Deferred to Phase 5 GPU integration |
 | 4 | **Batched cuBLAS for fragmented-sector CUDA:** In FragmentedSectors mode on GPU, launching one `cublasXgemm` call per sector has high per-call overhead (~5 µs). `cublasXgemmBatched` or `cublasXgemmStridedBatched` can amortize this across all sector tasks in a single kernel launch, potentially recovering 2–10× performance for large sector counts at small D. | Deferred to Phase 5 |
-| 5 | **`eigh_lowest` for large matrices:** The current spec routes all dense EVD to `LinAlgBackend::eigh_lowest`. For the DMRG ground-state problem, the matrix is far too large to diagonalize densely (typically 2D² × 2D² with D=1000). The spec correctly documents that `eigh_lowest` is for small auxiliary matrices only. But the interface could be confusing. Should `eigh_lowest` carry a dimension limit (panic if n > threshold) to prevent misuse? | Decision needed before implementation |
-| 6 | **`f128` GEMM path in DeviceOxiblas:** The architecture doc notes that `f128` SVD might need to route through `DeviceOxiblas` exclusively. Clarification needed: does `faer` provide an `f128` GEMM path via its generic arithmetic? Or is `f128` restricted to oxiblas for all operations? | Needs investigation against faer 0.19 changelog |
-| 7 | **BLAS thread-count API for MKL/OpenBLAS:** `set_blas_num_threads` must call `MKL_Set_Num_Threads` or `openblas_set_num_threads` respectively. These are global state mutations that are unsafe in the presence of concurrent BLAS calls from other threads. The threading regime must guarantee that `set_blas_num_threads` is only called when no BLAS operations are in flight. Document and enforce this invariant. | Design clarification needed |
+| 5 | **`eigh_lowest` for large matrices:** The current spec routes all dense EVD to `LinAlgBackend::eigh_lowest`. For the DMRG ground-state problem, the matrix is far too large to diagonalize densely (typically 2D² × 2D² with D=1000). The spec correctly documents that `eigh_lowest` is for small auxiliary matrices only. But the interface could be confusing. Should `eigh_lowest` carry a dimension limit (panic if n > threshold) to prevent misuse? | Open — decision needed before implementation |
+| 6 | **`f128` GEMM path in DeviceOxiblas:** The architecture doc notes that `f128` SVD might need to route through `DeviceOxiblas` exclusively. Clarification needed: does `faer` provide an `f128` GEMM path via its generic arithmetic? Or is `f128` restricted to oxiblas for all operations? | Open — needs investigation against faer 0.19 changelog |
+| 7 | **BLAS thread-count API for MKL/OpenBLAS:** `set_blas_num_threads` must call `MKL_Set_Num_Threads` or `openblas_set_num_threads` respectively. These are global state mutations that are unsafe in the presence of concurrent BLAS calls from other threads. The threading regime must guarantee that `set_blas_num_threads` is only called when no BLAS operations are in flight. Document and enforce this invariant. | Open — design clarification needed |

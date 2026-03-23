@@ -409,7 +409,7 @@ impl<'a, T: Scalar> MatRef<'a, T> {
 Every `LinAlgBackend::gemm` implementation in `tk-linalg` **must** correctly handle all four combinations of `is_conjugated` on the two input `MatRef`s:
 
 | `a.is_conjugated` | `b.is_conjugated` | Operation |
-|:-----------------:|:-----------------:|:----------|
+|:------------------|:------------------|:----------|
 | false | false | C = α·A·B + β·C |
 | true | false | C = α·A*·B + β·C |
 | false | true | C = α·A·B* + β·C |
@@ -698,7 +698,7 @@ log::warn!(
 
 ---
 
-## 10. Error Types
+## 10. Error Handling
 
 ```rust
 /// Top-level error type for tk-core and, by re-export, the entire workspace.
@@ -725,6 +725,24 @@ pub enum TkError {
 
 pub type TkResult<T> = Result<T, TkError>;
 ```
+
+### 10.1 Error Propagation Strategy
+
+`TkError` is the root error type for the entire tensorkraft workspace. It is defined in `tk-core` and re-exported by all downstream crates via `pub use tk_core::{TkError, TkResult}`. Downstream crates that define their own error enums wrap `TkError` using `#[from]` conversions:
+
+```rust
+// Example: in a downstream crate such as tk-linalg
+#[derive(Debug, thiserror::Error)]
+pub enum LinAlgError {
+    #[error(transparent)]
+    Core(#[from] TkError),
+
+    #[error("...")]
+    SomeOtherVariant,
+}
+```
+
+This ensures that any `TkError` produced within `tk-core` can be propagated through downstream crate boundaries using the `?` operator without manual conversion.
 
 ---
 
@@ -759,7 +777,7 @@ pub use pinned::PinnedMemoryTracker;
 
 ---
 
-## 12. Feature Flags (tk-core–relevant)
+## 12. Feature Flags
 
 | Flag | Effect in tk-core |
 |:-----|:------------------|
@@ -770,9 +788,56 @@ pub use pinned::PinnedMemoryTracker;
 
 ---
 
-## 13. Testing Requirements
+## 13. Dependencies and Integration
 
-### 13.1 Unit Tests (within `tk-core`)
+### 13.1 `Cargo.toml` Sketch
+
+```toml
+[package]
+name = "tk-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smallvec = "1"
+bumpalo = "3"
+num-complex = "0.4"
+num-traits = "0.2"
+thiserror = "1"
+cfg-if = "1"
+log = "0.4"
+
+[dev-dependencies]
+proptest = "1"
+trybuild = "1"
+
+[features]
+default = []
+backend-cuda = []
+backend-oxiblas = []
+```
+
+### 13.2 Upstream Dependencies
+
+None. `tk-core` is a leaf crate with no workspace dependencies.
+
+### 13.3 Downstream Consumers
+
+The following workspace crates depend on `tk-core`:
+
+- `tk-symmetry`
+- `tk-linalg`
+- `tk-contract`
+- `tk-dsl`
+- `tk-dmrg`
+- `tk-dmft`
+- `tk-python`
+
+---
+
+## 14. Testing Strategy
+
+### 14.1 Unit Tests (within `tk-core`)
 
 | Test | Description |
 |:-----|:------------|
@@ -794,7 +859,7 @@ pub use pinned::PinnedMemoryTracker;
 | `scalar_is_real_f64` | `f64::is_real()` returns true |
 | `scalar_is_real_c64` | `C64::is_real()` returns false |
 
-### 13.2 Property-Based Tests
+### 14.2 Property-Based Tests
 
 Use `proptest` with **bounded strategies** (never unbounded random ranks/sizes — they inflate CI runtime):
 
@@ -821,7 +886,7 @@ proptest! {
 }
 ```
 
-### 13.3 Compile-Fail Tests
+### 14.3 Compile-Fail Tests
 
 Use the `trybuild` crate to verify borrow-checker enforcement:
 
@@ -837,7 +902,7 @@ fn escape_temp_tensor() {
 
 ---
 
-## 14. Performance Invariants
+## 15. Performance Invariants
 
 The following must be validated by CI benchmarks (Criterion, instruction-counting mode):
 
@@ -851,73 +916,61 @@ The following must be validated by CI benchmarks (Criterion, instruction-countin
 
 ---
 
-## 15. Forward Compatibility: `StorageDevice` Trait (Phase 5)
-
-The architecture document §10.1 introduces a `StorageDevice` trait that generalizes `TensorStorage` to support GPU and MPI device memory:
-
-```rust
-pub trait StorageDevice: Send + Sync + 'static {
-    type Alloc: Allocator;
-    fn alloc<T: Scalar>(len: usize) -> DeviceBuffer<T, Self>;
-    fn synchronize(&self);
-}
-
-pub struct HostDevice;
-
-#[cfg(feature = "backend-cuda")]
-pub struct CudaDevice { pub ordinal: usize }
-
-#[cfg(feature = "backend-mpi")]
-pub struct MpiDevice { pub comm: MpiComm, pub rank: usize }
-
-/// Default type parameter preserves backward compatibility.
-pub struct TensorStorage<T: Scalar, D: StorageDevice = HostDevice> {
-    data: DeviceBuffer<T, D>,
-    device: D,
-}
-```
-
-This generalization is **deferred to Phase 5** (CUDA/MPI integration). In Phases 1–3, `TensorStorage<'a, T>` remains the `Owned(Vec<T>)` / `Borrowed(&'a [T])` enum defined in §5. The default type parameter `D = HostDevice` ensures backward compatibility — existing code using `TensorStorage<f64>` continues to work unchanged when the trait is introduced.
-
-**Impact on `tk-core`:** The `StorageDevice` trait, `HostDevice`, and the parameterized `TensorStorage` will be added to `tk-core` when Phase 5 begins. `CudaDevice` and `MpiDevice` implementations live in their respective backend crates, not in `tk-core`.
-
----
-
-## 16. Cross-Crate Arena Usage: `flatten()` (Phase 4)
-
-The `SweepArena` is used not only for `alloc_tensor` within DMRG sweep steps, but also by `tk-symmetry`'s `BlockSparseTensor::flatten()` method (architecture document §4.2). The `flatten()` method accepts a `&SweepArena` parameter and packs fragmented block data into a single contiguous buffer allocated from the arena:
-
-```rust
-// In tk-symmetry (not tk-core), but depends on SweepArena from tk-core:
-impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
-    pub fn flatten<'a>(&self, arena: &'a SweepArena) -> FlatBlockStorage<'a, T>;
-}
-```
-
-When `backend-cuda` is active, the arena's pinned memory ensures that the flat buffer is DMA-capable for GPU transfers without the NVIDIA driver's hidden pin-copy-unpin staging dance. This is critical for PCI-e bandwidth — allocating the flat buffer from the pageable heap would halve effective transfer bandwidth.
-
-This cross-crate usage pattern does not change `SweepArena`'s API but motivates the `alloc_slice_uninit` method and confirms that the arena must support arbitrary-size allocations beyond just `TensorShape`-sized tensors.
-
----
-
-## 17. Out of Scope
+## 16. Out of Scope
 
 The following are explicitly **not** implemented in `tk-core`:
 
-- Tensor addition, subtraction, or element-wise operations (→ `tk-linalg`)
-- Tensor contraction or trace (→ `tk-contract`)
-- Block-sparse formats or quantum numbers (→ `tk-symmetry`)
-- BLAS/SVD/EVD dispatch (→ `tk-linalg`)
-- Index types or operator enums (→ `tk-dsl`)
-- Any `unsafe` block that is not strictly required for arena bump-allocation or pinned memory
+- Tensor addition, subtraction, or element-wise operations (-> `tk-linalg`)
+- Tensor contraction or trace (-> `tk-contract`)
+- Block-sparse formats or quantum numbers (-> `tk-symmetry`)
+- BLAS/SVD/EVD dispatch (-> `tk-linalg`)
+- Index types or operator enums (-> `tk-dsl`)
+- `unsafe` blocks beyond those strictly required for arena bump-allocation or pinned memory (-> self-imposed constraint; all `unsafe` usage is reviewed and minimized within `tk-core`)
 
 ---
 
-## 18. Open Questions
+## 17. Open Questions
 
 | # | Question | Status |
 |:--|:---------|:-------|
-| 1 | Should `TensorShape` support rank-0 (scalar) tensors? | Deferred; current code panics if `dims` is empty |
-| 2 | `f128` support via `backend-oxiblas`: does faer provide an `f128` GEMM path, or must it go through DeviceOxiblas exclusively? | Needs investigation before implementing `Scalar for f128` |
-| 3 | Arena capacity growth policy: fixed `with_capacity`, or auto-doubling? `bumpalo::Bump` doubles internally; document expected initial size for a DMRG step at D=2000 | To be benchmarked in Phase 2 |
-| 4 | NUMA-aware pinned allocation (`PinnedArena` binding to PCIe root NUMA node) | Deferred to Phase 5+ per architecture doc §10.2.6 |
+| 1 | Should `TensorShape` support rank-0 (scalar) tensors? | Deferred — current code panics if `dims` is empty |
+| 2 | `f128` support via `backend-oxiblas`: does faer provide an `f128` GEMM path, or must it go through DeviceOxiblas exclusively? | Open — needs investigation before implementing `Scalar for f128` |
+| 3 | Arena capacity growth policy: fixed `with_capacity`, or auto-doubling? `bumpalo::Bump` doubles internally; document expected initial size for a DMRG step at D=2000 | Deferred — to be benchmarked in Phase 2 |
+| 4 | NUMA-aware pinned allocation (`PinnedArena` binding to PCIe root NUMA node) | Deferred — deferred to Phase 5+ per architecture doc §10.2.6 |
+
+---
+
+## 18. Future Considerations
+
+- **`StorageDevice` trait (Phase 5):** The architecture document §10.1 introduces a `StorageDevice` trait that generalizes `TensorStorage` to support GPU and MPI device memory. A `StorageDevice` trait with associated `Allocator` type would define `HostDevice`, `CudaDevice`, and `MpiDevice` implementations. `TensorStorage` would gain a default type parameter `D: StorageDevice = HostDevice` for backward compatibility. In Phases 1–3, `TensorStorage<'a, T>` remains the `Owned(Vec<T>)` / `Borrowed(&'a [T])` enum defined in §5. The `StorageDevice` trait and `HostDevice` would be added to `tk-core`; `CudaDevice` and `MpiDevice` implementations would live in their respective backend crates.
+
+    ```rust
+    pub trait StorageDevice: Send + Sync + 'static {
+        type Alloc: Allocator;
+        fn alloc<T: Scalar>(len: usize) -> DeviceBuffer<T, Self>;
+        fn synchronize(&self);
+    }
+
+    pub struct HostDevice;
+
+    #[cfg(feature = "backend-cuda")]
+    pub struct CudaDevice { pub ordinal: usize }
+
+    #[cfg(feature = "backend-mpi")]
+    pub struct MpiDevice { pub comm: MpiComm, pub rank: usize }
+
+    /// Default type parameter preserves backward compatibility.
+    pub struct TensorStorage<T: Scalar, D: StorageDevice = HostDevice> {
+        data: DeviceBuffer<T, D>,
+        device: D,
+    }
+    ```
+
+- **Cross-crate arena usage via `flatten()` (Phase 4):** `SweepArena` is used not only for `alloc_tensor` within DMRG sweep steps, but also by `tk-symmetry`'s `BlockSparseTensor::flatten()` method (architecture document §4.2). The `flatten()` method accepts a `&SweepArena` parameter and packs fragmented block data into a single contiguous buffer allocated from the arena. When `backend-cuda` is active, the arena's pinned memory ensures that the flat buffer is DMA-capable for GPU transfers without the NVIDIA driver's hidden pin-copy-unpin staging dance. This cross-crate usage pattern does not change `SweepArena`'s API but motivates the `alloc_slice_uninit` method and confirms that the arena must support arbitrary-size allocations beyond just `TensorShape`-sized tensors.
+
+    ```rust
+    // In tk-symmetry (not tk-core), but depends on SweepArena from tk-core:
+    impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
+        pub fn flatten<'a>(&self, arena: &'a SweepArena) -> FlatBlockStorage<'a, T>;
+    }
+    ```

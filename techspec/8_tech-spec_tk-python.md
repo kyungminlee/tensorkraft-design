@@ -465,7 +465,7 @@ impl PySpectralFunction {
         // The clone is O(n_omega) words. This is acceptable because:
         //   1. n_omega is typically 2000–10000 (16–80 KB).
         //   2. Getter calls occur only during post-processing, not in hot loops.
-        // See §9.3 for the trade-off analysis against pinned-view alternatives.
+        // See §12.3 for the trade-off analysis against pinned-view alternatives.
         self.inner.omega.clone().into_pyarray(py)
     }
 
@@ -950,9 +950,85 @@ impl PyDmftStats {
 
 ---
 
-## 6. Error Handling
+## 6. TRIQS Integration
 
-### 6.1 Python Exception Hierarchy
+### 6.1 Feature Gate
+
+TRIQS interop is controlled by the `triqs` Cargo feature flag. It is NOT compiled by default and must NOT appear in PyPI wheels.
+
+```toml
+[features]
+triqs = []   # no additional Rust crate dependencies; uses runtime Python object inspection
+```
+
+When `triqs` is active, the following capabilities are added:
+- `PyBathParameters::update_from_triqs_delta(delta_gf, broadening)` — extract (ε_k, V_k) from a TRIQS `GfImFreq`.
+- `PySpectralFunction::to_triqs_gf_re_freq(mesh_size)` — export A(ω) as a TRIQS `GfReFreq`.
+- `PyDmftLoop` is otherwise unchanged; TRIQS integration occurs at the bath parameter level.
+
+### 6.2 Zero-Copy TRIQS/NumPy Interop
+
+TRIQS Green's function objects expose their data as NumPy arrays via `GfImFreq.data` (C-contiguous `complex128`, shape `(n_freq, n_orb, n_orb)`). The interop layer extracts this array as a `PyReadonlyArray3<Complex<f64>>` — a zero-copy view:
+
+```rust
+/// Extract the imaginary-frequency hybridization function from a TRIQS GfImFreq.
+///
+/// # Protocol (zero-copy)
+/// 1. Verify `delta_gf.__class__.__name__ == "GfImFreq"` via `getattr`.
+/// 2. Extract `delta_gf.mesh.beta` (f64) for inverse temperature.
+/// 3. Extract `delta_gf.data` as `PyReadonlyArray3<Complex<f64>>` (zero-copy view).
+///    For single-orbital, `data[:, 0, 0]` gives Δ(iω_n) as a 1D view.
+/// 4. Extract Matsubara frequencies `[m.value for m in delta_gf.mesh]` (f64 list).
+/// 5. Return `(iω_n_vec, delta_values)` for bath discretization.
+///
+/// No element-wise copy of the `data` array occurs.
+///
+/// # Errors
+/// Returns `PyErr` (TypeError) if `delta_gf` is not a `GfImFreq`.
+/// Returns `PyErr` (ImportError) if TRIQS attributes are missing.
+#[cfg(feature = "triqs")]
+pub(crate) fn extract_gf_imfreq(
+    py: Python<'_>,
+    delta_gf: &PyAny,
+) -> PyResult<(Vec<f64>, Vec<Complex<f64>>)>;
+```
+
+---
+
+## 7. Monomorphization Control (Architecture §5.4)
+
+`tk-python` is the sole crate in the workspace that determines which concrete `<T, Q, B>` combinations are compiled into the binary. The `DmftLoopVariant` enum enumerates exactly three:
+
+| Variant | T | Q | B | Compiled |
+|:--------|:---|:---|:---|:---------|
+| `RealU1` | `f64` | `U1` | `DefaultDevice` | Always |
+| `ComplexU1` | `Complex<f64>` | `U1` | `DefaultDevice` | Always |
+| `RealZ2` | `f64` | `Z2` | `DefaultDevice` | Always |
+
+All three variants are compiled regardless of feature flags, because Python users cannot opt out of type combinations at build time. `DefaultDevice` is a single concrete type (resolved at compile time by the active backend flag), so each variant generates exactly one machine-code path. For the PyPI wheel (`backend-faer` default), the binary contains three copies of the DMFT stack — not the theoretical maximum of 36 (3 scalars × 3 symmetries × 4 backends).
+
+**Adding a new combination:**
+1. Add one enum variant to `DmftLoopVariant`.
+2. Add one match arm to `dispatch_variant!{}`.
+3. Add one `#[staticmethod]` constructor to `PyDmftLoop`.
+
+No changes to `tk-dmrg`, `tk-dmft`, or any other upstream crate are needed.
+
+**Compile-time monitoring:** If any single `tk-python` compile step exceeds 60 seconds in release mode (architecture §5.4), `cargo-llvm-lines` is used to identify the largest generic expansions for targeted mitigation.
+
+---
+
+## 8. Error Handling
+
+### 8.1 Error Enum
+
+`tk-python` does not define its own Rust error enum. All domain errors originate as `DmftError` from `tk-dmft` (which transitively wraps `DmrgError` from `tk-dmrg`). The `PythonError` newtype in `error.rs` serves as the single conversion bridge from `DmftError` to PyO3's `PyErr`.
+
+### 8.2 Result Type Alias
+
+`tk-python` does not define a crate-level `Result` type alias. All fallible `#[pymethods]` return PyO3's `PyResult<T>` (i.e., `Result<T, PyErr>`) directly. The conversion from `DmftError` to `PyErr` is performed via `PythonError` at each call site.
+
+### 8.3 Python Exception Hierarchy
 
 ```
 tensorkraft.TensorkraftError  (base; subclass of Exception)
@@ -971,7 +1047,7 @@ tensorkraft.TensorkraftError  (base; subclass of Exception)
 KeyboardInterrupt                        ← DmftError::Cancelled  (call-site conversion)
 ```
 
-### 6.2 `PythonError` Conversion Type
+### 8.4 `PythonError` Conversion Type
 
 ```rust
 /// Conversion bridge from `DmftError` to `PyErr`.
@@ -1044,54 +1120,20 @@ impl From<PythonError> for PyErr {
 }
 ```
 
----
+### 8.5 Error Propagation Strategy
 
-## 7. TRIQS Integration
+All errors in `tk-python` originate from the upstream `tk-dmft` crate as `DmftError` variants. The propagation path is:
 
-### 7.1 Feature Gate
+1. **Rust → `PythonError`**: Each `#[pymethods]` function calls into `tk-dmft` and receives a `Result<T, DmftError>`. On `Err`, the `DmftError` is converted to `PythonError` via `From<DmftError>`.
+2. **`PythonError` → `PyErr`**: The `From<PythonError> for PyErr` implementation maps each `DmftError` variant to the appropriate Python exception class in the `tensorkraft.*` hierarchy.
+3. **Special case — `DmftError::Cancelled`**: This variant is intercepted at the call site (in `solve()`) and converted directly to `KeyboardInterrupt`. It must never reach `PythonError`.
+4. **Configuration validation errors**: `PyDmftConfig::new()` and `#[setter]` methods perform range checks and return `ConfigError` directly as `PyErr`, without going through `PythonError`.
 
-TRIQS interop is controlled by the `triqs` Cargo feature flag. It is NOT compiled by default and must NOT appear in PyPI wheels.
-
-```toml
-[features]
-triqs = []   # no additional Rust crate dependencies; uses runtime Python object inspection
-```
-
-When `triqs` is active, the following capabilities are added:
-- `PyBathParameters::update_from_triqs_delta(delta_gf, broadening)` — extract (ε_k, V_k) from a TRIQS `GfImFreq`.
-- `PySpectralFunction::to_triqs_gf_re_freq(mesh_size)` — export A(ω) as a TRIQS `GfReFreq`.
-- `PyDmftLoop` is otherwise unchanged; TRIQS integration occurs at the bath parameter level.
-
-### 7.2 Zero-Copy TRIQS/NumPy Interop
-
-TRIQS Green's function objects expose their data as NumPy arrays via `GfImFreq.data` (C-contiguous `complex128`, shape `(n_freq, n_orb, n_orb)`). The interop layer extracts this array as a `PyReadonlyArray3<Complex<f64>>` — a zero-copy view:
-
-```rust
-/// Extract the imaginary-frequency hybridization function from a TRIQS GfImFreq.
-///
-/// # Protocol (zero-copy)
-/// 1. Verify `delta_gf.__class__.__name__ == "GfImFreq"` via `getattr`.
-/// 2. Extract `delta_gf.mesh.beta` (f64) for inverse temperature.
-/// 3. Extract `delta_gf.data` as `PyReadonlyArray3<Complex<f64>>` (zero-copy view).
-///    For single-orbital, `data[:, 0, 0]` gives Δ(iω_n) as a 1D view.
-/// 4. Extract Matsubara frequencies `[m.value for m in delta_gf.mesh]` (f64 list).
-/// 5. Return `(iω_n_vec, delta_values)` for bath discretization.
-///
-/// No element-wise copy of the `data` array occurs.
-///
-/// # Errors
-/// Returns `PyErr` (TypeError) if `delta_gf` is not a `GfImFreq`.
-/// Returns `PyErr` (ImportError) if TRIQS attributes are missing.
-#[cfg(feature = "triqs")]
-pub(crate) fn extract_gf_imfreq(
-    py: Python<'_>,
-    delta_gf: &PyAny,
-) -> PyResult<(Vec<f64>, Vec<Complex<f64>>)>;
-```
+No `#[from]` derives are used because `PythonError` is a simple newtype wrapper, not a `thiserror`-derived enum. The conversion is explicit and centralized in `error.rs`.
 
 ---
 
-## 8. `#[pymodule]` Entry Point
+## 9. Public API Surface
 
 ```rust
 /// The top-level Python module `tensorkraft`.
@@ -1152,70 +1194,38 @@ fn tensorkraft(py: Python<'_>, m: &PyModule) -> PyResult<()> {
 }
 ```
 
----
+The `lib.rs` file contains the following module declarations and re-exports:
 
-## 9. Internal Data Representations
+```rust
+pub mod dispatch;
+pub mod dmft;
+pub mod spectral;
+pub mod bath;
+pub mod config;
+pub(crate) mod monitor;
+pub(crate) mod error;
 
-### 9.1 `DmftLoopVariant` Ownership and Thread Safety
-
-`DmftLoopVariant` is stored directly inside `PyDmftLoop` (not behind `Box` or `Arc`). PyO3's `PyCell<PyDmftLoop>` manages mutation exclusivity: `solve()` takes `&mut self`, so concurrent Python-thread access raises `PyRuntimeError("Already borrowed")` before reaching Rust. No additional `Mutex` is needed.
-
-This means a `PyDmftLoop` instance is inherently single-threaded from Python's perspective. Multiple independent DMFT loops require multiple `DMFTLoop(config)` instances — one per Python thread or `concurrent.futures` executor.
-
-### 9.2 `CancellationMonitor` Lifecycle
-
-The `CancellationMonitor` is constructed at the beginning of each `solve()` call and consumed by `shutdown()` inside `allow_threads`. It is not stored in `PyDmftLoop` between calls. A fresh monitor (new `AtomicBool`, new `mpsc::channel`, new thread) is created for each invocation. This avoids stale state from a previously interrupted run.
-
-### 9.3 NumPy Memory Ownership Model
-
-When `into_pyarray(py)` is called on a `Vec<f64>`, buffer ownership transfers to a Python `ndarray` object managed by CPython's reference counter. The `SpectralFunction` inside `PySpectralFunction` retains its own copy (via the clone in the getter), so dropping `PySpectralFunction` does not invalidate NumPy arrays previously returned to Python.
-
-**Clone-vs-view trade-off:** The clone-on-getter strategy is chosen over a pinned-view approach because:
-- Array sizes are small: `n_omega` ≤ 10,000 → ≤ 80 KB per clone.
-- Pinned-view (`PyArray1::borrow_from_array`) requires the `PySpectralFunction` to be pinned (e.g., stored in an `Arc`), complicating the ownership model.
-- Getter calls occur in post-processing, not in hot computation loops.
-
-If a future benchmark shows clone overhead is material (e.g., for n_omega = 10⁶ output grids), the implementation can adopt `Arc<SpectralFunction>` + borrowed views without changing the Python API.
+// The #[pymodule] function above is the sole public entry point.
+// All #[pyclass] types are registered via m.add_class::<T>() rather
+// than pub use re-exports, because PyO3 modules use runtime registration.
+```
 
 ---
 
-## 10. Monomorphization Control (Architecture §5.4)
+## 10. Feature Flags
 
-`tk-python` is the sole crate in the workspace that determines which concrete `<T, Q, B>` combinations are compiled into the binary. The `DmftLoopVariant` enum enumerates exactly three:
-
-| Variant | T | Q | B | Compiled |
-|:--------|:---|:---|:---|:---------|
-| `RealU1` | `f64` | `U1` | `DefaultDevice` | Always |
-| `ComplexU1` | `Complex<f64>` | `U1` | `DefaultDevice` | Always |
-| `RealZ2` | `f64` | `Z2` | `DefaultDevice` | Always |
-
-All three variants are compiled regardless of feature flags, because Python users cannot opt out of type combinations at build time. `DefaultDevice` is a single concrete type (resolved at compile time by the active backend flag), so each variant generates exactly one machine-code path. For the PyPI wheel (`backend-faer` default), the binary contains three copies of the DMFT stack — not the theoretical maximum of 36 (3 scalars × 3 symmetries × 4 backends).
-
-**Adding a new combination:**
-1. Add one enum variant to `DmftLoopVariant`.
-2. Add one match arm to `dispatch_variant!{}`.
-3. Add one `#[staticmethod]` constructor to `PyDmftLoop`.
-
-No changes to `tk-dmrg`, `tk-dmft`, or any other upstream crate are needed.
-
-**Compile-time monitoring:** If any single `tk-python` compile step exceeds 60 seconds in release mode (architecture §5.4), `cargo-llvm-lines` is used to identify the largest generic expansions for targeted mitigation.
-
----
-
-## 11. Feature Flags
-
-| Feature Flag | Effect | Default | PyPI wheel |
-|:-------------|:-------|:--------|:-----------|
-| `backend-faer` | Enables `DeviceFaer` as `DefaultDevice`; pure Rust, no system BLAS | Yes | Yes |
-| `backend-oxiblas` | Enables `DeviceOxiblas` for sparse BSR/CSR operations | Yes | Yes |
-| `backend-mkl` | Links Intel MKL; sets `DefaultDevice = DeviceMKL`. Build from source only. | No | No |
-| `backend-openblas` | Links OpenBLAS; sets `DefaultDevice = DeviceOpenBLAS`. Build from source only. | No | No |
-| `backend-cuda` | Enables `DeviceCuda` (requires CUDA toolkit). Build from source only. | No | No |
-| `backend-mpi` | Propagates MPI support from `tk-dmft`. Build from source only. | No | No |
-| `su2-symmetry` | Propagates SU(2) symmetry into underlying stack. No new Python API in Phase 4. | No | No |
-| `parallel` | Rayon parallelism (propagated from `tk-linalg` via `tk-dmft`) | Yes | Yes |
-| `triqs` | TRIQS GfImFreq/GfReFreq interop (runtime Python object inspection) | No | No |
-| `python-bindings` | Sentinel flag; activates `#[pymodule]` and `extension-module` in pyo3 | Yes | Yes |
+| Flag | Effect in `tk-python` |
+|:-----|:----------------------|
+| `backend-faer` | Enables `DeviceFaer` as `DefaultDevice`; pure Rust, no system BLAS. Enabled by default and used in PyPI wheels. |
+| `backend-oxiblas` | Enables `DeviceOxiblas` for sparse BSR/CSR operations. Enabled by default and used in PyPI wheels. |
+| `backend-mkl` | Links Intel MKL; sets `DefaultDevice = DeviceMKL`. Build from source only; not included in PyPI wheels. |
+| `backend-openblas` | Links OpenBLAS; sets `DefaultDevice = DeviceOpenBLAS`. Build from source only; not included in PyPI wheels. |
+| `backend-cuda` | Enables `DeviceCuda` (requires CUDA toolkit). Build from source only; not included in PyPI wheels. |
+| `backend-mpi` | Propagates MPI support from `tk-dmft`. Build from source only; not included in PyPI wheels. |
+| `su2-symmetry` | Propagates SU(2) symmetry into the underlying stack. No new Python API in Phase 4; not included in PyPI wheels. |
+| `parallel` | Rayon parallelism (propagated from `tk-linalg` via `tk-dmft`). Enabled by default and used in PyPI wheels. |
+| `triqs` | TRIQS `GfImFreq`/`GfReFreq` interop via runtime Python object inspection. Not included in PyPI wheels. |
+| `python-bindings` | Sentinel flag; activates `#[pymodule]` and `extension-module` in `pyo3`. Enabled by default and used in PyPI wheels. |
 
 **PyPI wheel constraint (architecture §2.3):** Pre-built wheels use `default-features = true` which resolves to `{backend-faer, backend-oxiblas, parallel, python-bindings}`. No FFI BLAS symbols are linked. Users requiring MKL, OpenBLAS, CUDA, or TRIQS must build from source:
 
@@ -1227,7 +1237,7 @@ maturin build --release --features backend-mkl,triqs
 
 ---
 
-## 12. Build-Level Concerns
+## 11. Build-Level Concerns
 
 `tk-python/build.rs` performs three checks:
 
@@ -1275,6 +1285,31 @@ strip       = true          # strip debug symbols in release wheels
 ```
 
 The `abi3-py38` tag on the `pyo3` dependency (`pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }`) ensures a single wheel file supports Python 3.8 through 3.x without recompilation.
+
+---
+
+## 12. Data Structures and Internal Representations
+
+### 12.1 `DmftLoopVariant` Ownership and Thread Safety
+
+`DmftLoopVariant` is stored directly inside `PyDmftLoop` (not behind `Box` or `Arc`). PyO3's `PyCell<PyDmftLoop>` manages mutation exclusivity: `solve()` takes `&mut self`, so concurrent Python-thread access raises `PyRuntimeError("Already borrowed")` before reaching Rust. No additional `Mutex` is needed.
+
+This means a `PyDmftLoop` instance is inherently single-threaded from Python's perspective. Multiple independent DMFT loops require multiple `DMFTLoop(config)` instances — one per Python thread or `concurrent.futures` executor.
+
+### 12.2 `CancellationMonitor` Lifecycle
+
+The `CancellationMonitor` is constructed at the beginning of each `solve()` call and consumed by `shutdown()` inside `allow_threads`. It is not stored in `PyDmftLoop` between calls. A fresh monitor (new `AtomicBool`, new `mpsc::channel`, new thread) is created for each invocation. This avoids stale state from a previously interrupted run.
+
+### 12.3 NumPy Memory Ownership Model
+
+When `into_pyarray(py)` is called on a `Vec<f64>`, buffer ownership transfers to a Python `ndarray` object managed by CPython's reference counter. The `SpectralFunction` inside `PySpectralFunction` retains its own copy (via the clone in the getter), so dropping `PySpectralFunction` does not invalidate NumPy arrays previously returned to Python.
+
+**Clone-vs-view trade-off:** The clone-on-getter strategy is chosen over a pinned-view approach because:
+- Array sizes are small: `n_omega` ≤ 10,000 → ≤ 80 KB per clone.
+- Pinned-view (`PyArray1::borrow_from_array`) requires the `PySpectralFunction` to be pinned (e.g., stored in an `Arc`), complicating the ownership model.
+- Getter calls occur in post-processing, not in hot computation loops.
+
+If a future benchmark shows clone overhead is material (e.g., for n_omega = 10⁶ output grids), the implementation can adopt `Arc<SpectralFunction>` + borrowed views without changing the Python API.
 
 ---
 
@@ -1526,13 +1561,13 @@ def test_no_memory_leak_spectral_function_arrays():
 
 ## 16. Out of Scope
 
-- **MPI Mode B orchestration** — `tk-python` does not expose `initialize_dmft_node_budget` or MPI primitives. Multi-rank DMFT uses `mpi4py` at the application layer; each rank imports `tensorkraft` independently.
-- **Multi-GPU management** — The `backend-cuda` feature is propagated from `tk-dmft`, but no GPU-specific Python API is added. GPU selection is transparent to the Python user.
-- **Interactive Jupyter widgets** — Progress bars and real-time convergence plots during `solve()` are out of scope. Users monitor convergence via `solver.stats()` after `solve()` returns.
-- **Complex bath parameters via `PyBathParameters`** — `PyBathParameters` exposes `f64` arrays only. A `PyBathParametersComplex` variant for the `ComplexU1` solver is deferred (Open Question #1).
-- **SU(2) Python API** — `su2-symmetry` is propagated into the underlying stack but no SU(2)-specific Python API (e.g., total spin constructors, multiplet-resolved bath parameters) is added in Phase 4. Deferred to Phase 5+.
-- **Checkpoint load/reload API** — `DMFTCheckpoint` is not directly exposed. Checkpoint read/write is controlled via `DMFTConfig.checkpoint_path`; the binary format is opaque to Python users.
-- **`tensorkraft-stubs` package** — Hand-written `.pyi` stubs for IDE autocompletion are out of scope for the initial spec (Open Question #5).
+- **MPI Mode B orchestration** — `tk-python` does not expose `initialize_dmft_node_budget` or MPI primitives. Multi-rank DMFT uses `mpi4py` at the application layer; each rank imports `tensorkraft` independently. `(-> application layer)`
+- **Multi-GPU management** — The `backend-cuda` feature is propagated from `tk-dmft`, but no GPU-specific Python API is added. GPU selection is transparent to the Python user. `(-> tk-dmft)`
+- **Interactive Jupyter widgets** — Progress bars and real-time convergence plots during `solve()` are out of scope. Users monitor convergence via `solver.stats()` after `solve()` returns. `(-> Phase 5+)`
+- **Complex bath parameters via `PyBathParameters`** — `PyBathParameters` exposes `f64` arrays only. A `PyBathParametersComplex` variant for the `ComplexU1` solver is deferred (Open Question #1). `(-> Phase 5+)`
+- **SU(2) Python API** — `su2-symmetry` is propagated into the underlying stack but no SU(2)-specific Python API (e.g., total spin constructors, multiplet-resolved bath parameters) is added in Phase 4. `(-> Phase 5+)`
+- **Checkpoint load/reload API** — `DMFTCheckpoint` is not directly exposed. Checkpoint read/write is controlled via `DMFTConfig.checkpoint_path`; the binary format is opaque to Python users. `(-> Phase 5+)`
+- **`tensorkraft-stubs` package** — Hand-written `.pyi` stubs for IDE autocompletion are out of scope for the initial spec (Open Question #5). `(-> Phase 5+)`
 
 ---
 
@@ -1541,9 +1576,9 @@ def test_no_memory_leak_spectral_function_arrays():
 | # | Question | Status |
 |:--|:---------|:-------|
 | 1 | `PyBathParametersComplex` for `ComplexU1`: the complex hybridization variant is supported by `DmftLoopVariant::ComplexU1` but its bath parameter setter is unspecified. Should complex bath arrays be a separate class or a unified `PyBathParameters` with a `dtype` parameter? | Open |
-| 2 | Clone-vs-pinned-view for NumPy getters: the clone-on-getter strategy is correct and simple (§9.3). Should we benchmark to confirm the ~80 KB clone is negligible for typical `n_omega`? If so, is this a CI benchmark or a one-time measurement? | Open — defer unless profiling shows it is an issue |
-| 3 | PyO3 v0.22 migration: the spec targets v0.21's `&'py PyAny` lifetime style. The v0.22 `Bound<'py, T>` API is the long-term standard. Should this spec target v0.22 for Phase 4, or migrate in Phase 5? | Open — use v0.21 for Phase 4; migrate in Phase 5 |
-| 4 | TRIQS duck-typing: §7.2 checks the TRIQS class by name. Should it instead check for a duck-typed protocol (presence of `.data`, `.mesh`, `.beta` attributes) to support compatible non-TRIQS Green's function objects? | Open |
+| 2 | Clone-vs-pinned-view for NumPy getters: the clone-on-getter strategy is correct and simple (§12.3). Should we benchmark to confirm the ~80 KB clone is negligible for typical `n_omega`? If so, is this a CI benchmark or a one-time measurement? | Deferred — defer unless profiling shows it is an issue |
+| 3 | PyO3 v0.22 migration: the spec targets v0.21's `&'py PyAny` lifetime style. The v0.22 `Bound<'py, T>` API is the long-term standard. Should this spec target v0.22 for Phase 4, or migrate in Phase 5? | Deferred — use v0.21 for Phase 4; migrate in Phase 5 |
+| 4 | TRIQS duck-typing: §6.2 checks the TRIQS class by name. Should it instead check for a duck-typed protocol (presence of `.data`, `.mesh`, `.beta` attributes) to support compatible non-TRIQS Green's function objects? | Open |
 | 5 | Python stubs (`.pyi` files) for IDE autocompletion: should maturin auto-generate stubs via `pyo3-stub-gen`, or should hand-written stubs be committed to a `python/tensorkraft.pyi` file? | Open |
 | 6 | Config freeze-on-construct: if a Python user modifies `config.dmrg.max_bond_dim` while `solve()` is running on a different thread, PyO3 raises `PyRuntimeError("Already borrowed")`. Is this sufficient, or should `DMFTLoop` deep-copy the config on construction to make post-construction mutations a no-op? | Open — deep-copy on construction is safer; flag as design decision before Phase 4 implementation |
 | 7 | Checkpoint restart API: should `DMFTLoop.solve()` accept an optional `resume_from_checkpoint: str` parameter to restart from a saved checkpoint, rather than requiring the user to reconstruct the entire loop? | Open |

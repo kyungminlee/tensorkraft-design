@@ -336,7 +336,7 @@ impl SpinOp {
     ///
     /// `Sy` has purely imaginary matrix elements. For `T = f64`, this
     /// method returns a zero matrix. Use `T = Complex<f64>` for models
-    /// requiring `Sy`. See Open Question §17.4.
+    /// requiring `Sy`. See Open Question §19.4.
     pub fn matrix<T: Scalar>(self) -> Vec<T>;
 
     /// True iff this operator conserves the total U(1) charge (Sz quantum number).
@@ -1209,7 +1209,42 @@ pub type DslResult<T> = Result<T, DslError>;
 
 ---
 
-## 11. Feature Flags
+## 11. Public API Surface
+
+```rust
+// tk-dsl/src/lib.rs
+
+pub mod index;
+pub mod indexed_tensor;
+pub mod operators;
+pub mod opterm;
+pub mod opsum;
+pub mod lattice;
+pub mod error;
+
+// Flat re-exports for ergonomic downstream use:
+pub use index::{Index, IndexDirection, IndexRegistry};
+pub use indexed_tensor::{IndexedTensor, contract};
+pub use operators::{SpinOp, FermionOp, BosonOp, CustomOp, SiteOperator};
+pub use opterm::{op, OpTerm, OpProduct, ScaledOpProduct};
+pub use opsum::{OpSum, OpSumTerm, OpSumPair, HermitianConjugate, hc};
+pub use lattice::{
+    Lattice,
+    Chain, Square, Triangular, BetheLattice, StarGeometry,
+    snake_path,
+};
+pub use error::{DslError, DslResult};
+
+// Re-export IndexId from tk-contract (thin coupling; see §15 and §19.1):
+pub use tk_contract::IndexId;
+
+// Re-export the hamiltonian! proc-macro from the companion crate:
+pub use tk_dsl_macros::hamiltonian;
+```
+
+---
+
+## 12. Feature Flags
 
 | Flag | Effect in `tk-dsl` |
 |:-----|:-------------------|
@@ -1220,7 +1255,7 @@ pub type DslResult<T> = Result<T, DslError>;
 
 ---
 
-## 12. Build-Level Concerns
+## 13. Build-Level Concerns
 
 `tk-dsl/build.rs` performs one check: the `tk-dsl-macros` crate version must exactly match the `tk-dsl` crate version. A mismatch can produce cryptic type errors (e.g., `OpSum` from one version is not the `OpSum` expected by a macro generated against another); this build check converts the symptom into an explicit diagnostic.
 
@@ -1239,9 +1274,9 @@ For released crates, `tk-dsl` declares `tk-dsl-macros = { version = "=0.1.0" }` 
 
 ---
 
-## 13. Internal Helper Functions
+## 14. Internal Helpers
 
-### 13.1 `ScaledOpProduct::hermitian_conjugate`
+### 14.1 `ScaledOpProduct::hermitian_conjugate`
 
 ```rust
 impl<T: Scalar> ScaledOpProduct<T> {
@@ -1263,7 +1298,7 @@ impl<T: Scalar> ScaledOpProduct<T> {
 }
 ```
 
-### 13.2 `SiteOperator::adjoint`
+### 14.2 `SiteOperator::adjoint`
 
 ```rust
 impl<T: Scalar> SiteOperator<T> {
@@ -1273,13 +1308,13 @@ impl<T: Scalar> SiteOperator<T> {
 }
 ```
 
-### 13.3 `snake_path` (re-exported from `lattice::square`)
+### 14.3 `snake_path` (re-exported from `lattice::square`)
 
 See §8.3. Made `pub` so that custom `Lattice` implementations can reuse the standard snake-path algorithm without duplicating it.
 
 ---
 
-## 14. Dependencies (`Cargo.toml` sketch)
+## 15. Dependencies and Integration
 
 ```toml
 [package]
@@ -1321,13 +1356,13 @@ quote       = "1"
 proc-macro2 = "1"
 ```
 
-**`tk-contract` coupling note:** `tk-dsl` depends on `tk-contract` exclusively to re-export `IndexId`. This is a narrow coupling; `IndexId` could be moved to `tk-core` to sever it entirely. See Open Question §17.1.
+**`tk-contract` coupling note:** `tk-dsl` depends on `tk-contract` exclusively to re-export `IndexId`. This is a narrow coupling; `IndexId` could be moved to `tk-core` to sever it entirely. See Open Question §19.1.
 
 ---
 
-## 15. Testing Strategy
+## 16. Testing Strategy
 
-### 15.1 Unit Tests
+### 16.1 Unit Tests
 
 | Test | Description |
 |:-----|:------------|
@@ -1362,12 +1397,12 @@ proc-macro2 = "1"
 | `star_geometry_bonds_star_only` | `StarGeometry::new(4, 4).bonds()` contains only `(0, k)` pairs |
 | `star_geometry_dmrg_ordering_center` | Impurity at position `n_bath / 2` in the ordering |
 | `contract_matching_indices_f64` | `contract(&a, &b)` correctly identifies and contracts matching index |
-| `contract_no_indices_error` | `contract(&a, &b)` with no matching indices → `DslError::NoContractingIndices` |
-| `contract_dim_mismatch_error` | Matching indices with different dims → `DslError::DimensionMismatch` |
+| `contract_no_indices_error` | `contract(&a, &b)` with no matching indices -> `DslError::NoContractingIndices` |
+| `contract_dim_mismatch_error` | Matching indices with different dims -> `DslError::DimensionMismatch` |
 | `op_scaled_by_scalar` | `2.0_f64 * op(SpinOp::Sz, 0)` produces `ScaledOpProduct { coeff: 2.0, ... }` |
 | `op_product_length` | `op(Sz, i) * op(Sz, j)` produces `OpProduct` with `factors.len() == 2` |
 
-### 15.2 Macro Expansion Tests (`trybuild`)
+### 16.2 Macro Expansion Tests (`trybuild`)
 
 Located in `tests/ui/`. Each file is a self-contained Rust snippet compiled by `trybuild`.
 
@@ -1393,7 +1428,7 @@ Located in `tests/ui/`. Each file is a self-contained Rust snippet compiled by `
 | `hc_non_additive.rs` | `error: 'h.c.' must appear as '+ h.c.'` |
 | `boson_missing_nmax.rs` | `error: boson operator requires explicit n_max` |
 
-### 15.3 Property-Based Tests
+### 16.3 Property-Based Tests
 
 ```rust
 proptest! {
@@ -1456,7 +1491,7 @@ proptest! {
 }
 ```
 
-### 15.4 Integration Test Contracts
+### 16.4 Integration Test Contracts
 
 Integration tests combining `tk-dsl` with `tk-dmrg` live in `tests/` at the workspace root and are the responsibility of `tk-dmrg`'s test suite. From `tk-dsl`'s perspective, the following contracts must hold:
 
@@ -1466,74 +1501,39 @@ Integration tests combining `tk-dsl` with `tk-dmrg` live in `tests/` at the work
 
 ---
 
-## 16. Implementation Notes and Design Decisions
+## 17. Implementation Notes and Design Decisions
 
-### 16.1 No `tk-linalg` Dependency (Cyclic Prevention)
+### 17.1 No `tk-linalg` Dependency (Cyclic Prevention)
 
 The absence of `tk-linalg` in `tk-dsl`'s dependency list is a load-bearing architectural constraint documented in design doc §2.2. `tk-dmrg` depends on both `tk-dsl` (for `OpSum`) and `tk-linalg` (for MPO compilation via SVD). Allowing `tk-dsl` to depend on `tk-linalg` would create a diamond dependency that needlessly invalidates `tk-dsl`'s compilation cache whenever a BLAS backend changes. The constraint is enforced by omitting `tk-linalg` from `tk-dsl/Cargo.toml` entirely.
 
-### 16.2 `SmallString<[u8; 32]>` for Tags
+### 17.2 `SmallString<[u8; 32]>` for Tags
 
 Index tags, operator names, and `CustomOp` names use `SmallString<[u8; 32]>` rather than `String`. Physical model identifiers are typically 2–12 characters ("phys", "bond_L", "σ_y"). The 32-byte inline buffer avoids heap allocation for all realistic tags, consistent with `tk-core`'s use of `SmallVec<[usize; 6]>` for tensor shapes.
 
-### 16.3 Prime-Level Convention
+### 17.3 Prime-Level Convention
 
 `prime_level` follows the ITensor convention: level 0 is the "ket" (incoming) copy; level 1 is the "bra" (outgoing) copy. `contracts_with` checks that levels differ by exactly one, not that they are 0 and 1 specifically, so that higher prime levels (2, 3, ...) can represent multi-time-step expressions or power applications without special-casing.
 
-### 16.4 `SiteOperator<T>` Generics and Monomorphization
+### 17.4 `SiteOperator<T>` Generics and Monomorphization
 
 `SiteOperator<T>` is generic over `T: Scalar`. The entire `OpSum<T>` machinery is monomorphized once per `T`. For the common case `T = f64` there is one instantiation; for `T = Complex<f64>` (complex hopping in DMFT) there is a separate one. The design avoids type-erased `Box<dyn Any>` storage, which would require unsafe downcasting in `matrix()` and heap-allocate every operator term.
 
-### 16.5 `HermitianConjugate` Marker and Atomic `+ h.c.` Insertion
+### 17.5 `HermitianConjugate` Marker and Atomic `+ h.c.` Insertion
 
 The `hc()` function returns a zero-size marker struct. `Add<HermitianConjugate>` on `ScaledOpProduct` returns `OpSumPair`, and `AddAssign<OpSumPair>` on `OpSum` inserts both forward and conjugate terms atomically. This prevents the bug where a user writes `opsum += J * term; opsum += hc();` — the latter is a type error because `HermitianConjugate` does not implement `AddAssign<OpSum>`.
 
-### 16.6 Bosonic `n_max` as Runtime Parameter
+### 17.6 Bosonic `n_max` as Runtime Parameter
 
 `BosonOp` does not store `n_max`; instead it appears in `SiteOperator::Boson { op, n_max }`. This is necessary because `n_max` is determined by convergence studies at runtime. The matrix is constructed once per unique `(BosonOp, n_max)` pair during MPO compilation in `tk-dmrg`, not in hot loops.
 
-### 16.7 Proc-Macro Crate Separation
+### 17.7 Proc-Macro Crate Separation
 
 Rust requires proc-macro crates to be separate compilation units. `tk-dsl-macros` is the proc-macro implementation; `tk-dsl` re-exports `hamiltonian!` from it. The exact-version constraint `version = "=0.1.0"` in `Cargo.toml` prevents Cargo from silently resolving to a different patch of the macros crate, which could produce type mismatch errors between the generated code and the runtime types.
 
-### 16.8 `contract()` Delegates to `tk-contract`
+### 17.8 `contract()` Delegates to `tk-contract`
 
 The `IndexedTensor::contract` function builds a `ContractionSpec` from the matched `IndexId` pairs and delegates to `tk-contract`'s `ContractionExecutor`. This means `tk-dsl` does not implement any GEMM logic itself — it only handles the index-matching metadata layer. Actual numerical work flows through the established `tk-contract` / `tk-linalg` path.
-
----
-
-## 17. Public API Surface (`lib.rs`)
-
-```rust
-// tk-dsl/src/lib.rs
-
-pub mod index;
-pub mod indexed_tensor;
-pub mod operators;
-pub mod opterm;
-pub mod opsum;
-pub mod lattice;
-pub mod error;
-
-// Flat re-exports for ergonomic downstream use:
-pub use index::{Index, IndexDirection, IndexRegistry};
-pub use indexed_tensor::{IndexedTensor, contract};
-pub use operators::{SpinOp, FermionOp, BosonOp, CustomOp, SiteOperator};
-pub use opterm::{op, OpTerm, OpProduct, ScaledOpProduct};
-pub use opsum::{OpSum, OpSumTerm, OpSumPair, HermitianConjugate, hc};
-pub use lattice::{
-    Lattice,
-    Chain, Square, Triangular, BetheLattice, StarGeometry,
-    snake_path,
-};
-pub use error::{DslError, DslResult};
-
-// Re-export IndexId from tk-contract (thin coupling; see §14 and §17.1):
-pub use tk_contract::IndexId;
-
-// Re-export the hamiltonian! proc-macro from the companion crate:
-pub use tk_dsl_macros::hamiltonian;
-```
 
 ---
 
@@ -1541,16 +1541,16 @@ pub use tk_dsl_macros::hamiltonian;
 
 The following are explicitly **not** implemented in `tk-dsl`:
 
-- `OpSum → MPO` compilation, SVD compression, finite-state automaton minimization (→ `tk-dmrg`)
-- BLAS, SVD, or eigenvalue operations of any kind (→ `tk-linalg`)
-- MPS or MPO data structures (→ `tk-dmrg`)
-- Block-sparse tensor arithmetic (→ `tk-linalg`, `tk-contract`)
-- Iterative eigensolvers: Lanczos, Davidson, Block-Davidson (→ `tk-dmrg`)
-- TDVP time-evolution, TEBD operators, or bath discretization (→ `tk-dmft`)
-- Python bindings (→ `tk-python`)
-- Lattice geometry for tree tensor networks or 2D PEPS (→ Phase 5+)
-- Fermionic swap gate or Jordan-Wigner string insertion (→ `tk-dmrg`, design doc §6.4)
-- Hamiltonian symmetry analysis or quantum number assignment (site quantum numbers are supplied at `BlockSparseTensor` construction in `tk-dmrg`, not here)
+- `OpSum -> MPO` compilation, SVD compression, finite-state automaton minimization (-> `tk-dmrg`)
+- BLAS, SVD, or eigenvalue operations of any kind (-> `tk-linalg`)
+- MPS or MPO data structures (-> `tk-dmrg`)
+- Block-sparse tensor arithmetic (-> `tk-linalg`, `tk-contract`)
+- Iterative eigensolvers: Lanczos, Davidson, Block-Davidson (-> `tk-dmrg`)
+- TDVP time-evolution, TEBD operators, or bath discretization (-> `tk-dmft`)
+- Python bindings (-> `tk-python`)
+- Lattice geometry for tree tensor networks or 2D PEPS (-> Phase 5+)
+- Fermionic swap gate or Jordan-Wigner string insertion (-> `tk-dmrg`, design doc §6.4)
+- Hamiltonian symmetry analysis or quantum number assignment (site quantum numbers are supplied at `BlockSparseTensor` construction in `tk-dmrg`, not here) (-> `tk-dmrg`)
 
 ---
 
@@ -1559,9 +1559,9 @@ The following are explicitly **not** implemented in `tk-dsl`:
 | # | Question | Status |
 |:--|:---------|:-------|
 | 1 | Should `IndexId` be moved to `tk-core` instead of `tk-contract`, so that `tk-dsl`'s only linalg-adjacent dependency is severed? This would let `tk-dsl` compile independently of `tk-contract` changes. Cost: a one-line change to `tk-core` and a re-export update in `tk-contract`. | Deferred; assess after initial implementations of both crates |
-| 2 | Should `OpSum<T>` include an in-place simplification pass (combining terms with identical operator products by summing their coefficients)? This would reduce term count before MPO compilation. Cost: O(N² log N) de-duplication in `tk-dsl`. Alternative: a pre-pass inside `OpSum::compile_mpo` in `tk-dmrg`. | Defer to `tk-dmrg` as a MPO compiler pre-pass |
-| 3 | Should `hamiltonian!` support `next_nearest_neighbour` and `all_pairs` keywords as sugar for common double-sum patterns in frustrated magnetism models? | Survey user demand before Phase 2 |
-| 4 | `SpinOp::Sy` returns a zero matrix for `T = f64`. Should `op(SpinOp::Sy, i)` be a `compile_error!` when `T = f64` (enforced via a blanket impl with a `static_assertions` check)? The alternative — a runtime `DslError::IncompatibleScalarType` — is less ergonomic. | Decide before Phase 1 implementation; lean toward compile-time error |
-| 5 | `CustomOp<T>` stores a `DenseTensor<T>` by value, cloning it once per site into the `OpSum`. For uniform models with the same custom operator on 1000 sites, this is 1000 heap allocations. An `Arc<DenseTensor<T>>` would share the storage. Is the extra complexity worth it? | Profile against `n_sites = 1000` with a 4×4 custom operator before deciding |
-| 6 | The `Lattice` trait is currently object-safe because it has no generic methods. Adding a `visit_bonds<F: Fn(usize, usize)>` callback method for zero-allocation bond iteration would break object safety. Is the performance benefit worth the ergonomic cost of requiring `dyn Lattice` callers to use `bonds()` + iteration? | Keep `Lattice` object-safe; users can iterate `bonds()` slice directly |
-| 7 | Should `StarGeometry` expose a `map_to_chain` method that returns a `Chain` with reordered coupling arrays, reflecting the Lanczos tridiagonalization used in `tk-dmft`? This would make the AIM→chain mapping visible at the `tk-dsl` level, improving discoverability. Alternatively, this mapping belongs entirely in `tk-dmft`. | Belongs in `tk-dmft`; keep `tk-dsl` geometry-agnostic w.r.t. chain mapping |
+| 2 | Should `OpSum<T>` include an in-place simplification pass (combining terms with identical operator products by summing their coefficients)? This would reduce term count before MPO compilation. Cost: O(N² log N) de-duplication in `tk-dsl`. Alternative: a pre-pass inside `OpSum::compile_mpo` in `tk-dmrg`. | Deferred — defer to `tk-dmrg` as an MPO compiler pre-pass |
+| 3 | Should `hamiltonian!` support `next_nearest_neighbour` and `all_pairs` keywords as sugar for common double-sum patterns in frustrated magnetism models? | Deferred — survey user demand before Phase 2 |
+| 4 | `SpinOp::Sy` returns a zero matrix for `T = f64`. Should `op(SpinOp::Sy, i)` be a `compile_error!` when `T = f64` (enforced via a blanket impl with a `static_assertions` check)? The alternative — a runtime `DslError::IncompatibleScalarType` — is less ergonomic. | Open — decide before Phase 1 implementation; lean toward compile-time error |
+| 5 | `CustomOp<T>` stores a `DenseTensor<T>` by value, cloning it once per site into the `OpSum`. For uniform models with the same custom operator on 1000 sites, this is 1000 heap allocations. An `Arc<DenseTensor<T>>` would share the storage. Is the extra complexity worth it? | Open — profile against `n_sites = 1000` with a 4x4 custom operator before deciding |
+| 6 | The `Lattice` trait is currently object-safe because it has no generic methods. Adding a `visit_bonds<F: Fn(usize, usize)>` callback method for zero-allocation bond iteration would break object safety. Is the performance benefit worth the ergonomic cost of requiring `dyn Lattice` callers to use `bonds()` + iteration? | Resolved — keep `Lattice` object-safe; users can iterate `bonds()` slice directly |
+| 7 | Should `StarGeometry` expose a `map_to_chain` method that returns a `Chain` with reordered coupling arrays, reflecting the Lanczos tridiagonalization used in `tk-dmft`? This would make the AIM→chain mapping visible at the `tk-dsl` level, improving discoverability. Alternatively, this mapping belongs entirely in `tk-dmft`. | Resolved — belongs in `tk-dmft`; keep `tk-dsl` geometry-agnostic w.r.t. chain mapping |

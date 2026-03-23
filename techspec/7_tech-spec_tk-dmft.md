@@ -1109,20 +1109,61 @@ pub type DmftResult<T> = Result<T, DmftError>;
 
 ---
 
-## 11. Feature Flags
+## 11. Public API Surface
 
-| Feature Flag | Effect | Default |
-|:-------------|:-------|:--------|
-| `parallel` | Enables Rayon parallelism in FFT post-processing and Levinson-Durbin inner loops (propagated from `tk-linalg`). | Yes |
-| `backend-cuda` | Activates pinned-memory budget tracking in `SweepArena` (propagated from `tk-dmrg`). Required for `initialize_dmft_node_budget`. | No |
-| `backend-mpi` | Enables `initialize_dmft_node_budget` and the `MpiComm` type. Requires system MPI library. | No |
-| `su2-symmetry` | Propagates SU(2) symmetry support into AIM Hamiltonian construction and DMRG engine. | No |
+```rust
+// tk-dmft/src/lib.rs
+
+// Anderson Impurity Model
+pub use crate::impurity::mod_::{AndersonImpurityModel};
+pub use crate::impurity::bath::{BathParameters};
+pub use crate::impurity::discretize::{BathDiscretizationConfig};
+
+// Spectral function types and free functions
+pub use crate::spectral::mod_::{SpectralFunction, SpectralSolverMode};
+pub use crate::spectral::linear_predict::{
+    ToeplitzSolver,
+    LinearPredictionConfig,
+    linear_predict_regularized,
+    fft_to_spectral,
+    deconvolve_lorentzian,
+};
+pub use crate::spectral::positivity::restore_positivity;
+pub use crate::spectral::chebyshev::{ChebyshevConfig, chebyshev_expand};
+
+// DMFT loop and configuration
+pub use crate::r#loop::config::{DMFTConfig, TimeEvolutionConfig};
+pub use crate::r#loop::mixing::MixingScheme;
+pub use crate::r#loop::mod_::DMFTLoop;
+pub use crate::r#loop::stats::DMFTStats;
+
+// Checkpointing
+pub use crate::r#loop::mod_::DMFTCheckpoint;
+
+// MPI budget initialization (feature-gated)
+#[cfg(all(feature = "backend-cuda", feature = "backend-mpi"))]
+pub use crate::mpi::initialize_dmft_node_budget;
+
+// Error types
+pub use crate::error::{DmftError, DmftResult};
+```
+
+---
+
+## 12. Feature Flags
+
+| Flag | Effect in tk-dmft |
+|:-----|:------------------|
+| `parallel` | Enables Rayon parallelism in FFT post-processing and Levinson-Durbin inner loops, propagated from `tk-linalg` (default) |
+| `backend-cuda` | Activates pinned-memory budget tracking in `SweepArena`, propagated from `tk-dmrg`; required for `initialize_dmft_node_budget` |
+| `backend-mpi` | Enables `initialize_dmft_node_budget` and the `MpiComm` type; requires system MPI library |
+| `su2-symmetry` | Propagates SU(2) symmetry support into AIM Hamiltonian construction and DMRG engine |
 
 `backend-mkl` and `backend-openblas` are not declared in `tk-dmft`'s own `Cargo.toml`; they are propagated through `tk-dmrg`'s feature flags.
 
 ---
 
-## 12. Build-Level Concerns
+## 13. Build-Level Concerns
 
 `tk-dmft/build.rs` performs two checks:
 
@@ -1132,9 +1173,9 @@ pub type DmftResult<T> = Result<T, DmftError>;
 
 ---
 
-## 13. Data Structures and Internal Representations
+## 14. Data Structures and Internal Representations
 
-### 13.1 Time-Domain Green's Function
+### 14.1 Time-Domain Green's Function
 
 The retarded impurity Green's function at T=0:
 
@@ -1144,7 +1185,7 @@ G(t) = -i ⟨ψ₀| c_{0σ} exp(-iHt) c†_{0σ} |ψ₀⟩    (t > 0)
 
 Stored as `Vec<Complex<f64>>` sampled at uniform times 0, dt, 2dt, ..., t_max. The FFT assumes uniform sampling; adaptive time-step TDVP must resample onto a uniform grid before calling `fft_to_spectral`.
 
-### 13.2 Self-Consistency Equation (Bethe Lattice)
+### 14.2 Self-Consistency Equation (Bethe Lattice)
 
 The DMFT self-consistency condition for the Bethe lattice (coordination z, half-bandwidth W):
 
@@ -1160,7 +1201,7 @@ G_imp(ω) is recovered from A_imp(ω) via Kramers-Kronig. The hybridization func
 
 The Weiss field is specialized to the Bethe lattice for Phase 4; the general-lattice Dyson equation path is marked `// TODO: Phase 5+`.
 
-### 13.3 Tensor Leg Conventions
+### 14.3 Tensor Leg Conventions
 
 AIM chain Hamiltonian tensors follow the same conventions as `tk-dmrg` (design doc §9):
 
@@ -1173,7 +1214,7 @@ AIM chain Hamiltonian tensors follow the same conventions as `tk-dmrg` (design d
 
 Physical dimensions: impurity site d = 4 (|0⟩, |↑⟩, |↓⟩, |↑↓⟩) for spin-1/2 single-orbital; bath sites d = 2 (|0⟩, |1⟩ per spin channel in the spinless basis) or d = 4 for spin-resolved bath.
 
-### 13.4 Checkpoint Format
+### 14.4 Checkpoint Format
 
 ```rust
 /// Serializable checkpoint for a DMFT run.
@@ -1224,9 +1265,9 @@ where
 
 ---
 
-## 14. Dependencies and Integration
+## 15. Dependencies and Integration
 
-### 14.1 Upstream Dependencies (`Cargo.toml`)
+### 15.1 Upstream Dependencies (`Cargo.toml`)
 
 ```toml
 [dependencies]
@@ -1267,11 +1308,11 @@ backend-mpi     = ["mpi", "sys-info", "tk-dmrg/backend-mpi"]
 su2-symmetry    = ["tk-dmrg/su2-symmetry"]
 ```
 
-### 14.2 Downstream Consumers
+### 15.2 Downstream Consumers
 
 **`tk-python`** — Wraps `DMFTLoop<f64, U1, DeviceFaer>` in a `PyDMFTLoop` PyO3 class. Calls `solve_with_cancel_flag` inside a `py.allow_threads` closure so that Rayon workers inside `DMRGEngine` never touch the Python GIL (design doc §7.5). Spectral function output is zero-copied to NumPy via `rust-numpy`.
 
-### 14.3 External Dependencies by Functionality
+### 15.3 External Dependencies by Functionality
 
 | Crate | Purpose | Feature Gate |
 |:------|:--------|:-------------|
@@ -1282,9 +1323,9 @@ su2-symmetry    = ["tk-dmrg/su2-symmetry"]
 
 ---
 
-## 15. Testing Strategy
+## 16. Testing Strategy
 
-### 15.1 Unit Tests
+### 16.1 Unit Tests
 
 | Test | Description |
 |:-----|:------------|
@@ -1318,7 +1359,7 @@ su2-symmetry    = ["tk-dmrg/su2-symmetry"]
 | `dmft_checkpoint_roundtrip` | Write a `DMFTCheckpoint` with bincode, reload from file. Verify all bath parameter values and spectral function values match f64 round-trip precision. |
 | `initialize_budget_mpi` | (gated `backend-mpi`) Mock two co-resident ranks; verify each rank's `PinnedMemoryTracker` budget = floor(0.60 × total_ram / 2). |
 
-### 15.2 Integration Tests — Bethe Lattice Benchmarks
+### 16.2 Integration Tests — Bethe Lattice Benchmarks
 
 Gated behind the `integration-tests` feature flag (slow; excluded from standard `cargo test`).
 
@@ -1343,7 +1384,7 @@ fixtures/
 | `positivity_metallic_no_kondo_corruption` | U=4W correlated metal. Verify A(ω=0) shift after positivity restoration < 1% (Kondo peak not corrupted). |
 | `mode_b_two_rank_convergence` | (gated `backend-mpi`) Run two-rank Mode B DMFT on U=0 and U=4W. Verify both converge and spectral functions match single-rank runs to within 1e-4. |
 
-### 15.3 Property-Based Tests
+### 16.3 Property-Based Tests
 
 ```rust
 // Idempotency: restoring a positive spectrum is a no-op
@@ -1386,7 +1427,7 @@ proptest! {
 - Maximum 256 cases per test
 - Deterministic seed via `PROPTEST_SEED`
 
-### 15.4 Performance Benchmarks
+### 16.4 Performance Benchmarks
 
 ```
 // Criterion.rs — bare-metal only; iai instruction counting for CI gating
@@ -1403,7 +1444,7 @@ CI gating: iai instruction counting, ±2% regression threshold (consistent with 
 
 ---
 
-## 16. Implementation Notes
+## 17. Implementation Notes and Design Decisions
 
 ### Note 1 — Levinson-Durbin Recursion
 
@@ -1435,7 +1476,7 @@ The `TdvpStabilizationConfig` (v8.2 revision, design doc §8.1.1) added `adaptiv
 
 ### Note 4 — Chebyshev H_eff Reuse
 
-`chebyshev_expand` needs to apply the Hamiltonian H repeatedly to an MPS. It reuses the H_eff construction machinery from `tk-dmrg`'s environment infrastructure. This requires either a new `DMRGEngine::apply_hamiltonian_to_mps` method, or direct access to `build_heff_single_site` + `ContractionExecutor`. This is an open design point (see §18, Open Question 3).
+`chebyshev_expand` needs to apply the Hamiltonian H repeatedly to an MPS. It reuses the H_eff construction machinery from `tk-dmrg`'s environment infrastructure. This requires either a new `DMRGEngine::apply_hamiltonian_to_mps` method, or direct access to `build_heff_single_site` + `ContractionExecutor`. This is an open design point (see §19, Open Question 3).
 
 ### Note 5 — rustfft Integration
 
@@ -1447,56 +1488,15 @@ The current `weiss_field` implementation is specialized to the Bethe lattice (Ph
 
 ---
 
-## 17. Public API Surface (`lib.rs` re-exports)
-
-```rust
-// tk-dmft/src/lib.rs
-
-// Anderson Impurity Model
-pub use crate::impurity::mod_::{AndersonImpurityModel};
-pub use crate::impurity::bath::{BathParameters};
-pub use crate::impurity::discretize::{BathDiscretizationConfig};
-
-// Spectral function types and free functions
-pub use crate::spectral::mod_::{SpectralFunction, SpectralSolverMode};
-pub use crate::spectral::linear_predict::{
-    ToeplitzSolver,
-    LinearPredictionConfig,
-    linear_predict_regularized,
-    fft_to_spectral,
-    deconvolve_lorentzian,
-};
-pub use crate::spectral::positivity::restore_positivity;
-pub use crate::spectral::chebyshev::{ChebyshevConfig, chebyshev_expand};
-
-// DMFT loop and configuration
-pub use crate::r#loop::config::{DMFTConfig, TimeEvolutionConfig};
-pub use crate::r#loop::mixing::MixingScheme;
-pub use crate::r#loop::mod_::DMFTLoop;
-pub use crate::r#loop::stats::DMFTStats;
-
-// Checkpointing
-pub use crate::r#loop::mod_::DMFTCheckpoint;
-
-// MPI budget initialization (feature-gated)
-#[cfg(all(feature = "backend-cuda", feature = "backend-mpi"))]
-pub use crate::mpi::initialize_dmft_node_budget;
-
-// Error types
-pub use crate::error::{DmftError, DmftResult};
-```
-
----
-
 ## 18. Out of Scope
 
-- **Cluster DMFT / multi-orbital DMFT** — Phase 5+. Current design handles single-orbital single-site DMFT only.
-- **Finite-temperature DMFT (Matsubara formalism)** — Phase 5+. Imaginary-time TDVP is architecturally supported (T = f64, imaginary dt), but the full Matsubara self-consistency and analytic continuation are not in scope.
-- **MPI Mode A (distributed block-sparse tensors)** — Phase 5+. Mode B (embarrassingly parallel independent DMRG runs) requires no core changes to `tk-dmrg`.
-- **GPU-accelerated FFT (cuFFT)** — Phase 5+. The spectral pipeline uses CPU-only `rustfft`.
-- **General non-Bethe-lattice Weiss fields** — The self-consistency equation is specialized to the Bethe lattice. General-lattice paths are marked `// TODO: Phase 5+`.
-- **TEBD time evolution** — Mentioned in the design doc as a fallback but not specified for Phase 4 implementation. TDVP (primary) and Chebyshev (cross-validation) cover the Phase 4 use cases. TEBD would be added as a third `SpectralSolverMode` variant in Phase 5+ if needed.
-- **Async MPI convergence checks and dynamic work-stealing** — Design doc §10.3 documents these as Phase 5+ mitigations for MPI Mode B load imbalance under multi-orbital DMFT.
+- **Cluster DMFT / multi-orbital DMFT** (-> Phase 5+) — Current design handles single-orbital single-site DMFT only.
+- **Finite-temperature DMFT (Matsubara formalism)** (-> Phase 5+) — Imaginary-time TDVP is architecturally supported (T = f64, imaginary dt), but the full Matsubara self-consistency and analytic continuation are not in scope.
+- **MPI Mode A (distributed block-sparse tensors)** (-> Phase 5+) — Mode B (embarrassingly parallel independent DMRG runs) requires no core changes to `tk-dmrg`.
+- **GPU-accelerated FFT (cuFFT)** (-> Phase 5+) — The spectral pipeline uses CPU-only `rustfft`.
+- **General non-Bethe-lattice Weiss fields** (-> Phase 5+) — The self-consistency equation is specialized to the Bethe lattice. General-lattice paths are marked `// TODO: Phase 5+`.
+- **TEBD time evolution** (-> `tk-dmrg`) — Mentioned in the design doc as a fallback but not specified for Phase 4 implementation. TDVP (primary) and Chebyshev (cross-validation) cover the Phase 4 use cases. TEBD would be added as a third `SpectralSolverMode` variant in Phase 5+ if needed.
+- **Async MPI convergence checks and dynamic work-stealing** (-> Phase 5+) — Design doc §10.3 documents these as Phase 5+ mitigations for MPI Mode B load imbalance under multi-orbital DMFT.
 
 ---
 
@@ -1504,9 +1504,9 @@ pub use crate::error::{DmftError, DmftResult};
 
 | # | Question | Status |
 |:--|:---------|:-------|
-| 1 | Should `DMFTLoop::weiss_field` be a method or a pluggable `WeissFieldStrategy` trait to support non-Bethe lattices without forking `tk-dmft`? Phase 4 only needs the Bethe lattice. | Open — defer to Phase 5; annotate current impl as Bethe-only |
-| 2 | Should `rustfft::FftPlanner` be cached inside `DMFTLoop` for repeated use? At one FFT per DMFT iteration the overhead is negligible, but a future spectral-function-only mode (no self-consistency loop) could call it frequently. | Low priority — profile first; defer to Phase 5 |
-| 3 | `chebyshev_expand` requires applying H repeatedly to an MPS. Does this require a new `DMRGEngine::apply_hamiltonian_to_mps` method, or can it reuse `build_heff_single_site` from `tk-dmrg`'s environment module? | Requires coordination with `tk-dmrg` before implementation; resolve at start of Phase 4 |
-| 4 | Broyden mixing stores a history of bath-parameter vectors. Should these be stored as `Vec<BathParameters<T>>` (clean API) or as flat `Vec<f64>` (cache-friendly Jacobian update)? | Recommend flat storage for numerical efficiency; confirm with implementer |
-| 5 | `initialize_dmft_node_budget` uses `sys_info::mem_info()` which queries physical RAM. On HPC clusters with Slurm `--mem` constraints, the cgroup memory limit may be less than physical RAM. Should the function query the cgroup limit via `/proc/self/cgroup` instead? | Flag for HPC deployment review; use `sys_info::mem_info()` for Phase 4 (document limitation) |
-| 6 | Should `DMFTCheckpoint` include the full MPS state (via `DMRGCheckpoint` from `tk-dmrg`) to enable DMRG warm-starting from the previous iteration's converged state? This would save 1–3 sweeps per iteration at the cost of larger checkpoint files. | Recommend bath-only checkpoint for Phase 4; MPS warm-start as Phase 5 optimization |
+| 1 | Should `DMFTLoop::weiss_field` be a method or a pluggable `WeissFieldStrategy` trait to support non-Bethe lattices without forking `tk-dmft`? Phase 4 only needs the Bethe lattice. | Deferred — defer to Phase 5; annotate current impl as Bethe-only |
+| 2 | Should `rustfft::FftPlanner` be cached inside `DMFTLoop` for repeated use? At one FFT per DMFT iteration the overhead is negligible, but a future spectral-function-only mode (no self-consistency loop) could call it frequently. | Deferred — profile first; defer to Phase 5 |
+| 3 | `chebyshev_expand` requires applying H repeatedly to an MPS. Does this require a new `DMRGEngine::apply_hamiltonian_to_mps` method, or can it reuse `build_heff_single_site` from `tk-dmrg`'s environment module? | Open — requires coordination with `tk-dmrg` before implementation; resolve at start of Phase 4 |
+| 4 | Broyden mixing stores a history of bath-parameter vectors. Should these be stored as `Vec<BathParameters<T>>` (clean API) or as flat `Vec<f64>` (cache-friendly Jacobian update)? | Open — recommend flat storage for numerical efficiency; confirm with implementer |
+| 5 | `initialize_dmft_node_budget` uses `sys_info::mem_info()` which queries physical RAM. On HPC clusters with Slurm `--mem` constraints, the cgroup memory limit may be less than physical RAM. Should the function query the cgroup limit via `/proc/self/cgroup` instead? | Open — use `sys_info::mem_info()` for Phase 4; flag for HPC deployment review |
+| 6 | Should `DMFTCheckpoint` include the full MPS state (via `DMRGCheckpoint` from `tk-dmrg`) to enable DMRG warm-starting from the previous iteration's converged state? This would save 1-3 sweeps per iteration at the cost of larger checkpoint files. | Deferred — recommend bath-only checkpoint for Phase 4; MPS warm-start as Phase 5 optimization |

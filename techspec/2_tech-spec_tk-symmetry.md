@@ -123,7 +123,7 @@ pub trait BitPackable: QuantumNumber {
 The maximum number of legs packable into a `u64` is `64 / BIT_WIDTH`:
 
 | Quantum Number | `BIT_WIDTH` | Max legs (u64) | Max legs (u128) |
-|:---------------|:-----------:|:--------------:|:---------------:|
+|:---------------|:------------|:---------------|:----------------|
 | `Z2` | 1 | 64 | 128 |
 | `U1` | 8 | 8 | 16 |
 | `U1Z2` | 9 | 7 | 14 |
@@ -721,7 +721,13 @@ These items are scoped to the `su2-symmetry` feature flag and do not affect the 
 
 ---
 
-## 11. Error Types
+## 11. Error Handling
+
+### 11.1 Error Propagation Strategy
+
+`SymmetryError` wraps `tk_core::TkError` via the `#[from]` attribute, allowing any `TkError` raised by `tk-core` operations (e.g., `DenseTensor` construction or `SweepArena` allocation) to propagate transparently through `tk-symmetry` functions that return `SymResult<T>`. Downstream crates (`tk-linalg`, `tk-contract`, `tk-dmrg`, etc.) in turn wrap `SymmetryError` in their own error enums using the same `#[from]` pattern, forming a layered error chain that preserves the original error context across crate boundaries without requiring manual conversion logic.
+
+### 11.2 Error Enum Definition
 
 ```rust
 #[derive(Debug, thiserror::Error)]
@@ -796,9 +802,45 @@ No other `tk-symmetry`-specific feature flags. The `parallel` and backend flags 
 
 ---
 
-## 14. Testing Requirements
+## 14. Dependencies and Integration
 
-### 14.1 Unit Tests
+### 14.1 `Cargo.toml` Sketch
+
+```toml
+[dependencies]
+tk-core = { path = "../tk-core" }
+smallvec = "1"
+hashbrown = "0.14"
+thiserror = "1"
+lie-groups = { version = "0.1", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+trybuild = "1"
+
+[features]
+default = []
+su2-symmetry = ["lie-groups"]
+```
+
+### 14.2 Upstream Dependencies
+
+- `tk-core` — `Scalar`, `DenseTensor`, `TensorShape`, `TkError`, `SweepArena`
+
+### 14.3 Downstream Consumers
+
+- `tk-linalg`
+- `tk-contract`
+- `tk-dsl`
+- `tk-dmrg`
+- `tk-dmft`
+- `tk-python`
+
+---
+
+## 15. Testing Strategy
+
+### 15.1 Unit Tests
 
 | Test | Description |
 |:-----|:------------|
@@ -823,7 +865,7 @@ No other `tk-symmetry`-specific feature flags. The `parallel` and backend flags 
 | `unflatten_round_trip` | `unflatten(flatten(tensor))` recovers original blocks exactly |
 | `flatten_offsets_correct` | Each offset in `FlatBlockStorage` matches the cumulative element count |
 
-### 14.2 Property-Based Tests
+### 15.2 Property-Based Tests
 
 ```rust
 proptest! {
@@ -848,7 +890,7 @@ proptest! {
 }
 ```
 
-### 14.3 Invariant Checks
+### 15.3 Invariant Checks
 
 The `BlockSparseTensor` exposes a `#[cfg(debug_assertions)] fn assert_invariants(&self)` method that checks:
 1. `sector_keys` is strictly sorted (ascending, no duplicates).
@@ -859,7 +901,7 @@ This is called at the end of every constructor and mutation in debug/test builds
 
 ---
 
-## 15. Performance Invariants
+## 16. Performance Invariants
 
 | Operation | Invariant |
 |:----------|:----------|
@@ -873,23 +915,23 @@ CI Criterion benchmarks must verify that `get_block` on a 100-sector tensor comp
 
 ---
 
-## 16. Out of Scope
+## 17. Out of Scope
 
 The following are explicitly **not** implemented in `tk-symmetry`:
 
-- GEMM dispatch or LPT scheduling for block-sparse contractions (→ `tk-linalg`)
-- DAG-based contraction path optimization (→ `tk-contract`)
-- MPS / MPO data structures (→ `tk-dmrg`)
-- SVD truncation, including multiplet-aware truncation (→ `tk-linalg`, `tk-dmrg`)
-- Physical model definitions or lattice types (→ `tk-dsl`)
+- GEMM dispatch or LPT scheduling for block-sparse contractions (-> `tk-linalg`)
+- DAG-based contraction path optimization (-> `tk-contract`)
+- MPS / MPO data structures (-> `tk-dmrg`)
+- SVD truncation, including multiplet-aware truncation (-> `tk-linalg`, `tk-dmrg`)
+- Physical model definitions or lattice types (-> `tk-dsl`)
 
 ---
 
-## 17. Open Questions
+## 18. Open Questions
 
 | # | Question | Status |
 |:--|:---------|:-------|
-| 1 | Should `BlockSparseTensor` support mixed symmetry groups on different legs (e.g., leg 0 carries `U1`, leg 1 carries `Z2`)? Current design requires all legs to share the same `Q` type. | Deferred; workaround is to use `U1Z2` composite type |
-| 2 | Is `SmallVec<[SU2Irrep; 6]>` the right key for the `WignerEckartTensor` reduced-block map, or should it be a sorted `Vec` for a more complex rank pattern? | To be decided when SU(2) is actively implemented |
-| 3 | Should `ClebschGordanCache` use `dashmap` for better concurrent write performance during `prefill`? | Profile under realistic multi-thread load first |
-| 4 | Does `enumerate_valid_sectors` need memoization for high-rank tensors (rank > 6)? | Benchmark on rank-8 MPO construction before optimizing |
+| 1 | Should `BlockSparseTensor` support mixed symmetry groups on different legs (e.g., leg 0 carries `U1`, leg 1 carries `Z2`)? Current design requires all legs to share the same `Q` type. | Deferred — workaround is to use `U1Z2` composite type |
+| 2 | Is `SmallVec<[SU2Irrep; 6]>` the right key for the `WignerEckartTensor` reduced-block map, or should it be a sorted `Vec` for a more complex rank pattern? | Deferred — to be decided when SU(2) is actively implemented |
+| 3 | Should `ClebschGordanCache` use `dashmap` for better concurrent write performance during `prefill`? | Open — profile under realistic multi-thread load first |
+| 4 | Does `enumerate_valid_sectors` need memoization for high-rank tensors (rank > 6)? | Open — benchmark on rank-8 MPO construction before optimizing |

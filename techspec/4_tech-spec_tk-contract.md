@@ -738,7 +738,7 @@ where B: LinAlgBackend<T> + SparseLinAlgBackend<T, Q>
 /// 1. Evaluates ⟨j_a, m_a; j_b, m_b | j_c, m_c⟩ from the `ClebschGordanCache`.
 /// 2. Scales the output block by the appropriate coefficient before
 ///    accumulation.
-/// 3. Handles fusion-rule multiplicity: j₁⊗j₂ → multiple j_c irreps,
+/// 3. Handles fusion-rule multiplicity: j₁⊗j₂ -> multiple j_c irreps,
 ///    producing multiple `SectorGemmTask`s per input pair (§4.4 of design doc).
 ///
 /// This trait is defined in `tk-contract` (not `tk-linalg`) because evaluating
@@ -775,7 +775,7 @@ impl<T: Scalar, Q: BitPackable> StructuralContractionHook<T, Q> for AbelianHook<
         sector_a: &[Q],
         sector_b: &[Q],
     ) -> SmallVec<[(SmallVec<[Q; 8]>, T); 4]> {
-        // Abelian fusion: fuse sector_a ⊕ sector_b → unique output sector.
+        // Abelian fusion: fuse sector_a ⊕ sector_b -> unique output sector.
         // Coefficient is always 1.
         let output: SmallVec<[Q; 8]> = sector_a
             .iter()
@@ -948,11 +948,42 @@ pub type ContractResult<T> = Result<T, ContractionError>;
 - `PathOptimizer::optimize` re-validates shapes against the `IndexMap` for defense-in-depth.
 - `ContractionExecutor::execute` checks that input tensor shapes match the plan's `IndexMap` before the first arithmetic operation.
 - `SparseContractionExecutor::execute` additionally verifies flux conservation for each sector pair in debug builds via `#[cfg(debug_assertions)]`.
-- Errors propagate via `?` and the `#[from]` chain: `TkError` → `ContractionError::Core`, `SymmetryError` → `ContractionError::Symmetry`, `LinAlgError` → `ContractionError::LinAlg`.
+- Errors propagate via `?` and the `#[from]` chain: `TkError` -> `ContractionError::Core`, `SymmetryError` -> `ContractionError::Symmetry`, `LinAlgError` -> `ContractionError::LinAlg`.
 
 ---
 
-## 12. Feature Flags
+## 12. Public API Surface
+
+```rust
+// tk-contract/src/lib.rs
+
+pub mod index;
+pub mod graph;
+pub mod cost;
+pub mod optimizer;
+pub mod executor;
+pub mod reshape;
+pub mod sparse;
+pub mod structural;
+pub mod error;
+
+// Flat re-exports for ergonomic downstream use:
+pub use index::{IndexId, TensorId, IndexSpec, ContractionSpec, IndexMap};
+pub use graph::{ContractionNode, ContractionGraph};
+pub use cost::CostMetric;
+pub use optimizer::{PathOptimizer, GreedyOptimizer, DPOptimizer, TreeSAOptimizer};
+pub use executor::{ContractionExecutor, ExecutionPlan};
+pub use sparse::SparseContractionExecutor;
+pub use structural::{StructuralContractionHook, AbelianHook};
+pub use error::{ContractionError, ContractResult};
+
+// Re-export NoQ only within the crate; not part of the public API.
+pub(crate) use executor::NoQ;
+```
+
+---
+
+## 13. Feature Flags
 
 | Flag | Effect in tk-contract |
 |:-----|:----------------------|
@@ -968,7 +999,7 @@ pub type ContractResult<T> = Result<T, ContractionError>;
 
 ---
 
-## 13. Build-Level Concerns
+## 14. Build-Level Concerns
 
 `tk-contract/build.rs` performs one check:
 
@@ -987,7 +1018,7 @@ fn main() {
 
 ---
 
-## 14. Dependencies
+## 15. Dependencies and Integration
 
 ```toml
 # tk-contract/Cargo.toml
@@ -1023,109 +1054,41 @@ parallel         = ["tk-linalg/parallel"]
 
 ---
 
-## 15. Implementation Notes and Design Decisions
+## 16. Testing Strategy
 
-### Note 1 — Optimizer Caching is the Caller's Responsibility
-
-`ContractionExecutor` and `SparseContractionExecutor` do not cache `ContractionGraph` objects internally. The DMRG sweep engine in `tk-dmrg` caches `ExecutionPlan`s per-pattern (left environment update, right environment update, two-site effective Hamiltonian, etc.) and calls `needs_rebuild` after each SVD truncation to detect shape changes. This places the caching logic at the level that has semantic knowledge of when shapes change.
-
-### Note 2 — Two Execution Strategies for Non-Contiguous Inputs
-
-When the `ContractionExecutor` encounters contracted legs that are non-contiguous in the current `TensorShape`:
-
-- **Strategy A (Strided micro-kernels):** If the backend is `DeviceFaer`, faer's arbitrary-stride GEMM handles non-unit strides natively. No transpose is needed. Zero additional memory allocation. This is the preferred path.
-- **Strategy B (Block-transpose + standard GEMM):** For BLAS backends (`DeviceMKL`, `DeviceOpenBLAS`) that require at least one unit stride, `block_transpose` (§7.2) materializes a contiguous copy in the `SweepArena` before calling `gemm`. The cache-oblivious 16×16 tile size balances L1 cache capacity (typically 32–64 KB) against loop overhead.
-
-Strategy selection is performed at compile time via a `cfg` attribute on the `tensor_to_mat_ref` implementation, keyed to the active backend feature flag.
-
-### Note 3 — Conjugation Flag Propagation
-
-The path optimizer marks a pairwise step as requiring a Hermitian conjugate when the free indices of the right operand must appear in transposed order in the output. This mark is translated into `is_conjugated = true` on the corresponding `MatRef` inside `tensor_to_mat_ref`, costing zero bytes of data movement. The backend sees a normal `gemm` call with a conjugated view. This is traceable to design document §3.2 and §6.2.
-
-### Note 4 — Bosonic Legs Only
-
-The executor applies no automatic sign corrections when contracted legs are permuted. Jordan-Wigner sign strings for fermionic models are pre-encoded in MPO matrix elements by `tk-dmrg::mpo_compiler`. Any fermionic model that uses `tk-contract` without properly Jordan-Wigner-transformed MPO tensors will silently produce wrong results. This is a physics responsibility of the caller. Design document §6.4 documents this as an explicit, intentional design decision (correct for all 1D chain and star-to-chain geometries through Phase 4).
-
-### Note 5 — `ExecutionPlan` Invalidation
-
-An `ExecutionPlan` must be rebuilt when a bond dimension changes after SVD truncation. The simplest implementation stores the `IndexMap` snapshot at build time and compares it against the current shapes on every call to `needs_rebuild`. For DMRG, bond dimensions change only at the end of an SVD step, so the comparison runs O(n_tensors × rank) per sweep step — negligible overhead compared to the GEMM. A more sophisticated implementation could use a version counter on each tensor, but the shape-comparison approach is simpler, correct, and sufficient for the target use case.
-
-### Note 6 — SU(2) Refactoring Scope
-
-The `StructuralContractionHook` trait is injected into `SparseContractionExecutor` from day one, keeping the Abelian code path completely unchanged when SU(2) support is added. The known Phase 5+ refactoring requirements (fusion-rule multiplicity fan-out, output-sector collision map-reduce) live inside the SU(2) implementation of `StructuralContractionHook`, not in the executor's task-generation loop. The Abelian `AbelianHook` implementation remains a zero-cost no-op. This design decision is traceable to design document §4.4 (non-Abelian roadmap) and §6 (contraction engine, structural callback).
-
-### Note 7 — `NoQ` Sentinel Type
-
-The `NoQ` sentinel allows `ExecutionPlan` and `ContractionExecutor` to be uniformly generic over `Q: BitPackable` without requiring callers on the dense path to choose a quantum-number type. `NoQ` is not exported and carries no overhead (all its methods are `#[inline(always)]` trivial returns). It is an implementation artifact, not a design concept visible to consumers.
-
----
-
-## 16. Public API Surface (`lib.rs`)
-
-```rust
-// tk-contract/src/lib.rs
-
-pub mod index;
-pub mod graph;
-pub mod cost;
-pub mod optimizer;
-pub mod executor;
-pub mod reshape;
-pub mod sparse;
-pub mod structural;
-pub mod error;
-
-// Flat re-exports for ergonomic downstream use:
-pub use index::{IndexId, TensorId, IndexSpec, ContractionSpec, IndexMap};
-pub use graph::{ContractionNode, ContractionGraph};
-pub use cost::CostMetric;
-pub use optimizer::{PathOptimizer, GreedyOptimizer, DPOptimizer, TreeSAOptimizer};
-pub use executor::{ContractionExecutor, ExecutionPlan};
-pub use sparse::SparseContractionExecutor;
-pub use structural::{StructuralContractionHook, AbelianHook};
-pub use error::{ContractionError, ContractResult};
-
-// Re-export NoQ only within the crate; not part of the public API.
-pub(crate) use executor::NoQ;
-```
-
----
-
-## 17. Testing Strategy
-
-### 17.1 Unit Tests
+### 16.1 Unit Tests
 
 | Test | Description |
 |:-----|:------------|
 | `spec_new_valid_two_tensor` | Two tensors with one contracted pair; verify `contracted_pairs()` and `free_indices()` |
-| `spec_new_index_too_many_times` | Three tensors sharing one index → `IndexAppearsTooManyTimes` |
-| `spec_new_duplicate_on_tensor` | One tensor with repeated IndexId → `DuplicateIndexOnTensor` |
-| `spec_new_output_index_not_free` | Output index is contracted → `OutputIndexNotFree` |
-| `spec_dimension_mismatch_detected` | Contracted pair with dim 3 vs dim 4 → `DimensionMismatch` |
+| `spec_new_index_too_many_times` | Three tensors sharing one index -> `IndexAppearsTooManyTimes` |
+| `spec_new_duplicate_on_tensor` | One tensor with repeated IndexId -> `DuplicateIndexOnTensor` |
+| `spec_new_output_index_not_free` | Output index is contracted -> `OutputIndexNotFree` |
+| `spec_dimension_mismatch_detected` | Contracted pair with dim 3 vs dim 4 -> `DimensionMismatch` |
 | `greedy_optimizer_two_tensor` | Two tensors; verify graph has one `Contraction` node |
 | `greedy_optimizer_three_tensor_order` | Three tensors of different sizes; verify greedily picked cheapest first |
 | `dp_optimizer_recovers_greedy_at_small_n` | n=3, verify DP gives same or lower cost than greedy |
-| `treesa_optimizer_seed_reproducible` | Same seed → same graph for n=6 |
+| `treesa_optimizer_seed_reproducible` | Same seed -> same graph for n=6 |
 | `cost_metric_flop_count` | `flop_count(4, 5, 6)` == 240 |
-| `cost_metric_zero_conjugation_cost` | Hermitian-transpose step → `transpose_cost_bytes` == 0 |
-| `cost_metric_noncontiguous_has_cost` | Non-contiguous tensor → positive `transpose_cost_bytes` |
-| `executor_two_tensor_outer_product` | No contracted indices → result is outer product |
-| `executor_two_tensor_trace` | One contracted pair → matrix multiply result matches manual computation |
+| `cost_metric_zero_conjugation_cost` | Hermitian-transpose step -> `transpose_cost_bytes` == 0 |
+| `cost_metric_noncontiguous_has_cost` | Non-contiguous tensor -> positive `transpose_cost_bytes` |
+| `executor_two_tensor_outer_product` | No contracted indices -> result is outer product |
+| `executor_two_tensor_trace` | One contracted pair -> matrix multiply result matches manual computation |
 | `executor_three_tensor_chain` | A·B·C chain contraction; result matches numpy.einsum reference |
 | `executor_hermitian_flag_propagated` | Check that adjoint input sets `is_conjugated`, not a data copy |
 | `executor_arena_lifetime_enforced` | (compile-fail) Result TempTensor<'arena> must not outlive arena |
 | `execution_plan_no_rebuild_same_shapes` | `needs_rebuild` returns false for unchanged shapes |
-| `execution_plan_rebuild_after_bond_change` | Change one tensor's bond dim → `needs_rebuild` returns true |
+| `execution_plan_rebuild_after_bond_change` | Change one tensor's bond dim -> `needs_rebuild` returns true |
 | `sparse_executor_u1_two_site` | Block-sparse contraction with U1 symmetry; sector_keys sorted in output |
 | `sparse_executor_flux_conserved` | Output tensor flux == fuse(flux_a, flux_b) for all inputs |
-| `sparse_executor_flux_mismatch_error` | Mismatched input fluxes → `FluxMismatch` error |
+| `sparse_executor_flux_mismatch_error` | Mismatched input fluxes -> `FluxMismatch` error |
 | `abelian_hook_single_output` | `AbelianHook::compute_output_sectors` always returns exactly one entry |
 | `abelian_hook_unit_coefficient` | Coefficient from `AbelianHook` is always `T::one()` |
-| `block_transpose_round_trip` | Transpose then inverse-transpose → original data |
-| `tensor_to_mat_ref_zero_copy_contiguous` | Contiguous input → `MatRef` data pointer equals input slice pointer |
-| `tensor_to_mat_ref_copies_noncontiguous` | Non-contiguous input → data pointer differs (copy performed) |
+| `block_transpose_round_trip` | Transpose then inverse-transpose -> original data |
+| `tensor_to_mat_ref_zero_copy_contiguous` | Contiguous input -> `MatRef` data pointer equals input slice pointer |
+| `tensor_to_mat_ref_copies_noncontiguous` | Non-contiguous input -> data pointer differs (copy performed) |
 
-### 17.2 Property-Based Tests
+### 16.2 Property-Based Tests
 
 ```rust
 use proptest::prelude::*;
@@ -1182,7 +1145,7 @@ proptest! {
 }
 ```
 
-### 17.3 Snapshot / Reference Tests
+### 16.3 Snapshot / Reference Tests
 
 ```rust
 /// Validate against ITensor/numpy reference values stored in `fixtures/`.
@@ -1201,7 +1164,7 @@ fn sparse_two_site_h_eff_matches_dense() {
 }
 ```
 
-### 17.4 CI Benchmark Gates
+### 16.4 CI Benchmark Gates
 
 Use `iai`/`divan` for instruction counting in CI (not wall-clock time):
 
@@ -1231,20 +1194,57 @@ fn bench_sparse_u1_two_site(c: &mut Criterion) {
 
 ---
 
+## 17. Implementation Notes and Design Decisions
+
+### Note 1 — Optimizer Caching is the Caller's Responsibility
+
+`ContractionExecutor` and `SparseContractionExecutor` do not cache `ContractionGraph` objects internally. The DMRG sweep engine in `tk-dmrg` caches `ExecutionPlan`s per-pattern (left environment update, right environment update, two-site effective Hamiltonian, etc.) and calls `needs_rebuild` after each SVD truncation to detect shape changes. This places the caching logic at the level that has semantic knowledge of when shapes change.
+
+### Note 2 — Two Execution Strategies for Non-Contiguous Inputs
+
+When the `ContractionExecutor` encounters contracted legs that are non-contiguous in the current `TensorShape`:
+
+- **Strategy A (Strided micro-kernels):** If the backend is `DeviceFaer`, faer's arbitrary-stride GEMM handles non-unit strides natively. No transpose is needed. Zero additional memory allocation. This is the preferred path.
+- **Strategy B (Block-transpose + standard GEMM):** For BLAS backends (`DeviceMKL`, `DeviceOpenBLAS`) that require at least one unit stride, `block_transpose` (§7.2) materializes a contiguous copy in the `SweepArena` before calling `gemm`. The cache-oblivious 16×16 tile size balances L1 cache capacity (typically 32–64 KB) against loop overhead.
+
+Strategy selection is performed at compile time via a `cfg` attribute on the `tensor_to_mat_ref` implementation, keyed to the active backend feature flag.
+
+### Note 3 — Conjugation Flag Propagation
+
+The path optimizer marks a pairwise step as requiring a Hermitian conjugate when the free indices of the right operand must appear in transposed order in the output. This mark is translated into `is_conjugated = true` on the corresponding `MatRef` inside `tensor_to_mat_ref`, costing zero bytes of data movement. The backend sees a normal `gemm` call with a conjugated view. This is traceable to design document §3.2 and §6.2.
+
+### Note 4 — Bosonic Legs Only
+
+The executor applies no automatic sign corrections when contracted legs are permuted. Jordan-Wigner sign strings for fermionic models are pre-encoded in MPO matrix elements by `tk-dmrg::mpo_compiler`. Any fermionic model that uses `tk-contract` without properly Jordan-Wigner-transformed MPO tensors will silently produce wrong results. This is a physics responsibility of the caller. Design document §6.4 documents this as an explicit, intentional design decision (correct for all 1D chain and star-to-chain geometries through Phase 4).
+
+### Note 5 — `ExecutionPlan` Invalidation
+
+An `ExecutionPlan` must be rebuilt when a bond dimension changes after SVD truncation. The simplest implementation stores the `IndexMap` snapshot at build time and compares it against the current shapes on every call to `needs_rebuild`. For DMRG, bond dimensions change only at the end of an SVD step, so the comparison runs O(n_tensors × rank) per sweep step — negligible overhead compared to the GEMM. A more sophisticated implementation could use a version counter on each tensor, but the shape-comparison approach is simpler, correct, and sufficient for the target use case.
+
+### Note 6 — SU(2) Refactoring Scope
+
+The `StructuralContractionHook` trait is injected into `SparseContractionExecutor` from day one, keeping the Abelian code path completely unchanged when SU(2) support is added. The known Phase 5+ refactoring requirements (fusion-rule multiplicity fan-out, output-sector collision map-reduce) live inside the SU(2) implementation of `StructuralContractionHook`, not in the executor's task-generation loop. The Abelian `AbelianHook` implementation remains a zero-cost no-op. This design decision is traceable to design document §4.4 (non-Abelian roadmap) and §6 (contraction engine, structural callback).
+
+### Note 7 — `NoQ` Sentinel Type
+
+The `NoQ` sentinel allows `ExecutionPlan` and `ContractionExecutor` to be uniformly generic over `Q: BitPackable` without requiring callers on the dense path to choose a quantum-number type. `NoQ` is not exported and carries no overhead (all its methods are `#[inline(always)]` trivial returns). It is an implementation artifact, not a design concept visible to consumers.
+
+---
+
 ## 18. Out of Scope
 
 The following are explicitly **not** implemented in `tk-contract`:
 
-- MPS / MPO data structures and canonicality management (→ `tk-dmrg`)
-- OpSum → MPO compilation and SVD compression (→ `tk-dmrg`)
-- Iterative eigensolvers (Lanczos, Davidson) (→ `tk-dmrg`)
-- SVD truncation of tensor network bonds (→ `tk-linalg`, `tk-dmrg`)
-- Fermionic swap gates or automatic Jordan-Wigner string insertion (→ `tk-dmrg` via MPO; deferred to Phase 5+ for tree/PEPS)
-- SU(2) Clebsch-Gordan coefficient computation or caching (→ `tk-symmetry::ClebschGordanCache`; injected into this crate via `StructuralContractionHook`)
-- DMFT self-consistency loop or TDVP time evolution (→ `tk-dmft`)
-- Physical operator definitions (`SpinOp`, `FermionOp`, `BosonOp`) (→ `tk-dsl`)
-- Python bindings or GIL management (→ `tk-python`)
-- BLAS/SVD/EVD dispatch logic (→ `tk-linalg`)
+- MPS / MPO data structures and canonicality management (-> `tk-dmrg`)
+- OpSum -> MPO compilation and SVD compression (-> `tk-dmrg`)
+- Iterative eigensolvers (Lanczos, Davidson) (-> `tk-dmrg`)
+- SVD truncation of tensor network bonds (-> `tk-linalg`, `tk-dmrg`)
+- Fermionic swap gates or automatic Jordan-Wigner string insertion (-> `tk-dmrg` via MPO; deferred to Phase 5+ for tree/PEPS)
+- SU(2) Clebsch-Gordan coefficient computation or caching (-> `tk-symmetry::ClebschGordanCache`; injected into this crate via `StructuralContractionHook`)
+- DMFT self-consistency loop or TDVP time evolution (-> `tk-dmft`)
+- Physical operator definitions (`SpinOp`, `FermionOp`, `BosonOp`) (-> `tk-dsl`)
+- Python bindings or GIL management (-> `tk-python`)
+- BLAS/SVD/EVD dispatch logic (-> `tk-linalg`)
 
 ---
 
@@ -1252,10 +1252,10 @@ The following are explicitly **not** implemented in `tk-contract`:
 
 | # | Question | Status |
 |:--|:---------|:-------|
-| 1 | Should `ContractionGraph::execution_order()` be made `pub` to allow `tk-dmrg` to inspect the planned GEMM sequence for diagnostic purposes, or should it remain `pub(crate)` to preserve encapsulation? | Deferred; keep `pub(crate)` for now; add accessor if `tk-dmrg` needs it |
-| 2 | Should `DPOptimizer` use a memoization cache keyed on tensor-subset bitvectors, or construct a flat DP table? Flat table is faster for n ≤ 12 but requires O(2^n) memory upfront. | Implement flat table; benchmark before optimizing |
-| 3 | `TreeSAOptimizer` requires a reproducible RNG for testing. Should it use `rand::SeedableRng::seed_from_u64` (portable) or `rand_xoshiro` (faster, also seedable)? | Use `rand_xoshiro256pp` for speed; seed stored in `TreeSAOptimizer::seed` |
-| 4 | For the `backend-cuda` path, should `SparseContractionExecutor` fall back to host-side GEMM for sectors smaller than a configurable threshold (to avoid kernel-launch overhead for tiny blocks)? | Benchmark on realistic DMRG sector distributions at D=1000 before deciding |
-| 5 | Should `ExecutionPlan::needs_rebuild` compare full `IndexMap` contents or only the dimensions (ignoring stride layout changes from permutations that don't affect shape)? | Compare only dimensions for invalidation; stride changes do not change the plan's index connectivity |
-| 6 | Is `NoQ` the right mechanism for the "no symmetry" dense path, or should `ContractionExecutor` and `ExecutionPlan` have separate non-generic versions? | Keep `NoQ`; the generic approach prevents code duplication and the zero-size type has no overhead |
-| 7 | The current design does not support hyperedge contractions (a single `IndexId` connecting three or more tensors). Is this needed for any planned use case through Phase 4? | No: DMRG and DMFT use only pairwise-decomposable networks; defer to Phase 5+ if needed |
+| 1 | Should `ContractionGraph::execution_order()` be made `pub` to allow `tk-dmrg` to inspect the planned GEMM sequence for diagnostic purposes, or should it remain `pub(crate)` to preserve encapsulation? | Deferred — keep `pub(crate)` for now; add accessor if `tk-dmrg` needs it |
+| 2 | Should `DPOptimizer` use a memoization cache keyed on tensor-subset bitvectors, or construct a flat DP table? Flat table is faster for n ≤ 12 but requires O(2^n) memory upfront. | Open — implement flat table; benchmark before optimizing |
+| 3 | `TreeSAOptimizer` requires a reproducible RNG for testing. Should it use `rand::SeedableRng::seed_from_u64` (portable) or `rand_xoshiro` (faster, also seedable)? | Resolved — use `rand_xoshiro256pp` for speed; seed stored in `TreeSAOptimizer::seed` |
+| 4 | For the `backend-cuda` path, should `SparseContractionExecutor` fall back to host-side GEMM for sectors smaller than a configurable threshold (to avoid kernel-launch overhead for tiny blocks)? | Open — benchmark on realistic DMRG sector distributions at D=1000 before deciding |
+| 5 | Should `ExecutionPlan::needs_rebuild` compare full `IndexMap` contents or only the dimensions (ignoring stride layout changes from permutations that don't affect shape)? | Resolved — compare only dimensions for invalidation |
+| 6 | Is `NoQ` the right mechanism for the "no symmetry" dense path, or should `ContractionExecutor` and `ExecutionPlan` have separate non-generic versions? | Resolved — keep `NoQ`; the generic approach prevents code duplication |
+| 7 | The current design does not support hyperedge contractions (a single `IndexId` connecting three or more tensors). Is this needed for any planned use case through Phase 4? | Resolved — DMRG and DMFT use only pairwise-decomposable networks; defer to Phase 5+ if needed |

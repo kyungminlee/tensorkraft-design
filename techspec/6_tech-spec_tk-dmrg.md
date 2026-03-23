@@ -1438,315 +1438,7 @@ pub type DmrgResult<T> = Result<T, DmrgError>;
 
 ---
 
-## 14. Data Structures and Internal Representations
-
-### 14.1 Tensor Leg Ordering Convention
-
-| Tensor | Rank | Leg order | Notes |
-|:-------|:-----|:----------|:------|
-| MPS site tensor A[i] | 3 | (σ, α_L, α_R) | σ = physical; α = MPS bond |
-| MPO site tensor W[i] | 4 | (σ_in, σ_out, w_L, w_R) | w = MPO bond |
-| Left environment L | 3 | (α_bra, w, α_ket) | bra above, ket below |
-| Right environment R | 3 | (α_bra, w, α_ket) | same convention as L |
-| Two-site tensor Θ | 4 | (σ_i, σ_{i+1}, α_L, α_R) | merged for 2-site update |
-| Bond matrix S | 2 | (α_L, α_R) | diagonal; D × D |
-
-### 14.2 Quantum Number Flow in U(1)-Symmetric MPS
-
-The flux rule for each MPS site tensor A[i] with legs (σ, α_L, α_R):
-```
-q(σ) + q(α_L) - q(α_R) = 0
-```
-The outgoing bond α_R carries the cumulative charge of sites 0..i. The total charge of the MPS is the charge carried by the rightmost bond (which equals `total_charge`).
-
-The left environment at site i carries charge q_L. The right environment at site i carries charge q_R such that q_L + q_W + q_R = total_charge, where q_W is the MPO flux (zero for Hermitian Hamiltonians).
-
-### 14.3 Memory Layout for Environments
-
-At D = 2000, w = 50, T = f64, the full environment tensor (dense) would be D × w × D × 8 bytes ≈ 1.6 GB per environment. With U(1) symmetry, typically 1/√D sectors are occupied, reducing to ~80 MB. Total for N = 100 sites: ~8 GB. A `max_env_memory` parameter (default 8 GB) in `DMRGConfig` triggers disk offloading of the most distant environments (see Implementation Note 3).
-
----
-
-## 15. Dependencies and Integration
-
-### 15.1 Upstream Dependencies (Cargo.toml)
-
-```toml
-[dependencies]
-tk-core      = { path = "../tk-core",     version = "0.1.0" }
-tk-symmetry  = { path = "../tk-symmetry", version = "0.1.0" }
-tk-linalg    = { path = "../tk-linalg",   version = "0.1.0" }
-tk-contract  = { path = "../tk-contract", version = "0.1.0" }
-tk-dsl       = { path = "../tk-dsl",      version = "0.1.0" }
-
-num-complex  = "0.4"
-num-traits   = "0.2"
-smallvec     = "1"
-rand         = "0.8"
-thiserror    = "1"
-
-serde        = { version = "1", features = ["derive"] }
-bincode      = "2"
-serde_json   = "1"
-
-tracing      = "0.1"
-
-[dev-dependencies]
-proptest     = "1"
-approx       = "0.5"
-rand_chacha  = "0.3"
-criterion    = { version = "0.5", optional = true }
-
-[features]
-default          = ["backend-faer", "backend-oxiblas", "parallel"]
-backend-faer     = ["tk-linalg/backend-faer"]
-backend-oxiblas  = ["tk-linalg/backend-oxiblas"]
-backend-mkl      = ["tk-linalg/backend-mkl"]
-backend-openblas = ["tk-linalg/backend-openblas"]
-backend-cuda     = ["tk-core/backend-cuda", "tk-linalg/backend-cuda"]
-su2-symmetry     = ["tk-symmetry/su2-symmetry", "tk-linalg/su2-symmetry"]
-parallel         = ["tk-linalg/parallel"]
-bench            = ["criterion"]
-```
-
-### 15.2 Downstream Consumers
-
-| Crate | Usage |
-|:------|:------|
-| `tk-dmft` | `DMRGEngine`, `TdvpDriver`, `MPS`, `MPO`, `MpoCompiler`, `DmrgResult` |
-| `tk-python` | Type-erased through `DmftLoopVariant` enum in `tk-dmft` |
-
-### 15.3 Integration Point: `tk-dsl` → `tk-dmrg`
-
-`tk-dsl` produces `OpSum<T>`. `MpoCompiler::compile` in `tk-dmrg` is the sole consumer of `OpSum`. This is the hard architectural boundary preventing a cyclic dependency: `tk-dsl` must not import `tk-linalg` (design doc §2.2).
-
-```rust
-// Full end-to-end usage:
-use tk_dsl::{hamiltonian, SpinOp};
-use tk_dmrg::{DMRGEngine, DMRGConfig, MpoCompiler, MpoCompressionConfig,
-              MPS, BondDimensionSchedule};
-use tk_linalg::DeviceFaer;
-use tk_symmetry::U1;
-
-let backend = DeviceFaer;
-
-// Phase 1: compile OpSum → MPO (runtime SVD compression)
-let opsum = hamiltonian! {
-    lattice: Chain(N = 100, d = 2);
-    sum i in 0..N-1 {
-        0.5 * (Sp(i) * Sm(i+1) + Sm(i) * Sp(i+1)) + Sz(i) * Sz(i+1)
-    }
-};
-let mpo: MPO<f64, U1> = MpoCompiler::new(&backend, MpoCompressionConfig {
-    max_bond_dim: 50,
-    svd_cutoff: 1e-12,
-    validate_compression: cfg!(debug_assertions),
-    compression_tol: 1e-8,
-}).compile(&opsum, 100, &vec![2; 100], U1(0))?;
-
-// Phase 2: run DMRG
-let mps = MPS::random(100, &vec![2; 100], 64, U1(0), 50, &mut rng)?;
-let mut engine = DMRGEngine::new(mps, mpo, backend, DMRGConfig {
-    bond_dim_schedule: BondDimensionSchedule::warmup(64, 500, 5),
-    ..DMRGConfig::default()
-})?;
-let ground_energy: f64 = engine.run()?;
-```
-
----
-
-## 16. Feature Flags
-
-| Flag | Effect in `tk-dmrg` |
-|:-----|:--------------------|
-| `backend-faer` | Propagates to `tk-linalg`; enables `DeviceFaer` for SVD/GEMM |
-| `backend-oxiblas` | Propagates to `tk-linalg`; enables `DeviceOxiblas` for sparse ops |
-| `backend-mkl` | Propagates to `tk-linalg`; enables FFI Intel MKL |
-| `backend-openblas` | Propagates to `tk-linalg`; enables FFI OpenBLAS |
-| `backend-cuda` | Propagates to `tk-core` and `tk-linalg`; `DMRGStats` gains `pinned_memory_fallbacks` counter |
-| `su2-symmetry` | Propagates to `tk-symmetry` and `tk-linalg`; enables multiplet-aware SVD truncation (two-phase: sort + snap to multiplet boundary; (2j+1)-weighted truncation error) |
-| `parallel` | Propagates to `tk-linalg`; enables Rayon-parallel LPT-scheduled block GEMM |
-
-`backend-mkl` and `backend-openblas` remain mutually exclusive, enforced by `tk-linalg/build.rs`. No additional `build.rs` is required in `tk-dmrg`.
-
----
-
-## 17. Testing Strategy
-
-### 17.1 Unit Tests
-
-| Test | Description |
-|:-----|:------------|
-| `mps_random_is_mixed_canonical` | A†A = I for all sites left of center; BB† = I for all sites right |
-| `mps_shift_center_preserves_state` | `shift_center(k)` changes `center` without changing `mps_overlap(mps, mps)` |
-| `mps_expose_absorb_bond_roundtrip` | `expose_bond().absorb_bond()` recovers the original state; overlap ≈ 1 |
-| `mps_entanglement_entropy_product_state` | Product state has S = 0 at all bonds |
-| `mpo_identity_energy` | `<ψ|I|ψ>` = `<ψ|ψ>` for any normalized ψ |
-| `mpo_compile_heisenberg_bond_dim` | Heisenberg OpSum compiles to MPO with bond dim ≤ 5 |
-| `mpo_compile_hubbard_bond_dim` | Hubbard model (with Jordan-Wigner strings) compiles to MPO bond dim ≤ 10 |
-| `mpo_add_scaled_bond_dim_additive` | H + α*H has bond dim = 2 * bond_dim(H) before compression |
-| `env_build_boundary_shape` | Left boundary has shape (1, 1, 1); right boundary same |
-| `env_grow_left_coverage` | After `grow_left(i)`, left env `up_to()` = i+1 |
-| `env_energy_matches_mps_energy` | Full environment contraction matches `mps_energy` |
-| `lanczos_hermitian_convergence` | Converges to known eigenvalue of a 10×10 diagonal test matrix |
-| `lanczos_thick_restart_correctness` | Thick restart does not degrade eigenvalue accuracy |
-| `davidson_fewer_iters_than_lanczos` | DavidsonSolver converges in fewer iterations for diagonal-dominant test |
-| `block_davidson_k_states` | Returns correct 3 lowest eigenvalues of a 20×20 test matrix |
-| `truncate_svd_bond_dim_capped` | Returned bond dim ≤ max_bond_dim |
-| `truncate_svd_cutoff_applied` | All retained singular values > svd_cutoff |
-| `truncate_svd_truncation_error_formula` | Truncation error = Σ_discarded σ² / Σ_all σ² |
-| `bond_dim_schedule_warmup_monotone` | Warmup schedule is non-decreasing and ends at D_max |
-| `dmrg_heisenberg_n4_energy` | N=4 Heisenberg energy matches exact diagonalization |
-| `dmrg_heisenberg_n8_energy` | N=8 energy within 1e-10 of ED |
-| `dmrg_converged_flag_triggers` | `converged()` returns true when energy change < `energy_tol` |
-| `dmrg_cancellation_flag` | `run_with_cancel_flag` returns `Cancelled` within 1 sweep step |
-| `tdvp_norm_conservation` | `||ψ(t)||` ≈ 1 for all t (Hermitian H, imaginary time → real convergence) |
-| `tdvp_tikhonov_no_nan` | Near-zero bond singular values do not produce NaN after Tikhonov regularization |
-| `expand_bond_subspace_orthogonality` | `||<A_L | R_null>||` < 1e-10 after expansion |
-| `expand_bond_subspace_dim_consistency` | A_L column count increases by D_expand; bond matrix shape (D+D_expand)×(D+D_expand) |
-| `expand_bond_subspace_vs_explicit` | Matrix-free projection matches explicit `(I - A_L·A_L†)·|R>` for small test case |
-| `soft_dmax_no_oscillation` | Bond dim does not oscillate between expansion and truncation over 20 steps |
-| `exp_krylov_matches_exact_expm` | `exp_krylov` on a 4×4 tridiagonal matches `scipy.linalg.expm` reference |
-| `checkpoint_write_read_roundtrip` | Write + read checkpoint recovers identical MPS energy and bond dims |
-| `assert_mps_equivalent_macro` | `assert_mps_equivalent!` passes for two gauge-rotated representations of the same state |
-
-### 17.2 Property-Based Tests
-
-```rust
-proptest! {
-    // Bounded: max 6 sites, max bond dim 8, max 4 sectors, 256 cases
-    #[test]
-    fn mps_left_canonicalize_orthogonality(
-        n_sites in 2usize..=6,
-        local_dim in 2usize..=4,
-        bond_dim in 1usize..=8,
-    ) {
-        // Construct random MPS, left-canonicalize, verify A†A = I at each site
-    }
-
-    #[test]
-    fn truncation_error_formula_correct(
-        singular_values in prop::collection::vec(0.01f64..=1.0, 2..=20),
-        max_bond_dim in 1usize..=10,
-    ) {
-        // Verify: truncation_error = sum_discarded(σ²) / sum_all(σ²)
-    }
-
-    #[test]
-    fn mpo_compile_preserves_hermiticity(
-        j_values in prop::collection::vec(-2.0f64..=2.0, 1..=3),
-    ) {
-        // Verify <ψ|H|φ> = conj(<φ|H|ψ>) for random MPS ψ, φ
-    }
-}
-```
-
-### 17.3 Reference Snapshot Tests
-
-```rust
-// fixtures/heisenberg_chain_n20_d500.json  (from ITensor, N=20)
-// fixtures/heisenberg_chain_n100_d200.json (from Block2, N=100)
-// fixtures/hubbard_n10_u4_d200.json        (from ITensor, N=10)
-
-#[test]
-fn heisenberg_n20_energy_matches_itensor() {
-    let reference: ReferenceData = load_fixture("heisenberg_chain_n20_d500.json");
-    let energy = run_dmrg_heisenberg(n=20, d=500);
-    assert!((energy - reference.energy).abs() < 1e-10);
-}
-
-#[test]
-fn heisenberg_n100_truncation_error_acceptable() {
-    let result = run_dmrg_heisenberg(n=100, d=200);
-    assert!(result.max_truncation_error < 1e-6);
-}
-```
-
-Cross-backend tests use `assert_mps_equivalent!` and `assert_svd_equivalent!` macros to avoid spurious failures from SVD sign gauge freedom (design doc §12.1.1).
-
-### 17.4 Compile-Fail Tests
-
-```rust
-// tests/compile_fail/wrong_gauge_dmrg_step.rs
-fn wrong_gauge_rejected() {
-    let mps: MPS<f64, U1, LeftCanonical> = /* ... */;
-    // must not compile: dmrg_step_two_site requires MixedCanonical
-    let engine = DMRGEngine { mps, /* ... */ };
-    engine.dmrg_step_two_site(0, SweepDirection::LeftToRight);
-}
-```
-
-### 17.5 Performance Benchmarks
-
-| Benchmark | Condition | Target |
-|:----------|:----------|:-------|
-| `bench_two_site_step` | N=100, D=200, U(1) | < 50 ms per step (DeviceFaer) |
-| `bench_env_grow_left` | D=500, w=5 | < 5 ms per site |
-| `bench_lanczos` | dim=8000, 100 iterations | < 200 ms |
-| `bench_svd_truncation` | 4000×4000 dense matrix | < 500 ms (gesdd) |
-| `bench_full_sweep` | N=100, D=200 | < 10 s per full sweep |
-| `bench_mpo_compile_heisenberg` | N=100 | < 2 s |
-
-CI uses `iai`/`divan` instruction counting with ±2% regression threshold. Criterion wall-clock benchmarks reserved for local bare-metal.
-
----
-
-## 18. Implementation Notes and Design Decisions
-
-### Note 1: Why In-House Eigensolvers
-
-Off-the-shelf Rust eigensolvers such as `eigenvalues` accept dense matrix types and cannot be adapted to the `Fn(&[T], &mut [T])` closure required for zero-allocation H_eff matvec. Wrapping the effective Hamiltonian in a dense matrix would require materializing a D²d × D²d matrix (up to 64 million elements at D=2000, d=4) — defeating the entire purpose of DMRG. Additionally, in-house implementations allow thick-restart state management and pre-allocation from `SweepArena` that external crates cannot provide. This decision is specified in design doc §8.2 and §11.
-
-### Note 2: Two-Site vs. Single-Site Updates
-
-The two-site update (§8.2) diagonalizes a rank-4 object of size d²·D² and allows bond dimension growth (SVD can produce up to d·D new singular values per site). It is required for the first warmup sweeps. Single-site updates (§8.2) are O(d D³) per step and cannot grow the bond dimension; they are used for the final convergence sweeps. The `UpdateVariant` enum selects between them. An adaptive policy (start two-site, switch to single-site when truncation error drops below a threshold) can be layered on top of `DMRGConfig`.
-
-### Note 3: Environment Memory Scaling
-
-For large systems (N=200, D=1000, w=50), full in-memory environment caching requires ~10 GB. Two strategies are available:
-1. **On-the-fly recomputation**: Recompute environments from scratch at each sweep-direction reversal. Cost: one extra O(N·d·D²·w) pass per sweep.
-2. **Partial caching with disk offload**: Keep only the k nearest environments in memory; serialize distant ones via `checkpoint.rs`. A `max_env_memory` field in `DMRGConfig` (default: 8 GB) triggers this automatically.
-
-The Phase 3 implementation uses full in-memory caching. Disk offloading is deferred pending benchmarks.
-
-### Note 4: OpSum → MPO via Finite-State Automaton
-
-The `MpoCompiler` translates `OpSum` terms into an MPO via the finite-state automaton (FSA) method. Each term (e.g., `J * Sz(i) * Sz(i+1)`) defines a path through the FSA, contributing one row/column to the MPO transfer matrix at each site. For nearest-neighbor models, the FSA gives the exact minimal-bond-dim MPO (Heisenberg = 5, Hubbard ≈ 8) without SVD compression. For long-range models the uncompressed bond dim is O(N); SVD compression reduces it to `max_bond_dim`. The standard approach used by ITensor and TeNPy.
-
-### Note 5: Fermionic Sign Convention
-
-The `tk-contract` engine is bosonic-only (design doc §6.4). Jordan-Wigner strings for fermionic models are encoded in the MPO tensors by `MpoCompiler::compile`. The Jordan-Wigner string operator F = (−1)^N is inserted between fermionic creation/annihilation operators by the compiler. This is correct for all 1D chain and star-to-chain geometries through Phase 4. Native fermionic swap gates for tree/PEPS are deferred to Phase 5+.
-
-### Note 6: Checkpoint Atomicity
-
-Checkpoint writes use `write_to_temp + rename` to guarantee atomic updates. On POSIX systems, `rename(2)` is atomic within the same filesystem. On Windows, `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` provides similar semantics. The implementation uses `std::fs::rename` across all platforms.
-
-### Note 7: SU(2) Multiplet-Aware Truncation
-
-Under the `su2-symmetry` feature flag, `truncate_svd` implements two-phase truncation (design doc §4.4):
-1. Sort all singular values by magnitude.
-2. Snap the truncation boundary to the nearest multiplet edge (never split a 2j+1-degenerate multiplet).
-3. Weight discarded values by (2j+1)·σ_i² in the truncation error sum.
-
-`TruncationConfig` is extended (under `su2-symmetry`) with `multiplet_info: Option<Vec<(SU2Irrep, usize)>>` supplying the sector structure. When `None`, standard scalar truncation applies (Abelian path unchanged).
-
-### Note 8: `DefaultEngine` Type Alias
-
-Per design doc §5.4, only the most common concrete combination is compiled by default:
-
-```rust
-#[cfg(all(
-    feature = "backend-faer",
-    not(any(feature = "backend-mkl", feature = "backend-openblas"))
-))]
-pub type DefaultEngine = DMRGEngine<f64, tk_symmetry::U1, tk_linalg::DeviceFaer>;
-```
-
-Additional combinations (e.g., `Complex<f64>` for real-time TDVP, `Z2` for parity-symmetric models) are compiled only when explicitly requested via feature flags.
-
----
-
-## 19. Public API Surface (`lib.rs`)
+## 14. Public API Surface
 
 ```rust
 // tk-dmrg/src/lib.rs
@@ -1827,21 +1519,329 @@ pub type DefaultEngine = DMRGEngine<f64, tk_symmetry::U1, tk_linalg::DeviceFaer>
 
 ---
 
+## 15. Feature Flags
+
+| Flag | Effect in `tk-dmrg` |
+|:-----|:--------------------|
+| `backend-faer` | Propagates to `tk-linalg`; enables `DeviceFaer` for SVD/GEMM |
+| `backend-oxiblas` | Propagates to `tk-linalg`; enables `DeviceOxiblas` for sparse ops |
+| `backend-mkl` | Propagates to `tk-linalg`; enables FFI Intel MKL |
+| `backend-openblas` | Propagates to `tk-linalg`; enables FFI OpenBLAS |
+| `backend-cuda` | Propagates to `tk-core` and `tk-linalg`; `DMRGStats` gains `pinned_memory_fallbacks` counter |
+| `su2-symmetry` | Propagates to `tk-symmetry` and `tk-linalg`; enables multiplet-aware SVD truncation (two-phase: sort + snap to multiplet boundary; (2j+1)-weighted truncation error) |
+| `parallel` | Propagates to `tk-linalg`; enables Rayon-parallel LPT-scheduled block GEMM |
+
+`backend-mkl` and `backend-openblas` remain mutually exclusive, enforced by `tk-linalg/build.rs`. No additional `build.rs` is required in `tk-dmrg`.
+
+---
+
+## 16. Data Structures and Internal Representations
+
+### 16.1 Tensor Leg Ordering Convention
+
+| Tensor | Rank | Leg order | Notes |
+|:-------|:-----|:----------|:------|
+| MPS site tensor A[i] | 3 | (σ, α_L, α_R) | σ = physical; α = MPS bond |
+| MPO site tensor W[i] | 4 | (σ_in, σ_out, w_L, w_R) | w = MPO bond |
+| Left environment L | 3 | (α_bra, w, α_ket) | bra above, ket below |
+| Right environment R | 3 | (α_bra, w, α_ket) | same convention as L |
+| Two-site tensor Θ | 4 | (σ_i, σ_{i+1}, α_L, α_R) | merged for 2-site update |
+| Bond matrix S | 2 | (α_L, α_R) | diagonal; D × D |
+
+### 16.2 Quantum Number Flow in U(1)-Symmetric MPS
+
+The flux rule for each MPS site tensor A[i] with legs (σ, α_L, α_R):
+```
+q(σ) + q(α_L) - q(α_R) = 0
+```
+The outgoing bond α_R carries the cumulative charge of sites 0..i. The total charge of the MPS is the charge carried by the rightmost bond (which equals `total_charge`).
+
+The left environment at site i carries charge q_L. The right environment at site i carries charge q_R such that q_L + q_W + q_R = total_charge, where q_W is the MPO flux (zero for Hermitian Hamiltonians).
+
+### 16.3 Memory Layout for Environments
+
+At D = 2000, w = 50, T = f64, the full environment tensor (dense) would be D × w × D × 8 bytes ≈ 1.6 GB per environment. With U(1) symmetry, typically 1/√D sectors are occupied, reducing to ~80 MB. Total for N = 100 sites: ~8 GB. A `max_env_memory` parameter (default 8 GB) in `DMRGConfig` triggers disk offloading of the most distant environments (see Implementation Note 3).
+
+---
+
+## 17. Dependencies and Integration
+
+### 17.1 Upstream Dependencies (Cargo.toml)
+
+```toml
+[dependencies]
+tk-core      = { path = "../tk-core",     version = "0.1.0" }
+tk-symmetry  = { path = "../tk-symmetry", version = "0.1.0" }
+tk-linalg    = { path = "../tk-linalg",   version = "0.1.0" }
+tk-contract  = { path = "../tk-contract", version = "0.1.0" }
+tk-dsl       = { path = "../tk-dsl",      version = "0.1.0" }
+
+num-complex  = "0.4"
+num-traits   = "0.2"
+smallvec     = "1"
+rand         = "0.8"
+thiserror    = "1"
+
+serde        = { version = "1", features = ["derive"] }
+bincode      = "2"
+serde_json   = "1"
+
+tracing      = "0.1"
+
+[dev-dependencies]
+proptest     = "1"
+approx       = "0.5"
+rand_chacha  = "0.3"
+criterion    = { version = "0.5", optional = true }
+
+[features]
+default          = ["backend-faer", "backend-oxiblas", "parallel"]
+backend-faer     = ["tk-linalg/backend-faer"]
+backend-oxiblas  = ["tk-linalg/backend-oxiblas"]
+backend-mkl      = ["tk-linalg/backend-mkl"]
+backend-openblas = ["tk-linalg/backend-openblas"]
+backend-cuda     = ["tk-core/backend-cuda", "tk-linalg/backend-cuda"]
+su2-symmetry     = ["tk-symmetry/su2-symmetry", "tk-linalg/su2-symmetry"]
+parallel         = ["tk-linalg/parallel"]
+bench            = ["criterion"]
+```
+
+### 17.2 Downstream Consumers
+
+| Crate | Usage |
+|:------|:------|
+| `tk-dmft` | `DMRGEngine`, `TdvpDriver`, `MPS`, `MPO`, `MpoCompiler`, `DmrgResult` |
+| `tk-python` | Type-erased through `DmftLoopVariant` enum in `tk-dmft` |
+
+### 17.3 Integration Point: `tk-dsl` -> `tk-dmrg`
+
+`tk-dsl` produces `OpSum<T>`. `MpoCompiler::compile` in `tk-dmrg` is the sole consumer of `OpSum`. This is the hard architectural boundary preventing a cyclic dependency: `tk-dsl` must not import `tk-linalg` (design doc §2.2).
+
+```rust
+// Full end-to-end usage:
+use tk_dsl::{hamiltonian, SpinOp};
+use tk_dmrg::{DMRGEngine, DMRGConfig, MpoCompiler, MpoCompressionConfig,
+              MPS, BondDimensionSchedule};
+use tk_linalg::DeviceFaer;
+use tk_symmetry::U1;
+
+let backend = DeviceFaer;
+
+// Phase 1: compile OpSum -> MPO (runtime SVD compression)
+let opsum = hamiltonian! {
+    lattice: Chain(N = 100, d = 2);
+    sum i in 0..N-1 {
+        0.5 * (Sp(i) * Sm(i+1) + Sm(i) * Sp(i+1)) + Sz(i) * Sz(i+1)
+    }
+};
+let mpo: MPO<f64, U1> = MpoCompiler::new(&backend, MpoCompressionConfig {
+    max_bond_dim: 50,
+    svd_cutoff: 1e-12,
+    validate_compression: cfg!(debug_assertions),
+    compression_tol: 1e-8,
+}).compile(&opsum, 100, &vec![2; 100], U1(0))?;
+
+// Phase 2: run DMRG
+let mps = MPS::random(100, &vec![2; 100], 64, U1(0), 50, &mut rng)?;
+let mut engine = DMRGEngine::new(mps, mpo, backend, DMRGConfig {
+    bond_dim_schedule: BondDimensionSchedule::warmup(64, 500, 5),
+    ..DMRGConfig::default()
+})?;
+let ground_energy: f64 = engine.run()?;
+```
+
+---
+
+## 18. Testing Strategy
+
+### 18.1 Unit Tests
+
+| Test | Description |
+|:-----|:------------|
+| `mps_random_is_mixed_canonical` | A†A = I for all sites left of center; BB† = I for all sites right |
+| `mps_shift_center_preserves_state` | `shift_center(k)` changes `center` without changing `mps_overlap(mps, mps)` |
+| `mps_expose_absorb_bond_roundtrip` | `expose_bond().absorb_bond()` recovers the original state; overlap ≈ 1 |
+| `mps_entanglement_entropy_product_state` | Product state has S = 0 at all bonds |
+| `mpo_identity_energy` | `<ψ|I|ψ>` = `<ψ|ψ>` for any normalized ψ |
+| `mpo_compile_heisenberg_bond_dim` | Heisenberg OpSum compiles to MPO with bond dim ≤ 5 |
+| `mpo_compile_hubbard_bond_dim` | Hubbard model (with Jordan-Wigner strings) compiles to MPO bond dim ≤ 10 |
+| `mpo_add_scaled_bond_dim_additive` | H + α*H has bond dim = 2 * bond_dim(H) before compression |
+| `env_build_boundary_shape` | Left boundary has shape (1, 1, 1); right boundary same |
+| `env_grow_left_coverage` | After `grow_left(i)`, left env `up_to()` = i+1 |
+| `env_energy_matches_mps_energy` | Full environment contraction matches `mps_energy` |
+| `lanczos_hermitian_convergence` | Converges to known eigenvalue of a 10×10 diagonal test matrix |
+| `lanczos_thick_restart_correctness` | Thick restart does not degrade eigenvalue accuracy |
+| `davidson_fewer_iters_than_lanczos` | DavidsonSolver converges in fewer iterations for diagonal-dominant test |
+| `block_davidson_k_states` | Returns correct 3 lowest eigenvalues of a 20×20 test matrix |
+| `truncate_svd_bond_dim_capped` | Returned bond dim ≤ max_bond_dim |
+| `truncate_svd_cutoff_applied` | All retained singular values > svd_cutoff |
+| `truncate_svd_truncation_error_formula` | Truncation error = Σ_discarded σ² / Σ_all σ² |
+| `bond_dim_schedule_warmup_monotone` | Warmup schedule is non-decreasing and ends at D_max |
+| `dmrg_heisenberg_n4_energy` | N=4 Heisenberg energy matches exact diagonalization |
+| `dmrg_heisenberg_n8_energy` | N=8 energy within 1e-10 of ED |
+| `dmrg_converged_flag_triggers` | `converged()` returns true when energy change < `energy_tol` |
+| `dmrg_cancellation_flag` | `run_with_cancel_flag` returns `Cancelled` within 1 sweep step |
+| `tdvp_norm_conservation` | `||ψ(t)||` ≈ 1 for all t (Hermitian H, imaginary time -> real convergence) |
+| `tdvp_tikhonov_no_nan` | Near-zero bond singular values do not produce NaN after Tikhonov regularization |
+| `expand_bond_subspace_orthogonality` | `||<A_L | R_null>||` < 1e-10 after expansion |
+| `expand_bond_subspace_dim_consistency` | A_L column count increases by D_expand; bond matrix shape (D+D_expand)×(D+D_expand) |
+| `expand_bond_subspace_vs_explicit` | Matrix-free projection matches explicit `(I - A_L·A_L†)·|R>` for small test case |
+| `soft_dmax_no_oscillation` | Bond dim does not oscillate between expansion and truncation over 20 steps |
+| `exp_krylov_matches_exact_expm` | `exp_krylov` on a 4×4 tridiagonal matches `scipy.linalg.expm` reference |
+| `checkpoint_write_read_roundtrip` | Write + read checkpoint recovers identical MPS energy and bond dims |
+| `assert_mps_equivalent_macro` | `assert_mps_equivalent!` passes for two gauge-rotated representations of the same state |
+
+### 18.2 Property-Based Tests
+
+```rust
+proptest! {
+    // Bounded: max 6 sites, max bond dim 8, max 4 sectors, 256 cases
+    #[test]
+    fn mps_left_canonicalize_orthogonality(
+        n_sites in 2usize..=6,
+        local_dim in 2usize..=4,
+        bond_dim in 1usize..=8,
+    ) {
+        // Construct random MPS, left-canonicalize, verify A†A = I at each site
+    }
+
+    #[test]
+    fn truncation_error_formula_correct(
+        singular_values in prop::collection::vec(0.01f64..=1.0, 2..=20),
+        max_bond_dim in 1usize..=10,
+    ) {
+        // Verify: truncation_error = sum_discarded(σ²) / sum_all(σ²)
+    }
+
+    #[test]
+    fn mpo_compile_preserves_hermiticity(
+        j_values in prop::collection::vec(-2.0f64..=2.0, 1..=3),
+    ) {
+        // Verify <ψ|H|φ> = conj(<φ|H|ψ>) for random MPS ψ, φ
+    }
+}
+```
+
+### 18.3 Reference Snapshot Tests
+
+```rust
+// fixtures/heisenberg_chain_n20_d500.json  (from ITensor, N=20)
+// fixtures/heisenberg_chain_n100_d200.json (from Block2, N=100)
+// fixtures/hubbard_n10_u4_d200.json        (from ITensor, N=10)
+
+#[test]
+fn heisenberg_n20_energy_matches_itensor() {
+    let reference: ReferenceData = load_fixture("heisenberg_chain_n20_d500.json");
+    let energy = run_dmrg_heisenberg(n=20, d=500);
+    assert!((energy - reference.energy).abs() < 1e-10);
+}
+
+#[test]
+fn heisenberg_n100_truncation_error_acceptable() {
+    let result = run_dmrg_heisenberg(n=100, d=200);
+    assert!(result.max_truncation_error < 1e-6);
+}
+```
+
+Cross-backend tests use `assert_mps_equivalent!` and `assert_svd_equivalent!` macros to avoid spurious failures from SVD sign gauge freedom (design doc §12.1.1).
+
+### 18.4 Compile-Fail Tests
+
+```rust
+// tests/compile_fail/wrong_gauge_dmrg_step.rs
+fn wrong_gauge_rejected() {
+    let mps: MPS<f64, U1, LeftCanonical> = /* ... */;
+    // must not compile: dmrg_step_two_site requires MixedCanonical
+    let engine = DMRGEngine { mps, /* ... */ };
+    engine.dmrg_step_two_site(0, SweepDirection::LeftToRight);
+}
+```
+
+### 18.5 Performance Benchmarks
+
+| Benchmark | Condition | Target |
+|:----------|:----------|:-------|
+| `bench_two_site_step` | N=100, D=200, U(1) | < 50 ms per step (DeviceFaer) |
+| `bench_env_grow_left` | D=500, w=5 | < 5 ms per site |
+| `bench_lanczos` | dim=8000, 100 iterations | < 200 ms |
+| `bench_svd_truncation` | 4000×4000 dense matrix | < 500 ms (gesdd) |
+| `bench_full_sweep` | N=100, D=200 | < 10 s per full sweep |
+| `bench_mpo_compile_heisenberg` | N=100 | < 2 s |
+
+CI uses `iai`/`divan` instruction counting with ±2% regression threshold. Criterion wall-clock benchmarks reserved for local bare-metal.
+
+---
+
+## 19. Implementation Notes and Design Decisions
+
+### Note 1 — Why In-House Eigensolvers
+
+Off-the-shelf Rust eigensolvers such as `eigenvalues` accept dense matrix types and cannot be adapted to the `Fn(&[T], &mut [T])` closure required for zero-allocation H_eff matvec. Wrapping the effective Hamiltonian in a dense matrix would require materializing a D²d × D²d matrix (up to 64 million elements at D=2000, d=4) — defeating the entire purpose of DMRG. Additionally, in-house implementations allow thick-restart state management and pre-allocation from `SweepArena` that external crates cannot provide. This decision is specified in design doc §8.2 and §11.
+
+### Note 2 — Two-Site vs. Single-Site Updates
+
+The two-site update (§8.2) diagonalizes a rank-4 object of size d²·D² and allows bond dimension growth (SVD can produce up to d·D new singular values per site). It is required for the first warmup sweeps. Single-site updates (§8.2) are O(d D³) per step and cannot grow the bond dimension; they are used for the final convergence sweeps. The `UpdateVariant` enum selects between them. An adaptive policy (start two-site, switch to single-site when truncation error drops below a threshold) can be layered on top of `DMRGConfig`.
+
+### Note 3 — Environment Memory Scaling
+
+For large systems (N=200, D=1000, w=50), full in-memory environment caching requires ~10 GB. Two strategies are available:
+1. **On-the-fly recomputation**: Recompute environments from scratch at each sweep-direction reversal. Cost: one extra O(N·d·D²·w) pass per sweep.
+2. **Partial caching with disk offload**: Keep only the k nearest environments in memory; serialize distant ones via `checkpoint.rs`. A `max_env_memory` field in `DMRGConfig` (default: 8 GB) triggers this automatically.
+
+The Phase 3 implementation uses full in-memory caching. Disk offloading is deferred pending benchmarks.
+
+### Note 4 — OpSum -> MPO via Finite-State Automaton
+
+The `MpoCompiler` translates `OpSum` terms into an MPO via the finite-state automaton (FSA) method. Each term (e.g., `J * Sz(i) * Sz(i+1)`) defines a path through the FSA, contributing one row/column to the MPO transfer matrix at each site. For nearest-neighbor models, the FSA gives the exact minimal-bond-dim MPO (Heisenberg = 5, Hubbard ≈ 8) without SVD compression. For long-range models the uncompressed bond dim is O(N); SVD compression reduces it to `max_bond_dim`. The standard approach used by ITensor and TeNPy.
+
+### Note 5 — Fermionic Sign Convention
+
+The `tk-contract` engine is bosonic-only (design doc §6.4). Jordan-Wigner strings for fermionic models are encoded in the MPO tensors by `MpoCompiler::compile`. The Jordan-Wigner string operator F = (−1)^N is inserted between fermionic creation/annihilation operators by the compiler. This is correct for all 1D chain and star-to-chain geometries through Phase 4. Native fermionic swap gates for tree/PEPS are deferred to Phase 5+.
+
+### Note 6 — Checkpoint Atomicity
+
+Checkpoint writes use `write_to_temp + rename` to guarantee atomic updates. On POSIX systems, `rename(2)` is atomic within the same filesystem. On Windows, `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` provides similar semantics. The implementation uses `std::fs::rename` across all platforms.
+
+### Note 7 — SU(2) Multiplet-Aware Truncation
+
+Under the `su2-symmetry` feature flag, `truncate_svd` implements two-phase truncation (design doc §4.4):
+1. Sort all singular values by magnitude.
+2. Snap the truncation boundary to the nearest multiplet edge (never split a 2j+1-degenerate multiplet).
+3. Weight discarded values by (2j+1)·σ_i² in the truncation error sum.
+
+`TruncationConfig` is extended (under `su2-symmetry`) with `multiplet_info: Option<Vec<(SU2Irrep, usize)>>` supplying the sector structure. When `None`, standard scalar truncation applies (Abelian path unchanged).
+
+### Note 8 — `DefaultEngine` Type Alias
+
+Per design doc §5.4, only the most common concrete combination is compiled by default:
+
+```rust
+#[cfg(all(
+    feature = "backend-faer",
+    not(any(feature = "backend-mkl", feature = "backend-openblas"))
+))]
+pub type DefaultEngine = DMRGEngine<f64, tk_symmetry::U1, tk_linalg::DeviceFaer>;
+```
+
+Additional combinations (e.g., `Complex<f64>` for real-time TDVP, `Z2` for parity-symmetric models) are compiled only when explicitly requested via feature flags.
+
+---
+
 ## 20. Out of Scope
 
 The following are explicitly **not** implemented in `tk-dmrg`:
 
-- DMFT self-consistency loop, bath discretization, Anderson impurity model (→ `tk-dmft`)
-- Python bindings and GIL management (→ `tk-python`)
-- TEBD (Trotterized time evolution) as a primary method (→ `tk-dmft`; TEBD is a DMFT fallback, not a DMRG concern)
-- Linear prediction and Chebyshev expansion for spectral functions (→ `tk-dmft`)
-- Multi-dimensional (2D PEPS) or tree tensor network algorithms (→ Phase 5+)
-- Native fermionic swap gates in the contraction engine (→ `tk-contract`, Phase 5+)
-- MPI-distributed tensor contractions (→ `tk-linalg`/`tk-dmft`, Phase 5+)
-- `#[pyclass]` Python-accessible wrappers (→ `tk-python`)
-- Block-sparse GEMM dispatch and LPT scheduling (→ `tk-linalg`)
-- DAG contraction path optimization (→ `tk-contract`)
-- Index types and operator enum definitions (→ `tk-dsl`)
+- DMFT self-consistency loop, bath discretization, Anderson impurity model (-> `tk-dmft`)
+- Python bindings and GIL management (-> `tk-python`)
+- TEBD (Trotterized time evolution) as a primary method (-> `tk-dmft`; TEBD is a DMFT fallback, not a DMRG concern)
+- Linear prediction and Chebyshev expansion for spectral functions (-> `tk-dmft`)
+- Multi-dimensional (2D PEPS) or tree tensor network algorithms (-> Phase 5+)
+- Native fermionic swap gates in the contraction engine (-> `tk-contract`, Phase 5+)
+- MPI-distributed tensor contractions (-> `tk-linalg`/`tk-dmft`, Phase 5+)
+- `#[pyclass]` Python-accessible wrappers (-> `tk-python`)
+- Block-sparse GEMM dispatch and LPT scheduling (-> `tk-linalg`)
+- DAG contraction path optimization (-> `tk-contract`)
+- Index types and operator enum definitions (-> `tk-dsl`)
 
 ---
 
@@ -1855,5 +1855,5 @@ The following are explicitly **not** implemented in `tk-dmrg`:
 | 4 | Should `MpoCompiler` expose an `MpoCompressionStrategy` enum (FSA-only vs. FSA + SVD), or always apply SVD? For short-range models, FSA-only gives the exact minimal-bond-dim MPO; SVD adds overhead. | Open — determine whether the overhead is material during Phase 2 |
 | 5 | `run_idmrg` takes a unit-cell MPO (2 sites). For non-trivial unit cells (dimerized chains, multi-orbital Hubbard), the unit cell size should be configurable. Add `unit_cell_size: usize` to `IDmrgConfig`? | Deferred — required only when iDMRG is tested with non-trivial unit cells |
 | 6 | Should `energy_variance` be computed during the sweep (at the cost of one extra H² matvec per site, ~50% overhead per sweep) or only on-demand after convergence? The `variance_tol` criterion makes per-sweep computation useful. | Open — profile cost before choosing default |
-| 7 | `TruncationConfig::multiplet_info` (SU(2) only) introduces a `Vec<(SU2Irrep, usize)>` into the common truncation path. A `TruncationPolicy` trait (with `select_cutoff` method) may decouple the SU(2)-specific type from the generic code path. | Deferred to when `su2-symmetry` is actively implemented |
+| 7 | `TruncationConfig::multiplet_info` (SU(2) only) introduces a `Vec<(SU2Irrep, usize)>` into the common truncation path. A `TruncationPolicy` trait (with `select_cutoff` method) may decouple the SU(2)-specific type from the generic code path. | Deferred — `su2-symmetry` is actively implemented |
 | 8 | Should `BlockSparseTensor` derive `serde::Serialize` (propagating a `serde` dependency into `tk-symmetry`) or should `tk-dmrg` define its own `SerializedBlockSparseTensor` serialization proxy? | Open — check `serde` feature-gating conventions used across the workspace |
