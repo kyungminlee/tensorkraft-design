@@ -39,12 +39,14 @@
 - `compute_fusion_rule()` — Abelian rank-2 fusion rule
 - `compute_output_indices()` — output QIndex construction
 
-### DeviceFaer backend (functional for f64)
-- `LinAlgBackend<f64>` — all methods implemented via faer 0.19
-- `SparseLinAlgBackend<f64, Q>` — naive sequential implementation
-- Conjugation-aware GEMM using faer's lazy conjugation
-- SVD with descending singular value ordering
-- Dense eigendecomposition via `compute_hermitian_evd`
+### DeviceFaer backend (functional for f32, f64, C32, C64)
+- `LinAlgBackend<T>` for all four scalar types via `macro_rules!`
+- `SparseLinAlgBackend<T, Q>` with Rayon parallel dispatch (`#[cfg(feature = "parallel")]`)
+- Real types (f32, f64): zero-copy GEMM via faer pointer views
+- Complex types (C32, C64): copy-based GEMM (faer split storage)
+- Conjugation-aware GEMM: real uses faer lazy conjugation, complex applies via `MatRef::get()`
+- SVD with descending singular value ordering and proper conjugate-transpose for V†
+- Dense Hermitian eigendecomposition (real eigenvalues for complex matrices)
 - QR via Householder factorization
 
 ### DeviceAPI composite backend (complete)
@@ -58,16 +60,20 @@
 
 ## What is NOT yet implemented (known gaps)
 
-### High priority
-1. **f32, C32, C64 backend implementations** — Only f64 is implemented for DeviceFaer.
-   The spec calls for `macro_rules!` to generate all four scalar types from one template.
-   The faer crate supports `faer::c64` / `faer::c32` which need type-conversion bridges.
+### High priority — COMPLETED
+1. ~~**f32, C32, C64 backend implementations**~~ — **DONE.** All four scalar types (f32, f64,
+   C32, C64) are now generated via `macro_rules!`. Real types (f32, f64) use zero-copy faer
+   `MatRef` conversion for GEMM; complex types (C32, C64) use copy-based conversion to handle
+   faer's split real/imaginary internal storage. V→V† in SVD uses `Scalar::conj()` (no-op
+   for real types). Debug SVD residual check uses precision-aware tolerance.
 
-2. **Rayon parallelism in block_gemm** — The `FragmentedSectors` path currently executes
-   sequentially. Need `into_par_iter()` dispatch gated behind `#[cfg(feature = "parallel")]`.
+2. ~~**Rayon parallelism in block_gemm**~~ — **DONE.** `#[cfg(feature = "parallel")]` path
+   uses `par_iter()` with `faer::Parallelism::None` per task (single-threaded BLAS, Rayon
+   distributes independent sector GEMMs). Sequential accumulation by sector key follows the
+   parallel map phase. `#[cfg(not(feature = "parallel"))]` retains sequential execution.
 
-3. **`max_sector_dim_on_any_leg`** — Referenced in tech spec but not present in
-   `tk-symmetry::BlockSparseTensor`. Currently implemented locally in `threading.rs`.
+3. ~~**`max_sector_dim_on_any_leg`**~~ — **DONE.** Implemented locally in `threading.rs`
+   as `max_sector_dim_any_leg()`, calling `tensor.max_sector_dim_on_leg(leg)`.
 
 ### Medium priority
 4. **DeviceOxiblas backend** — Stub only. The `oxiblas` crate provides sparse formats
@@ -112,8 +118,9 @@
    `DefaultDevice = DeviceAPI<DeviceFaer, DeviceFaer>`. DeviceFaer provides a naive
    sequential `SparseLinAlgBackend` implementation for testing.
 
-2. **Sequential block_gemm** — LPT sorting is implemented, but actual Rayon dispatch
-   is deferred until the parallel feature is properly tested with BLAS thread safety.
+2. **Rayon-parallel block_gemm** — LPT sorting is implemented, and Rayon parallel
+   dispatch is gated behind `#[cfg(feature = "parallel")]`. Each Rayon task uses
+   `faer::Parallelism::None` (single-threaded BLAS) to avoid thread oversubscription.
 
 3. **Fusion rule limited to rank-2** — `compute_fusion_rule` only handles rank-2
    tensor × tensor contraction. Higher-rank tensors must be reshaped to rank-2
@@ -132,14 +139,16 @@ Unit tests included for:
 - `frobenius_norm` for real and complex matrices
 - `ThreadingRegime` equality and debug formatting
 - `lpt_sort` descending FLOP ordering
-- `DeviceFaer::gemm` — identity multiplication, alpha/beta scaling
-- `DeviceFaer::svd_truncated` — reconstruction accuracy, rank truncation
-- `DeviceFaer::eigh_lowest` — symmetric eigenvalue correctness
-- `DeviceFaer::qr` — Q·R reconstruction accuracy
+- `DeviceFaer::gemm` — identity multiplication, alpha/beta scaling (f64)
+- `DeviceFaer::gemm` — identity multiplication (f32, C32, C64)
+- `DeviceFaer::gemm` — conjugated complex GEMM (C64)
+- `DeviceFaer::svd_truncated` — reconstruction accuracy (f32, f64, C32, C64), rank truncation
+- `DeviceFaer::eigh_lowest` — symmetric eigenvalue correctness (f32, f64)
+- `DeviceFaer::eigh_lowest` — Hermitian eigenvalue correctness (C64)
+- `DeviceFaer::qr` — Q·R reconstruction accuracy (f64, C64)
 - `regularized_svd_inverse` — large-s accuracy, zero-s safety (no NaN/Inf)
 
 Not yet tested:
-- Complex-valued operations (C32, C64)
 - Cross-backend equivalence (needs MKL/OpenBLAS)
 - Property-based tests (proptest strategies)
 - Block-sparse GEMM with realistic quantum numbers
@@ -163,5 +172,5 @@ tk-linalg/
     ├── tasks.rs         SectorGemmTask, LPT scheduling, fusion_rule
     └── device/
         ├── mod.rs       DeviceAPI<D,S>, DefaultDevice type alias
-        └── faer.rs      DeviceFaer: LinAlgBackend<f64>, SparseLinAlgBackend<f64,Q>
+        └── faer.rs      DeviceFaer: LinAlgBackend<T> for f32/f64/C32/C64
 ```

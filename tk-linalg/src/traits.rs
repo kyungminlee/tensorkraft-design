@@ -55,11 +55,20 @@ pub trait LinAlgBackend<T: Scalar>: Send + Sync {
                         let eps = <T::Real as num_traits::Float>::epsilon();
                         if norm > eps {
                             let rel = residual / norm;
+                            // Use 1e-10 for f64 (64-bit) and eps^(3/4) for f32 (32-bit).
+                            // eps^(3/4) ≈ 4e-6 for f32, ≈ 5e-12 for f64.
+                            let eps_threshold =
+                                num_traits::Float::sqrt(eps) * num_traits::Float::sqrt(num_traits::Float::sqrt(eps));
                             let threshold = <T::Real as num_traits::NumCast>::from(1e-10_f64)
-                                .unwrap_or(eps);
+                                .unwrap_or(eps_threshold);
+                            let threshold = if threshold < eps_threshold {
+                                eps_threshold
+                            } else {
+                                threshold
+                            };
                             debug_assert!(
                                 rel < threshold,
-                                "gesdd SVD reconstruction residual exceeds tolerance 1e-10",
+                                "gesdd SVD reconstruction residual exceeds tolerance",
                             );
                         }
                     }
