@@ -267,6 +267,16 @@ impl<'a, T: Scalar> DenseTensor<'a, T> {
     }
 }
 
+impl<T: Scalar> Clone for DenseTensor<'static, T> {
+    fn clone(&self) -> Self {
+        DenseTensor {
+            shape: self.shape.clone(),
+            storage: self.storage.clone(),
+            offset: self.offset,
+        }
+    }
+}
+
 impl<T: Scalar> std::fmt::Debug for DenseTensor<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DenseTensor")
@@ -425,5 +435,15 @@ mod tests {
         assert_eq!(m.cols, 4);
         assert_eq!(m.get(0, 0), 4.0);  // original[1,0]
         assert_eq!(m.get(1, 3), 11.0); // original[2,3]
+    }
+
+    #[test]
+    fn dense_tensor_clone() {
+        let data: Vec<f64> = (0..6).map(|i| i as f64).collect();
+        let t = DenseTensor::from_vec(TensorShape::row_major(&[2, 3]), data);
+        let t2 = t.clone();
+        assert_eq!(t.numel(), t2.numel());
+        assert_eq!(t.as_slice()[..6], t2.as_slice()[..6]);
+        assert_eq!(t.shape(), t2.shape());
     }
 }

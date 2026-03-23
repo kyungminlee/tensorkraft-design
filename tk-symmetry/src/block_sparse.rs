@@ -860,6 +860,18 @@ impl<T: Scalar, Q: BitPackable> BlockSparseTensor<T, Q> {
     }
 }
 
+impl<T: Scalar, Q: BitPackable> Clone for BlockSparseTensor<T, Q> {
+    fn clone(&self) -> Self {
+        BlockSparseTensor {
+            indices: self.indices.clone(),
+            sector_keys: self.sector_keys.clone(),
+            sector_blocks: self.sector_blocks.clone(),
+            flux: self.flux.clone(),
+            leg_directions: self.leg_directions.clone(),
+        }
+    }
+}
+
 impl<T: Scalar, Q: BitPackable> std::fmt::Debug for BlockSparseTensor<T, Q> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockSparseTensor")
@@ -1100,5 +1112,16 @@ mod tests {
         let fused = t.fuse_legs(0..2);
         assert_eq!(fused.rank(), 1);
         assert_eq!(fused.nnz(), original_nnz);
+    }
+
+    #[test]
+    fn block_sparse_clone() {
+        let (indices, dirs) = make_test_indices();
+        let t = BlockSparseTensor::<f64, U1>::zeros(indices, U1::identity(), dirs);
+        let t2 = t.clone();
+        assert_eq!(t.rank(), t2.rank());
+        assert_eq!(t.n_sectors(), t2.n_sectors());
+        assert_eq!(t.nnz(), t2.nnz());
+        assert_eq!(t.flux, t2.flux);
     }
 }

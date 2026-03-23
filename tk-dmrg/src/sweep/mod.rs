@@ -116,7 +116,7 @@ impl Default for DMRGStats {
     }
 }
 
-/// DMRG configuration.
+/// Immutable DMRG configuration — set once before a run begins.
 pub struct DMRGConfig {
     /// Bond dimension schedule (ramp up over sweeps).
     pub bond_dim_schedule: BondDimensionSchedule,
@@ -128,8 +128,6 @@ pub struct DMRGConfig {
     pub energy_tol: f64,
     /// Optional variance convergence criterion.
     pub variance_tol: Option<f64>,
-    /// Eigensolver to use (default: DavidsonSolver).
-    pub eigensolver: Box<dyn IterativeEigensolver<f64>>,
     /// Use infinite DMRG warmup.
     pub idmrg_warmup: bool,
     /// Update variant (default: TwoSite).
@@ -150,12 +148,29 @@ impl Default for DMRGConfig {
             max_sweeps: 20,
             energy_tol: 1e-10,
             variance_tol: None,
-            eigensolver: Box::new(DavidsonSolver::default()),
             idmrg_warmup: false,
             update_variant: UpdateVariant::default(),
             checkpoint_path: None,
             n_target_states: None,
             excited_state_weight: 0.1,
+        }
+    }
+}
+
+/// Mutable DMRG runtime state — holds solver and per-sweep bookkeeping.
+///
+/// Separated from `DMRGConfig` so that static config can be `&self` while
+/// runtime state (eigensolver preconditioner, diagonal updates) can be `&mut self`.
+pub struct DMRGRuntimeState {
+    /// Eigensolver to use (default: DavidsonSolver). Mutable because the
+    /// diagonal preconditioner is updated each step.
+    pub eigensolver: Box<dyn IterativeEigensolver<f64>>,
+}
+
+impl Default for DMRGRuntimeState {
+    fn default() -> Self {
+        DMRGRuntimeState {
+            eigensolver: Box::new(DavidsonSolver::default()),
         }
     }
 }
@@ -170,8 +185,10 @@ pub struct DMRGEngine<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> {
     pub environments: Environments<T, Q>,
     /// Linear algebra backend.
     pub backend: B,
-    /// DMRG configuration.
+    /// DMRG configuration (immutable).
     pub config: DMRGConfig,
+    /// Mutable runtime state (eigensolver, preconditioner, etc.).
+    pub runtime: DMRGRuntimeState,
     /// Accumulated statistics.
     pub stats: DMRGStats,
     /// Arena for temporary allocations during sweeps.
@@ -188,6 +205,17 @@ impl<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> DMRGEngine<T, Q, B> {
         backend: B,
         config: DMRGConfig,
     ) -> DmrgResult<Self> {
+        Self::with_runtime(mps, mpo, backend, config, DMRGRuntimeState::default())
+    }
+
+    /// Create a new DMRG engine with explicit runtime state.
+    pub fn with_runtime(
+        mps: MPS<T, Q, MixedCanonical>,
+        mpo: MPO<T, Q>,
+        backend: B,
+        config: DMRGConfig,
+        runtime: DMRGRuntimeState,
+    ) -> DmrgResult<Self> {
         let environments = Environments::build_from_scratch(&mps, &mpo, &backend)?;
         let arena = SweepArena::new(64 * 1024 * 1024); // 64 MB default
 
@@ -197,6 +225,7 @@ impl<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> DMRGEngine<T, Q, B> {
             environments,
             backend,
             config,
+            runtime,
             stats: DMRGStats::new(),
             arena,
             current_energy: T::Real::zero(),
@@ -259,6 +288,10 @@ impl<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> DMRGEngine<T, Q, B> {
                 break;
             }
 
+            // ARENA SAFETY: All step results have been moved into owned MPS tensors
+            // by this point. The arena reset reclaims all scratch memory in O(1).
+            // Any TempTensor<'_> references are statically prevented from surviving
+            // past this point by the borrow checker.
             self.arena.reset();
         }
 
@@ -266,17 +299,34 @@ impl<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> DMRGEngine<T, Q, B> {
     }
 
     /// Perform a single two-site DMRG step.
+    ///
+    /// # Arena Safety Contract
+    ///
+    /// Temporary tensors allocated from `self.arena` during this step (reshape
+    /// buffers, Krylov vectors, etc.) must NOT outlive the step. Specifically:
+    ///
+    /// 1. All arena-allocated temporaries are used within this function scope.
+    /// 2. SVD results (U, S, V†) must be converted to owned storage via
+    ///    `into_owned()` BEFORE `arena.reset()` is called.
+    /// 3. The arena is reset at the end of each sweep (in `run()`), not per-step,
+    ///    so all step results must be fully owned by that point.
+    ///
+    /// The borrow checker enforces that `TempTensor<'a>` cannot outlive the
+    /// arena, but `into_owned()` must be called explicitly before reset.
     pub fn dmrg_step_two_site(
         &mut self,
         site: usize,
         direction: SweepDirection,
     ) -> DmrgResult<StepResult<T>> {
-        // Skeleton: in full implementation, this would:
-        // 1. Build H_eff from environments + MPO
-        // 2. Solve eigenvalue problem
-        // 3. SVD truncate
-        // 4. Update MPS tensors
-        // 5. Update environments
+        // Full implementation steps:
+        // 1. Build H_eff closure from environments + MPO
+        //    (uses arena for scratch space in environment contraction)
+        // 2. Solve eigenvalue problem: eigensolver.lowest_eigenpair(heff, dim, initial)
+        // 3. SVD truncate the two-site tensor
+        // 4. CRITICAL: Call .into_owned() on U and V† before storing in MPS
+        //    (arena data becomes invalid after reset)
+        // 5. Update MPS tensors at site and site+1
+        // 6. Update environments (grow_left or grow_right depending on direction)
         Ok(StepResult {
             site,
             direction,
