@@ -6,13 +6,64 @@ use tk_core::{DenseTensor, MatRef, Scalar, TensorShape};
 
 use crate::error::ContractResult;
 
+/// Result of reshaping a tensor into matrix form for GEMM dispatch.
+///
+/// When the zero-copy fast path is unavailable (non-contiguous or contracted
+/// legs not trailing), this struct owns the heap-allocated transposed copy
+/// and provides a `MatRef` that borrows from it.
+pub struct ReshapeResult<'a, T: Scalar> {
+    /// Dimensions of the free legs, in order. Needed to unfold the GEMM
+    /// result back into a tensor.
+    pub free_dims: Vec<usize>,
+    /// Product of free-leg dimensions (M for left operand, N for right).
+    pub rows: usize,
+    /// Product of contracted-leg dimensions (K).
+    pub cols: usize,
+    /// Whether Hermitian conjugation should be flagged on the MatRef.
+    pub conjugated: bool,
+    /// The data source: either a reference to the original tensor's storage
+    /// (zero-copy fast path) or owned transposed storage (slow path).
+    data: ReshapeData<'a, T>,
+}
+
+enum ReshapeData<'a, T: Scalar> {
+    /// Zero-copy: borrowed from the original tensor.
+    Borrowed(&'a [T]),
+    /// Heap-allocated transposed copy.
+    Owned(DenseTensor<'static, T>),
+}
+
+impl<'a, T: Scalar> ReshapeResult<'a, T> {
+    /// Create a `MatRef` from this reshape result.
+    pub fn as_mat_ref(&self) -> MatRef<'_, T> {
+        let data = match &self.data {
+            ReshapeData::Borrowed(s) => *s,
+            ReshapeData::Owned(t) => t.as_slice(),
+        };
+        MatRef {
+            data,
+            rows: self.rows,
+            cols: self.cols,
+            row_stride: self.cols as isize,
+            col_stride: 1,
+            is_conjugated: self.conjugated,
+        }
+    }
+}
+
 /// Reshape a tensor into a 2-D matrix for GEMM dispatch.
 ///
 /// Fuses `contracted_legs` into one axis (K) and the remaining (free) legs
 /// into another axis (M for left operand, N for right operand).
 ///
-/// Returns `(MatRef, free_dims)` where `free_dims` are the dimensions of
-/// the free legs in order, needed to unfold the result back into a tensor.
+/// # Contiguity fast path vs. transpose slow path
+///
+/// When the tensor is contiguous and contracted legs are trailing (rightmost),
+/// the result is a zero-copy view into the tensor's storage.
+///
+/// When either condition fails, the tensor is transposed via `block_transpose`
+/// into a contiguous heap buffer where free legs come first and contracted
+/// legs are trailing. The `ReshapeResult` owns this buffer.
 ///
 /// # Conjugation propagation
 /// If `conjugated` is true, `is_conjugated` is set on the returned `MatRef`
@@ -21,7 +72,7 @@ pub fn tensor_to_mat_ref<'a, T: Scalar>(
     tensor: &'a DenseTensor<'a, T>,
     contracted_legs: &[usize],
     conjugated: bool,
-) -> ContractResult<(MatRef<'a, T>, Vec<usize>)> {
+) -> ContractResult<ReshapeResult<'a, T>> {
     let shape = tensor.shape();
     let dims = shape.dims();
     let rank = shape.rank();
@@ -40,38 +91,42 @@ pub fn tensor_to_mat_ref<'a, T: Scalar>(
 
     let free_dim_product: usize = free_dims.iter().product();
 
-    // For now, we require contiguous row-major layout. The contracted legs
-    // must be the trailing legs (rightmost) for zero-copy reshape to work.
-    // If not, we'd need to transpose first. For the draft, we always use
-    // the gather path to produce a contiguous view.
-    //
-    // TODO: Optimize by checking if contracted legs are already trailing
-    // and contiguous, enabling zero-copy reshape.
-    let data = if shape.is_contiguous() && are_trailing_legs(contracted_legs, rank) {
-        // Zero-copy: contracted legs are trailing in a contiguous tensor.
-        tensor.as_slice()
+    if shape.is_contiguous() && are_trailing_legs(contracted_legs, rank) {
+        // Zero-copy fast path: contracted legs are trailing in contiguous storage.
+        Ok(ReshapeResult {
+            free_dims,
+            rows: free_dim_product,
+            cols: contracted_dim_product,
+            conjugated,
+            data: ReshapeData::Borrowed(tensor.as_slice()),
+        })
     } else {
-        // For now, fall back to the slice we have. In a full implementation,
-        // we'd allocate from the arena and transpose. Since DenseTensor
-        // doesn't give us owned data easily here, we use the raw slice
-        // and rely on the strides being correct.
-        tensor.as_slice()
-    };
+        // Slow path: transpose so free legs come first, contracted legs trail.
+        let mut perm = Vec::with_capacity(rank);
+        for leg in 0..rank {
+            if !contracted_legs.contains(&leg) {
+                perm.push(leg);
+            }
+        }
+        for leg in 0..rank {
+            if contracted_legs.contains(&leg) {
+                perm.push(leg);
+            }
+        }
 
-    let mat = MatRef {
-        data,
-        rows: free_dim_product,
-        cols: contracted_dim_product,
-        row_stride: contracted_dim_product as isize,
-        col_stride: 1,
-        is_conjugated: conjugated,
-    };
-
-    Ok((mat, free_dims))
+        let transposed = block_transpose(tensor, &perm);
+        Ok(ReshapeResult {
+            free_dims,
+            rows: free_dim_product,
+            cols: contracted_dim_product,
+            conjugated,
+            data: ReshapeData::Owned(transposed),
+        })
+    }
 }
 
 /// Check if the contracted legs are the trailing (rightmost) legs.
-fn are_trailing_legs(contracted_legs: &[usize], rank: usize) -> bool {
+pub(crate) fn are_trailing_legs(contracted_legs: &[usize], rank: usize) -> bool {
     if contracted_legs.is_empty() {
         return true;
     }
@@ -81,6 +136,19 @@ fn are_trailing_legs(contracted_legs: &[usize], rank: usize) -> bool {
     // Check that they form a contiguous range at the end.
     sorted.last() == Some(&(rank - 1))
         && sorted.first() == Some(&(rank - n))
+}
+
+/// Check if the contracted legs are the leading (leftmost) legs.
+pub(crate) fn are_leading_legs(contracted_legs: &[usize], _rank: usize) -> bool {
+    if contracted_legs.is_empty() {
+        return true;
+    }
+    let mut sorted = contracted_legs.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    // Check that they form a contiguous range starting at 0.
+    sorted.first() == Some(&0)
+        && sorted.last() == Some(&(n - 1))
 }
 
 /// Reconstruct a `DenseTensor` from a flat result buffer and target shape.
@@ -177,5 +245,54 @@ mod tests {
         assert_eq!(t.shape().dims(), &[2, 3, 4]);
         assert_eq!(t.numel(), 24);
         assert_eq!(t.as_slice()[..24], data[..]);
+    }
+
+    #[test]
+    fn leading_legs_check() {
+        assert!(are_leading_legs(&[0, 1], 4));
+        assert!(are_leading_legs(&[0], 4));
+        assert!(are_leading_legs(&[], 4));
+        assert!(!are_leading_legs(&[2, 3], 4));
+        assert!(!are_leading_legs(&[0, 2], 4)); // gap
+    }
+
+    #[test]
+    fn tensor_to_mat_ref_trailing_zero_copy() {
+        // 2x3 tensor, contract leg 1 (trailing) → should be zero-copy.
+        let data: Vec<f64> = (0..6).map(|i| i as f64).collect();
+        let t = DenseTensor::from_vec(TensorShape::row_major(&[2, 3]), data);
+        let result = tensor_to_mat_ref(&t, &[1], false).unwrap();
+
+        assert_eq!(result.rows, 2); // M = free dim
+        assert_eq!(result.cols, 3); // K = contracted dim
+        assert_eq!(result.free_dims, vec![2]);
+
+        let mat = result.as_mat_ref();
+        assert_eq!(mat.rows, 2);
+        assert_eq!(mat.cols, 3);
+    }
+
+    #[test]
+    fn tensor_to_mat_ref_non_trailing_transpose() {
+        // 2x3 tensor, contract leg 0 (leading, not trailing) → needs transpose.
+        let data: Vec<f64> = (0..6).map(|i| i as f64).collect();
+        let t = DenseTensor::from_vec(TensorShape::row_major(&[2, 3]), data);
+        let result = tensor_to_mat_ref(&t, &[0], false).unwrap();
+
+        assert_eq!(result.rows, 3); // M = free dim (leg 1, dim=3)
+        assert_eq!(result.cols, 2); // K = contracted dim (leg 0, dim=2)
+        assert_eq!(result.free_dims, vec![3]);
+
+        // Verify the transposed data is correct:
+        // Original: [[0,1,2],[3,4,5]], permuted to [leg1, leg0] = 3x2
+        // Transposed: [[0,3],[1,4],[2,5]]
+        let mat = result.as_mat_ref();
+        assert_eq!(mat.rows, 3);
+        assert_eq!(mat.cols, 2);
+        // Row 0: [0, 3], Row 1: [1, 4], Row 2: [2, 5]
+        assert!((mat.data[0] - 0.0).abs() < 1e-12);
+        assert!((mat.data[1] - 3.0).abs() < 1e-12);
+        assert!((mat.data[2] - 1.0).abs() < 1e-12);
+        assert!((mat.data[3] - 4.0).abs() < 1e-12);
     }
 }

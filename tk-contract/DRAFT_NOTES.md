@@ -1,7 +1,7 @@
 # tk-contract Draft Implementation Notes
 
-**Status:** Draft implementation — compiles, 26 tests pass, core abstractions functional.
-**Date:** March 2026
+**Status:** Draft implementation — compiles, 31 tests pass, medium-severity gaps resolved.
+**Date:** March 2026 (updated)
 
 ---
 
@@ -21,16 +21,11 @@
 
 ## Design Issues Discovered During Implementation
 
-### 1. `DenseTensor` lifetime makes executor generics painful
+### 1. `DenseTensor` lifetime makes executor generics painful — **RESOLVED**
 
 The spec assumes `ContractionExecutor::execute` can freely store and pass around `DenseTensor` references between steps. In practice, `DenseTensor<'a, T>` carries a lifetime `'a` tied to its storage. When intermediates (owned) and inputs (borrowed) coexist in the same `HashMap`, the lifetime annotations become difficult to reconcile.
 
-**Workaround used:** An `unsafe transmute` in `get_tensor()` to unify lifetimes between owned intermediates and borrowed inputs. This is sound in practice (intermediates outlive their use) but indicates the spec's type signatures need refinement.
-
-**Recommendation:** Consider either:
-- Making `DenseTensor` always own its data (use `Arc<[T]>` for cheap cloning)
-- Splitting the executor's storage into separate maps for inputs vs. intermediates with distinct lifetime parameters
-- Using an arena-based approach where all tensors (inputs and intermediates) live in the same arena
+**Resolution:** Implemented techspec §7.1 Option B — a `TensorRef<'a, T>` enum with `Borrowed` and `Owned` variants. The executor now maintains a single `HashMap<TensorId, TensorRef>` that safely holds both borrowed inputs and owned intermediates. The `unsafe transmute` has been removed entirely.
 
 ### 2. `BlockSparseTensor` does not implement `Clone`
 
@@ -53,22 +48,17 @@ The spec's B9 recommendation to cache `contracted_pairs()` and `free_indices()` 
 
 The review changed `ContractionNode::Contraction::contracted_indices` from `Vec<(IndexId, IndexId)>` to `Vec<IndexId>`. During implementation, this proved correct: since `ContractionSpec` uses shared `IndexId`s, the contracted indices in the DAG are naturally single IDs. The executor's `PairwiseStep` carries the *leg positions* (`left_contracted_legs`, `right_contracted_legs`) separately, which is what the GEMM reshape actually needs.
 
-### 5. The `IndexMap` dimension lookup pattern is awkward for intermediates
+### 5. The `IndexMap` dimension lookup pattern is awkward for intermediates — **RESOLVED**
 
 The optimizer uses `IndexMap` to look up dimensions by `(TensorId, leg_position)`. But intermediate results from pairwise contractions get assigned new `TensorId`s, and their dimensions must be computed on the fly from the input dimensions and contracted legs. The current `IndexMap` doesn't support this well — you'd need to insert intermediate specs during optimization, which mutates a structure the spec treats as read-only.
 
-**Workaround used:** The greedy optimizer computes M/K/N dimensions inline without going through `IndexMap` for intermediates. It directly examines the left/right node indices and looks up dims from the original `IndexMap`.
+**Resolution:** Per techspec §3.4 guidance, `NodeEntry` now carries a `dims: Vec<usize>` field alongside each node. For input nodes, dims are populated from the `IndexMap` at initialization. For intermediate nodes, dims are computed from the contracting pair's free-leg dimensions during `find_best_pair`. The `IndexMap` remains read-only throughout optimization.
 
-**Recommendation:** Either:
-- Allow `IndexMap` to be mutated during optimization (add intermediate specs)
-- Change the optimizer to carry its own working dimension map
-- Add a `compute_output_dims()` helper to `CostEstimator` that derives intermediate dimensions from input specs
-
-### 6. `tensor_to_mat_ref` requires arena allocation for non-contiguous inputs — spec is silent on fallback
+### 6. `tensor_to_mat_ref` requires arena allocation for non-contiguous inputs — **RESOLVED**
 
 The spec's `tensor_to_mat_ref` (§7.2) takes a `&SweepArena` parameter for allocating transposed copies of non-contiguous inputs. In the draft implementation, we don't have arena integration yet, so the fallback is to use the raw slice and hope strides work out. This means the draft only handles contiguous inputs correctly.
 
-**Recommendation:** The spec should explicitly document the "contiguous fast path" vs. "arena-allocated transpose" branching, and specify what happens when no arena is available (error? heap allocation? panic?).
+**Resolution:** `tensor_to_mat_ref` now returns a `ReshapeResult` struct that either borrows from the original tensor (zero-copy fast path when contiguous + trailing contracted legs) or owns a heap-allocated transposed copy (slow path via `block_transpose`). The `as_mat_ref()` method on `ReshapeResult` provides the `MatRef` from whichever source. `gather_for_gemm` in the executor was also fixed to properly reorder elements when contracted legs are non-trailing, using the same permutation logic.
 
 ### 7. Feature flags for backends not yet implemented in tk-linalg
 
@@ -99,15 +89,15 @@ The `AbelianHook::compute_output_sectors` implementation calls `qa.fuse(qb)` in 
 
 ## Gaps Between Spec and Reality
 
-| Spec Section | Issue | Severity |
-|:-------------|:------|:---------|
-| §7.1 (`ContractionExecutor`) | Spec shows arena parameter; actual `DenseTensor` lifetimes make arena integration non-trivial | Medium |
-| §7.2 (`tensor_to_mat_ref`) | Spec assumes arena is always available for transpose; no fallback documented | Medium |
-| §8 (`SparseContractionExecutor`) | Spec assumes `BlockSparseTensor` is cloneable; it's not | Low |
-| §10 (`ExecutionPlan`) | `NoQ` sentinel adds complexity without benefit in Phase 2 | Low |
-| §14 (`Cargo.toml`) | Feature flags reference backends that don't exist yet | Low |
-| §6 (`PathOptimizer`) | `IndexMap` is read-only but optimizer needs to track intermediate dimensions | Medium |
-| §7.1 | Spec's `execute` return type `TempTensor<'arena>` requires arena-lifetime coupling not yet feasible | Medium |
+| Spec Section | Issue | Severity | Status |
+|:-------------|:------|:---------|:-------|
+| §7.1 (`ContractionExecutor`) | Spec shows arena parameter; actual `DenseTensor` lifetimes make arena integration non-trivial | Medium | **Resolved** — Replaced unsafe transmute with `TensorRef` enum (Option B from techspec). Safe split-storage approach. |
+| §7.2 (`tensor_to_mat_ref`) | Spec assumes arena is always available for transpose; no fallback documented | Medium | **Resolved** — `tensor_to_mat_ref` now returns `ReshapeResult` that owns transposed data via heap fallback when zero-copy path unavailable. `gather_for_gemm` properly reorders for non-trailing contracted legs. |
+| §6 (`PathOptimizer`) | `IndexMap` is read-only but optimizer needs to track intermediate dimensions | Medium | **Resolved** — `NodeEntry` now carries per-node `dims: Vec<usize>`, populated from `IndexMap` for inputs and computed from contracting pairs for intermediates. `find_best_pair` uses node-local dims. |
+| §7.1 | Spec's `execute` return type `TempTensor<'arena>` requires arena-lifetime coupling not yet feasible | Medium | **Resolved** — `execute` returns `DenseTensor<'static, T>` (heap-owned). Added `contract_once` convenience method per techspec. Arena integration deferred to when `SweepArena` is threaded through the executor. |
+| §8 (`SparseContractionExecutor`) | Spec assumes `BlockSparseTensor` is cloneable; it's not | Low | Open |
+| §10 (`ExecutionPlan`) | `NoQ` sentinel adds complexity without benefit in Phase 2 | Low | Open (already simplified in draft) |
+| §14 (`Cargo.toml`) | Feature flags reference backends that don't exist yet | Low | Open (documented as planned-only) |
 
 ---
 
