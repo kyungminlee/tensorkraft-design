@@ -1229,6 +1229,7 @@ name = "tk-dsl"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "num-complex",
  "num-traits",
  "proptest",
  "smallstr",
