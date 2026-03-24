@@ -385,6 +385,60 @@ impl<T: Scalar> ExecutionPlan<T> {
         };
         executor.execute(&self.graph, inputs)
     }
+
+    /// Execute the plan over block-sparse inputs.
+    ///
+    /// The `Q: BitPackable` bound is introduced here rather than on the struct,
+    /// so that `ExecutionPlan<T>` remains usable without a quantum number type
+    /// on the dense path.
+    pub fn execute_sparse<Q: tk_symmetry::BitPackable, B>(
+        &self,
+        backend: &B,
+        inputs: &HashMap<TensorId, &tk_symmetry::BlockSparseTensor<T, Q>>,
+        hook: &dyn crate::structural::StructuralContractionHook<T, Q>,
+    ) -> ContractResult<tk_symmetry::BlockSparseTensor<T, Q>>
+    where
+        B: LinAlgBackend<T> + tk_linalg::SparseLinAlgBackend<T, Q>,
+    {
+        let steps = self.graph.execution_order();
+
+        if steps.is_empty() {
+            return Err(ContractionError::OptimizerFailed {
+                optimizer: "sparse".to_string(),
+                reason: "single-tensor contraction not supported; use input directly"
+                    .to_string(),
+            });
+        }
+
+        let mut intermediates: HashMap<TensorId, tk_symmetry::BlockSparseTensor<T, Q>> =
+            HashMap::new();
+
+        for step in &steps {
+            let left = if let Some(t) = inputs.get(&step.left_tensor_id) {
+                *t
+            } else if let Some(t) = intermediates.get(&step.left_tensor_id) {
+                t
+            } else {
+                return Err(ContractionError::MissingTensor(step.left_tensor_id));
+            };
+
+            let right = if let Some(t) = inputs.get(&step.right_tensor_id) {
+                *t
+            } else if let Some(t) = intermediates.get(&step.right_tensor_id) {
+                t
+            } else {
+                return Err(ContractionError::MissingTensor(step.right_tensor_id));
+            };
+
+            let result = backend.block_gemm(left, right);
+            intermediates.insert(step.result_tensor_id, result);
+        }
+
+        let last_step = steps.last().unwrap();
+        intermediates
+            .remove(&last_step.result_tensor_id)
+            .ok_or(ContractionError::EmptySpec)
+    }
 }
 
 /// Wrapper to allow `ContractionExecutor` to work with borrowed backends.
@@ -774,5 +828,214 @@ mod tests {
         assert!((data[1] - 2.0).abs() < 1e-12);
         assert!((data[4] - 5.0).abs() < 1e-12);
         assert!((data[5] - 6.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn executor_single_tensor_identity() {
+        // Single tensor with no contraction → should return a clone of the input.
+        let i = IndexId::from_raw(950);
+        let j = IndexId::from_raw(951);
+
+        let spec = ContractionSpec::new(
+            vec![(TensorId::new(0), vec![i, j])],
+            vec![i, j],
+        )
+        .unwrap();
+
+        let a = DenseTensor::from_vec(
+            TensorShape::row_major(&[2, 3]),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
+
+        let mut index_map = IndexMap::new();
+        index_map.insert(
+            TensorId::new(0),
+            vec![
+                IndexSpec { dim: 2, is_contiguous: true },
+                IndexSpec { dim: 3, is_contiguous: true },
+            ],
+        );
+
+        let graph = GreedyOptimizer
+            .optimize(&spec, &index_map, &CostMetric::default(), None)
+            .unwrap();
+
+        // Graph has no pairwise steps for a single tensor.
+        assert_eq!(graph.n_pairwise_steps(), 0);
+
+        let mut inputs = HashMap::new();
+        inputs.insert(TensorId::new(0), &a);
+
+        let executor = ContractionExecutor::new(NaiveBackend);
+        let result = executor.execute(&graph, &inputs).unwrap();
+
+        assert_eq!(result.shape().dims(), &[2, 3]);
+        let data = result.as_slice();
+        for i in 0..6 {
+            assert!((data[i] - (i as f64 + 1.0)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn executor_two_tensor_outer_product() {
+        // No contracted indices → result is outer product.
+        let i = IndexId::from_raw(960);
+        let j = IndexId::from_raw(961);
+
+        let spec = ContractionSpec::new(
+            vec![
+                (TensorId::new(0), vec![i]),
+                (TensorId::new(1), vec![j]),
+            ],
+            vec![i, j],
+        )
+        .unwrap();
+
+        let mut index_map = IndexMap::new();
+        index_map.insert(
+            TensorId::new(0),
+            vec![IndexSpec { dim: 2, is_contiguous: true }],
+        );
+        index_map.insert(
+            TensorId::new(1),
+            vec![IndexSpec { dim: 3, is_contiguous: true }],
+        );
+
+        let graph = GreedyOptimizer
+            .optimize(&spec, &index_map, &CostMetric::default(), None)
+            .unwrap();
+
+        let a = DenseTensor::from_vec(TensorShape::row_major(&[2]), vec![2.0, 3.0]);
+        let b = DenseTensor::from_vec(TensorShape::row_major(&[3]), vec![1.0, 10.0, 100.0]);
+
+        let mut inputs = HashMap::new();
+        inputs.insert(TensorId::new(0), &a);
+        inputs.insert(TensorId::new(1), &b);
+
+        let executor = ContractionExecutor::new(NaiveBackend);
+        let result = executor.execute(&graph, &inputs).unwrap();
+
+        // Outer product: [[2,20,200],[3,30,300]]
+        assert_eq!(result.shape().dims(), &[2, 3]);
+        let data = result.as_slice();
+        assert!((data[0] - 2.0).abs() < 1e-12);
+        assert!((data[1] - 20.0).abs() < 1e-12);
+        assert!((data[2] - 200.0).abs() < 1e-12);
+        assert!((data[3] - 3.0).abs() < 1e-12);
+        assert!((data[4] - 30.0).abs() < 1e-12);
+        assert!((data[5] - 300.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn executor_missing_tensor_error() {
+        let i = IndexId::from_raw(970);
+        let j = IndexId::from_raw(971);
+        let k = IndexId::from_raw(972);
+
+        let spec = ContractionSpec::new(
+            vec![
+                (TensorId::new(0), vec![i, j]),
+                (TensorId::new(1), vec![j, k]),
+            ],
+            vec![i, k],
+        )
+        .unwrap();
+
+        let mut index_map = IndexMap::new();
+        index_map.insert(
+            TensorId::new(0),
+            vec![
+                IndexSpec { dim: 2, is_contiguous: true },
+                IndexSpec { dim: 3, is_contiguous: true },
+            ],
+        );
+        index_map.insert(
+            TensorId::new(1),
+            vec![
+                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 2, is_contiguous: true },
+            ],
+        );
+
+        let graph = GreedyOptimizer
+            .optimize(&spec, &index_map, &CostMetric::default(), None)
+            .unwrap();
+
+        let a = DenseTensor::from_vec(
+            TensorShape::row_major(&[2, 3]),
+            vec![1.0; 6],
+        );
+
+        // Only provide tensor 0, not tensor 1.
+        let mut inputs = HashMap::new();
+        inputs.insert(TensorId::new(0), &a);
+
+        let executor = ContractionExecutor::new(NaiveBackend);
+        let result = executor.execute(&graph, &inputs);
+        assert!(matches!(result, Err(ContractionError::MissingTensor(_))));
+    }
+
+    #[test]
+    fn execution_plan_execute_dense() {
+        let i = IndexId::from_raw(980);
+        let j = IndexId::from_raw(981);
+        let k = IndexId::from_raw(982);
+
+        let spec = ContractionSpec::new(
+            vec![
+                (TensorId::new(0), vec![i, j]),
+                (TensorId::new(1), vec![j, k]),
+            ],
+            vec![i, k],
+        )
+        .unwrap();
+
+        let mut index_map = IndexMap::new();
+        index_map.insert(
+            TensorId::new(0),
+            vec![
+                IndexSpec { dim: 2, is_contiguous: true },
+                IndexSpec { dim: 3, is_contiguous: true },
+            ],
+        );
+        index_map.insert(
+            TensorId::new(1),
+            vec![
+                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 2, is_contiguous: true },
+            ],
+        );
+
+        let plan = ExecutionPlan::<f64>::build(
+            &spec,
+            &index_map,
+            &GreedyOptimizer,
+            &CostMetric::default(),
+            None,
+        )
+        .unwrap();
+
+        // A = 2x3 identity-like
+        let a = DenseTensor::from_vec(
+            TensorShape::row_major(&[2, 3]),
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        );
+        // B = 3x2 [[1,2],[3,4],[5,6]]
+        let b = DenseTensor::from_vec(
+            TensorShape::row_major(&[3, 2]),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert(TensorId::new(0), &a);
+        inputs.insert(TensorId::new(1), &b);
+
+        let result = plan.execute_dense(&NaiveBackend, &inputs).unwrap();
+        assert_eq!(result.shape().dims(), &[2, 2]);
+        let data = result.as_slice();
+        assert!((data[0] - 1.0).abs() < 1e-12);
+        assert!((data[1] - 2.0).abs() < 1e-12);
+        assert!((data[2] - 3.0).abs() < 1e-12);
+        assert!((data[3] - 4.0).abs() < 1e-12);
     }
 }

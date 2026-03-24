@@ -22,6 +22,7 @@ approx    = "0.5"
 [features]
 default = ["backend-faer", "parallel"]
 backend-faer     = ["tk-linalg/backend-faer"]
+# Planned backends — uncomment when upstream tk-linalg support is implemented:
 # backend-mkl      = ["tk-linalg/backend-mkl"]
 # backend-openblas = ["tk-linalg/backend-openblas"]
 # backend-cuda     = ["tk-linalg/backend-cuda", "tk-core/backend-cuda"]

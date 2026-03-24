@@ -257,6 +257,36 @@ impl ContractionSpec {
             })
             .collect()
     }
+
+    /// Validate that all contracted index pairs have matching dimensions.
+    ///
+    /// This is a defense-in-depth check: the `IndexMap` must already be populated
+    /// with dimension info for all tensors before calling this. Typically invoked
+    /// by the optimizer or executor before starting work.
+    ///
+    /// # Errors
+    /// Returns `ContractionError::DimensionMismatch` if any contracted pair
+    /// has different dimensions on the two tensors it connects.
+    pub fn validate_dimensions(&self, index_map: &IndexMap) -> ContractResult<()> {
+        for pair in &self.contracted_pairs {
+            let dim_a = index_map.dim(pair.tensor_a, pair.leg_a);
+            let dim_b = index_map.dim(pair.tensor_b, pair.leg_b);
+            if let (Some(da), Some(db)) = (dim_a, dim_b) {
+                if da != db {
+                    return Err(ContractionError::DimensionMismatch {
+                        index: pair.index,
+                        tensor_a: pair.tensor_a,
+                        leg_a: pair.leg_a,
+                        dim_a: da,
+                        tensor_b: pair.tensor_b,
+                        leg_b: pair.leg_b,
+                        dim_b: db,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +429,114 @@ mod tests {
             result,
             Err(ContractionError::OutputIndexNotFree { .. })
         ));
+    }
+
+    #[test]
+    fn spec_shared_indices_two_tensors() {
+        let i = IndexId::from_raw(450);
+        let j = IndexId::from_raw(451);
+        let k = IndexId::from_raw(452);
+
+        let spec = ContractionSpec::new(
+            vec![
+                (TensorId::new(0), vec![i, j]),
+                (TensorId::new(1), vec![j, k]),
+            ],
+            vec![i, k],
+        )
+        .unwrap();
+
+        let shared = spec.shared_indices(TensorId::new(0), TensorId::new(1));
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].index, j);
+    }
+
+    #[test]
+    fn spec_shared_indices_disjoint() {
+        let i = IndexId::from_raw(460);
+        let j = IndexId::from_raw(461);
+        let k = IndexId::from_raw(462);
+        let l = IndexId::from_raw(463);
+
+        let spec = ContractionSpec::new(
+            vec![
+                (TensorId::new(0), vec![i, j]),
+                (TensorId::new(1), vec![k, l]),
+            ],
+            vec![i, j, k, l],
+        )
+        .unwrap();
+
+        let shared = spec.shared_indices(TensorId::new(0), TensorId::new(1));
+        assert!(shared.is_empty());
+    }
+
+    #[test]
+    fn spec_dimension_mismatch_detected() {
+        let i = IndexId::from_raw(470);
+        let j = IndexId::from_raw(471);
+
+        let spec = ContractionSpec::new(
+            vec![
+                (TensorId::new(0), vec![i, j]),
+                (TensorId::new(1), vec![j]),
+            ],
+            vec![i],
+        )
+        .unwrap();
+
+        let mut index_map = IndexMap::new();
+        index_map.insert(
+            TensorId::new(0),
+            vec![
+                IndexSpec { dim: 4, is_contiguous: true },
+                IndexSpec { dim: 3, is_contiguous: true }, // j has dim 3 on tensor 0
+            ],
+        );
+        index_map.insert(
+            TensorId::new(1),
+            vec![
+                IndexSpec { dim: 5, is_contiguous: true }, // j has dim 5 on tensor 1 — mismatch!
+            ],
+        );
+
+        let result = spec.validate_dimensions(&index_map);
+        assert!(matches!(
+            result,
+            Err(ContractionError::DimensionMismatch { dim_a: 3, dim_b: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn spec_dimension_match_passes() {
+        let i = IndexId::from_raw(480);
+        let j = IndexId::from_raw(481);
+
+        let spec = ContractionSpec::new(
+            vec![
+                (TensorId::new(0), vec![i, j]),
+                (TensorId::new(1), vec![j]),
+            ],
+            vec![i],
+        )
+        .unwrap();
+
+        let mut index_map = IndexMap::new();
+        index_map.insert(
+            TensorId::new(0),
+            vec![
+                IndexSpec { dim: 4, is_contiguous: true },
+                IndexSpec { dim: 3, is_contiguous: true },
+            ],
+        );
+        index_map.insert(
+            TensorId::new(1),
+            vec![
+                IndexSpec { dim: 3, is_contiguous: true },
+            ],
+        );
+
+        assert!(spec.validate_dimensions(&index_map).is_ok());
     }
 
     #[test]
