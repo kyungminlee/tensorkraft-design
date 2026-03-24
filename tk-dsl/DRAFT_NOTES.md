@@ -1,6 +1,6 @@
 # tk-dsl Draft Implementation Notes
 
-**Status:** Draft implementation — compiles, 41 tests pass, core abstractions functional.
+**Status:** Draft implementation — compiles, 44 tests pass, core abstractions functional.
 **Date:** March 2026
 
 ---
@@ -19,9 +19,9 @@
 
 Added `fn from_real_imag(re: Self::Real, im: Self::Real) -> Self` to the `Scalar` trait in `tk-core`. `SpinOp::Sy.matrix::<T>()` correctly produces `[0, -i/2; i/2, 0]` for complex types and `[0, 0; 0, 0]` for real types (correct lossy projection).
 
-### Operator overloading for generic T (complete)
+### Operator overloading for all Scalar types (complete)
 
-Added `scale(coeff: T) -> ScaledOpProduct<T>` methods to `OpTerm<T>` and `OpProduct<T>` for any `T: Scalar`. `OpSum * T` also made generic. `f64`-only `Mul` overloads remain for ergonomics with real-valued models.
+`Mul` overloads (`coeff * expr` and `expr * coeff`) implemented for all four concrete `Scalar` types (`f32`, `f64`, `Complex<f32>`, `Complex<f64>`) via a `impl_scalar_mul!` macro. A blanket `impl<T: Scalar>` is impossible due to Rust orphan rules. `scale(coeff: T)` methods on `OpTerm<T>` and `OpProduct<T>` remain as an alternative that works for any `T: Scalar`. `OpSum * T` is also generic.
 
 ### IndexedTensor Clone (complete)
 
@@ -37,20 +37,18 @@ Added `scale(coeff: T) -> ScaledOpProduct<T>` methods to `OpTerm<T>` and `OpProd
 
 1. **`tk-dsl-macros` proc-macro crate not implemented** — `hamiltonian!{}` macro requires a separate `proc-macro = true` crate with `syn 2.x` / `quote` / `proc_macro2`. The core library types are the foundation; the macro is syntactic sugar.
 
-2. **`coeff * op(Sz, 0)` syntax only works for `f64`** — Due to Rust orphan rules, `Mul<FermionOp> for T` cannot be blanket-implemented. Use `op(Sz, 0).scale(coeff)` for generic `T`.
+2. **`Lattice` cloneability requires `LatticeClone` helper trait** — `Box<dyn Lattice>` needs `clone_box()` blanket impl for `Clone`. Standard pattern but undocumented in spec. Consider `Arc<dyn Lattice>` for zero-cost sharing.
 
-3. **`Lattice` cloneability requires `LatticeClone` helper trait** — `Box<dyn Lattice>` needs `clone_box()` blanket impl for `Clone`. Standard pattern but undocumented in spec. Consider `Arc<dyn Lattice>` for zero-cost sharing.
+3. **`IndexedTensor::contract()` uses naive GEMM** — No `tk-linalg` dependency in `tk-dsl`. O(mnk) triple-loop is acceptable for small operator matrices in the DSL layer.
 
-4. **`IndexedTensor::contract()` uses naive GEMM** — No `tk-linalg` dependency in `tk-dsl`. O(mnk) triple-loop is acceptable for small operator matrices in the DSL layer.
-
-5. **`SmallString` requires `smallstr` dependency** — Avoids heap allocation for tags < 32 bytes. Worth the dependency.
+4. **`SmallString` requires `smallstr` dependency** — Avoids heap allocation for tags < 32 bytes. Worth the dependency.
 
 ### Spec-vs-reality gaps
 
 | Spec Section | Issue | Severity | Status |
 |:-------------|:------|:---------|:-------|
 | §5 (operators) | `SpinOp::Sy` imaginary matrix | High | **Resolved** — `from_real_imag` added |
-| §5 (operators) | Operator overloading limited to `f64` | Medium | **Mitigated** — `scale()` methods added |
+| §5 (operators) | Operator overloading limited to `f64` | Medium | **Resolved** — `impl_scalar_mul!` for all 4 types |
 | §6 (IndexedTensor) | `DenseTensor` not `Clone` | Medium | **Mitigated** — manual `Clone` impl |
 | §6 (IndexedTensor) | `contract()` uses naive GEMM | Low | Accepted (small matrices) |
 | §8 (OpSum) | `Lattice` cloneability undocumented | Low | Accepted (standard pattern) |
