@@ -35,6 +35,9 @@ impl PathOptimizer for GreedyOptimizer {
             .tensors
             .iter()
             .map(|(tid, legs)| {
+                let dims: Vec<usize> = (0..legs.len())
+                    .map(|pos| index_map.dim(*tid, pos).unwrap_or(1))
+                    .collect();
                 Some(NodeEntry {
                     tensor_id: *tid,
                     node: ContractionNode::Input {
@@ -42,6 +45,7 @@ impl PathOptimizer for GreedyOptimizer {
                         indices: legs.clone(),
                     },
                     indices: legs.clone(),
+                    dims,
                 })
             })
             .collect();
@@ -53,12 +57,11 @@ impl PathOptimizer for GreedyOptimizer {
 
         // Greedy loop: contract n-1 pairs.
         for _ in 0..n - 1 {
-            let (best_i, best_j, best_cost, best_contracted, best_result_indices, best_intermediate_size) =
-                find_best_pair(&nodes, index_map, cost)?;
+            let best = find_best_pair(&nodes, cost)?;
 
             // Check memory constraint.
             if let Some(limit) = max_memory_bytes {
-                let bytes = best_intermediate_size * 8; // assume f64
+                let bytes = best.intermediate_size * 8; // assume f64
                 if bytes > limit {
                     return Err(ContractionError::OptimizerFailed {
                         optimizer: "greedy".to_string(),
@@ -70,8 +73,8 @@ impl PathOptimizer for GreedyOptimizer {
                 }
             }
 
-            let left_entry = nodes[best_i].take().unwrap();
-            let right_entry = nodes[best_j].take().unwrap();
+            let left_entry = nodes[best.left_idx].take().unwrap();
+            let right_entry = nodes[best.right_idx].take().unwrap();
 
             let result_id = TensorId::new(next_intermediate);
             next_intermediate += 1;
@@ -79,18 +82,20 @@ impl PathOptimizer for GreedyOptimizer {
             let new_node = ContractionNode::Contraction {
                 left: Box::new(left_entry.node),
                 right: Box::new(right_entry.node),
-                contracted_indices: best_contracted,
-                result_indices: best_result_indices.clone(),
+                contracted_indices: best.contracted,
+                result_indices: best.result_indices.clone(),
             };
 
-            total_flops += best_cost;
-            max_intermediate_size = max_intermediate_size.max(best_intermediate_size);
+            total_flops += best.cost;
+            max_intermediate_size = max_intermediate_size.max(best.intermediate_size);
 
-            // Place the new node in the first available slot.
-            nodes[best_i] = Some(NodeEntry {
+            // Place the new node in the first available slot, carrying
+            // the computed dimensions for use in subsequent steps.
+            nodes[best.left_idx] = Some(NodeEntry {
                 tensor_id: result_id,
                 node: new_node,
-                indices: best_result_indices,
+                indices: best.result_indices,
+                dims: best.result_dims,
             });
         }
 
@@ -112,19 +117,40 @@ impl PathOptimizer for GreedyOptimizer {
 }
 
 /// Working data for a node during greedy optimization.
+///
+/// Each entry tracks its own dimension map so that intermediate results
+/// (whose TensorIds are not in the original IndexMap) can still report
+/// correct per-leg dimensions to subsequent optimization steps.
 struct NodeEntry {
     tensor_id: TensorId,
     node: ContractionNode,
     indices: Vec<IndexId>,
+    /// Per-leg dimensions for this node's output tensor.
+    /// For input nodes, populated from the original `IndexMap`.
+    /// For intermediate nodes, computed from the contracting pair's dims.
+    dims: Vec<usize>,
+}
+
+/// Result of finding the best pair to contract.
+struct BestPair {
+    left_idx: usize,
+    right_idx: usize,
+    cost: f64,
+    contracted: Vec<IndexId>,
+    result_indices: Vec<IndexId>,
+    result_dims: Vec<usize>,
+    intermediate_size: usize,
 }
 
 /// Find the pair of active nodes with the lowest contraction cost.
+///
+/// Uses per-node dimension caches rather than the original `IndexMap`,
+/// so intermediate tensor dimensions are correctly tracked.
 fn find_best_pair(
     nodes: &[Option<NodeEntry>],
-    index_map: &IndexMap,
     cost: &CostMetric,
-) -> ContractResult<(usize, usize, f64, Vec<IndexId>, Vec<IndexId>, usize)> {
-    let mut best: Option<(usize, usize, f64, Vec<IndexId>, Vec<IndexId>, usize)> = None;
+) -> ContractResult<BestPair> {
+    let mut best: Option<BestPair> = None;
 
     let active: Vec<usize> = nodes
         .iter()
@@ -145,46 +171,51 @@ fn find_best_pair(
                 }
             }
 
-            // Compute M, K, N dimensions.
+            // Compute M, K, N dimensions from node-local dims (not IndexMap).
             let mut m: usize = 1;
             let mut k: usize = 1;
             let mut n: usize = 1;
 
             let mut result_indices = Vec::new();
+            let mut result_dims = Vec::new();
 
             for (pos, idx) in left.indices.iter().enumerate() {
-                let dim = index_map
-                    .dim(left.tensor_id, pos)
-                    .unwrap_or(1);
+                let dim = left.dims[pos];
                 if contracted.contains(idx) {
                     k *= dim;
                 } else {
                     m *= dim;
                     result_indices.push(*idx);
+                    result_dims.push(dim);
                 }
             }
 
             for (pos, idx) in right.indices.iter().enumerate() {
-                let dim = index_map
-                    .dim(right.tensor_id, pos)
-                    .unwrap_or(1);
+                let dim = right.dims[pos];
                 if contracted.contains(idx) {
                     // Already in k
                 } else {
                     n *= dim;
                     result_indices.push(*idx);
+                    result_dims.push(dim);
                 }
             }
 
             let intermediate_size = m * n;
             let pair_cost = CostEstimator::step_cost::<f64>(m, k, n, true, true, cost);
 
-            let is_better = best
-                .as_ref()
-                .map_or(true, |b| pair_cost < b.2);
+            let is_better = best.as_ref().map_or(true, |b| pair_cost < b.cost);
 
             if is_better {
-                best = Some((i, j, pair_cost, contracted, result_indices, intermediate_size));
+                best = Some(BestPair {
+                    left_idx: i,
+                    right_idx: j,
+                    cost: pair_cost,
+                    contracted,
+                    result_indices,
+                    result_dims,
+                    intermediate_size,
+                });
             }
         }
     }

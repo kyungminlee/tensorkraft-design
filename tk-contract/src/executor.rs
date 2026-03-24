@@ -12,6 +12,32 @@ use crate::graph::{ContractionGraph, PairwiseStep};
 use crate::index::{ContractionSpec, IndexMap, TensorId};
 use crate::optimizer::PathOptimizer;
 
+/// Safe wrapper for tensors that may be either borrowed inputs or owned intermediates.
+///
+/// Eliminates the need for `unsafe` lifetime transmute when the executor holds
+/// both borrowed input tensors and owned intermediate results simultaneously.
+/// See techspec §7.1 Option B.
+enum TensorRef<'a, T: Scalar> {
+    Borrowed(&'a DenseTensor<'a, T>),
+    Owned(DenseTensor<'static, T>),
+}
+
+impl<'a, T: Scalar> TensorRef<'a, T> {
+    fn as_dense(&self) -> &DenseTensor<'_, T> {
+        match self {
+            TensorRef::Borrowed(t) => t,
+            TensorRef::Owned(t) => t,
+        }
+    }
+
+    fn into_owned(self) -> Option<DenseTensor<'static, T>> {
+        match self {
+            TensorRef::Borrowed(_) => None,
+            TensorRef::Owned(t) => Some(t),
+        }
+    }
+}
+
 /// Executor for dense tensor contractions via `LinAlgBackend::gemm`.
 ///
 /// Converts each `PairwiseStep` from the `ContractionGraph` into a matrix
@@ -62,23 +88,34 @@ impl<T: Scalar, B: LinAlgBackend<T>> ContractionExecutor<T, B> {
             return Ok(owned);
         }
 
-        // Storage for intermediate results.
-        let mut intermediates: HashMap<TensorId, DenseTensor<'static, T>> = HashMap::new();
+        // Unified storage using TensorRef enum — no unsafe transmute needed.
+        // Inputs are wrapped as Borrowed, intermediates as Owned.
+        let mut tensors: HashMap<TensorId, TensorRef<'_, T>> = HashMap::new();
+        for (&tid, &tensor) in inputs.iter() {
+            tensors.insert(tid, TensorRef::Borrowed(tensor));
+        }
 
         for step in &steps {
-            // Get left operand (either from inputs or intermediates).
-            let left = self.get_tensor(step.left_tensor_id, inputs, &intermediates)?;
-            let right = self.get_tensor(step.right_tensor_id, inputs, &intermediates)?;
+            let left = tensors
+                .get(&step.left_tensor_id)
+                .ok_or(ContractionError::MissingTensor(step.left_tensor_id))?
+                .as_dense();
+            let right = tensors
+                .get(&step.right_tensor_id)
+                .ok_or(ContractionError::MissingTensor(step.right_tensor_id))?
+                .as_dense();
 
             let result = self.execute_pairwise(left, right, step)?;
 
-            intermediates.insert(step.result_tensor_id, result);
+            tensors.insert(step.result_tensor_id, TensorRef::Owned(result));
         }
 
         // Extract the final result.
         let last_step = steps.last().unwrap();
-        intermediates
+        tensors
             .remove(&last_step.result_tensor_id)
+            .ok_or(ContractionError::EmptySpec)?
+            .into_owned()
             .ok_or(ContractionError::EmptySpec)
     }
 
@@ -157,24 +194,39 @@ impl<T: Scalar, B: LinAlgBackend<T>> ContractionExecutor<T, B> {
         ))
     }
 
-    /// Look up a tensor by ID from either the input map or intermediates.
-    fn get_tensor<'a>(
+    /// Convenience method: build the index map from shapes, run the optimizer,
+    /// and execute in one call. Intended for one-off contractions where the
+    /// overhead of pre-optimization is not amortized over many calls.
+    ///
+    /// For recurring contractions (e.g., environment updates inside a DMRG
+    /// sweep), callers should cache the `ContractionGraph` via `ExecutionPlan`
+    /// and call `execute` directly.
+    pub fn contract_once(
         &self,
-        id: TensorId,
-        inputs: &'a HashMap<TensorId, &'a DenseTensor<'a, T>>,
-        intermediates: &'a HashMap<TensorId, DenseTensor<'static, T>>,
-    ) -> ContractResult<&'a DenseTensor<'a, T>> {
-        if let Some(t) = inputs.get(&id) {
-            Ok(*t)
-        } else if let Some(t) = intermediates.get(&id) {
-            // Safety: we're extending the lifetime annotation, but the intermediate
-            // lives in the HashMap for the duration of execution. This is sound
-            // because we never remove an intermediate while it might still be referenced.
-            // In a real implementation, arena allocation handles this cleanly.
-            Ok(unsafe { std::mem::transmute::<&DenseTensor<'static, T>, &'a DenseTensor<'a, T>>(t) })
-        } else {
-            Err(ContractionError::MissingTensor(id))
+        spec: &ContractionSpec,
+        inputs: &HashMap<TensorId, &DenseTensor<'_, T>>,
+        optimizer: &dyn PathOptimizer,
+        cost: &CostMetric,
+        max_memory_bytes: Option<usize>,
+    ) -> ContractResult<DenseTensor<'static, T>> {
+        // Build index map from actual tensor shapes.
+        let mut index_map = IndexMap::new();
+        for (tid, legs) in &spec.tensors {
+            if let Some(tensor) = inputs.get(tid) {
+                let shape = tensor.shape();
+                let dims = shape.dims();
+                let specs: Vec<crate::index::IndexSpec> = (0..legs.len())
+                    .map(|i| crate::index::IndexSpec {
+                        dim: dims.get(i).copied().unwrap_or(1),
+                        is_contiguous: shape.is_contiguous(),
+                    })
+                    .collect();
+                index_map.insert(*tid, specs);
+            }
         }
+
+        let graph = optimizer.optimize(spec, &index_map, cost, max_memory_bytes)?;
+        self.execute(&graph, inputs)
     }
 }
 
@@ -183,11 +235,15 @@ impl<T: Scalar, B: LinAlgBackend<T>> ContractionExecutor<T, B> {
 /// `is_left == true`: free legs become rows (M), contracted become cols (K).
 /// `is_left == false`: contracted become rows (K), free become cols (N).
 ///
-/// This is the "slow path" that always copies. The optimized path would
-/// check contiguity and do zero-copy reshape when possible.
+/// Handles the general case by permuting axes so that free legs vary slowly
+/// (leftmost) and contracted legs vary fast (rightmost) for left operands,
+/// or contracted vary slowly and free vary fast for right operands.
+///
+/// For contiguous tensors with contracted legs already in the right position,
+/// this is a simple memcpy (fast path).
 fn gather_for_gemm<T: Scalar>(
     tensor: &DenseTensor<'_, T>,
-    _contracted_legs: &smallvec::SmallVec<[usize; 6]>,
+    contracted_legs: &smallvec::SmallVec<[usize; 6]>,
     is_left: bool,
 ) -> Vec<T> {
     let shape = tensor.shape();
@@ -200,31 +256,68 @@ fn gather_for_gemm<T: Scalar>(
         return vec![data[0]];
     }
 
-    // For a contiguous row-major tensor where contracted legs are trailing,
-    // the data is already in the right layout for the left operand.
-    if shape.is_contiguous() && is_left {
-        return data[..shape.numel()].to_vec();
+    let numel = shape.numel();
+
+    // Fast path: contiguous row-major with contracted legs trailing.
+    // For left operand (M×K), this means [free..., contracted...] which is
+    // already the right layout. For right operand (K×N), contracted legs
+    // must be leading — check that too.
+    if shape.is_contiguous() {
+        let trailing = crate::reshape::are_trailing_legs(contracted_legs, rank);
+        if is_left && trailing {
+            return data[..numel].to_vec();
+        }
+        let leading = crate::reshape::are_leading_legs(contracted_legs, rank);
+        if !is_left && leading {
+            return data[..numel].to_vec();
+        }
     }
 
-    // General gather: iterate in the desired order.
-    let numel = shape.numel();
-    let mut result = Vec::with_capacity(numel);
+    // General path: build a permutation that puts legs in the desired order,
+    // then gather elements in that order.
+    //
+    // Left operand:  [free_0, free_1, ..., contracted_0, contracted_1, ...]
+    // Right operand: [contracted_0, contracted_1, ..., free_0, free_1, ...]
+    let mut perm = Vec::with_capacity(rank);
+    if is_left {
+        for i in 0..rank {
+            if !contracted_legs.contains(&i) {
+                perm.push(i);
+            }
+        }
+        for i in 0..rank {
+            if contracted_legs.contains(&i) {
+                perm.push(i);
+            }
+        }
+    } else {
+        for i in 0..rank {
+            if contracted_legs.contains(&i) {
+                perm.push(i);
+            }
+        }
+        for i in 0..rank {
+            if !contracted_legs.contains(&i) {
+                perm.push(i);
+            }
+        }
+    }
 
-    // For the left operand (M×K), we want free legs to vary slowly (rows)
-    // and contracted legs to vary fast (cols). For a general tensor this
-    // requires a transpose, but for contiguous tensors this is often free.
-    // The simple approach: just copy in row-major order.
-    let mut index = vec![0usize; rank];
+    // Gather elements in the permuted dimension order.
+    let mut result = Vec::with_capacity(numel);
+    let mut old_index = vec![0usize; rank];
+
     for _ in 0..numel {
-        let linear: usize = index.iter().zip(strides).map(|(&i, &s)| i * s).sum();
+        let linear: usize = old_index.iter().zip(strides).map(|(&i, &s)| i * s).sum();
         result.push(data[linear]);
 
-        for d in (0..rank).rev() {
-            index[d] += 1;
-            if index[d] < dims[d] {
+        // Increment indices in permuted order (rightmost varies fastest).
+        for &d in perm.iter().rev() {
+            old_index[d] += 1;
+            if old_index[d] < dims[d] {
                 break;
             }
-            index[d] = 0;
+            old_index[d] = 0;
         }
     }
 
@@ -290,15 +383,7 @@ impl<T: Scalar> ExecutionPlan<T> {
             backend: PhantomBackendRef(backend),
             _phantom: PhantomData,
         };
-
-        // Re-use the pre-computed steps by executing the graph directly.
-        // For now, we construct a fresh executor and delegate.
-        // A proper implementation would use the cached steps directly.
-        let temp_executor = ContractionExecutor {
-            backend: PhantomBackendRef(backend),
-            _phantom: PhantomData,
-        };
-        temp_executor.execute(&self.graph, inputs)
+        executor.execute(&self.graph, inputs)
     }
 }
 
@@ -558,5 +643,136 @@ mod tests {
         );
 
         assert!(plan.needs_rebuild(&new_map));
+    }
+
+    #[test]
+    fn executor_three_tensor_chain() {
+        // A(i,j) * B(j,k) * C(k,l) → D(i,l)
+        // Tests that intermediate dimension tracking works correctly
+        // when the greedy optimizer produces a multi-step plan.
+        let i = IndexId::from_raw(800);
+        let j = IndexId::from_raw(801);
+        let k = IndexId::from_raw(802);
+        let l = IndexId::from_raw(803);
+
+        let spec = ContractionSpec::new(
+            vec![
+                (TensorId::new(0), vec![i, j]),
+                (TensorId::new(1), vec![j, k]),
+                (TensorId::new(2), vec![k, l]),
+            ],
+            vec![i, l],
+        )
+        .unwrap();
+
+        let mut index_map = IndexMap::new();
+        index_map.insert(
+            TensorId::new(0),
+            vec![
+                IndexSpec { dim: 2, is_contiguous: true },
+                IndexSpec { dim: 3, is_contiguous: true },
+            ],
+        );
+        index_map.insert(
+            TensorId::new(1),
+            vec![
+                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 4, is_contiguous: true },
+            ],
+        );
+        index_map.insert(
+            TensorId::new(2),
+            vec![
+                IndexSpec { dim: 4, is_contiguous: true },
+                IndexSpec { dim: 2, is_contiguous: true },
+            ],
+        );
+
+        let graph = GreedyOptimizer
+            .optimize(&spec, &index_map, &CostMetric::default(), None)
+            .unwrap();
+
+        assert_eq!(graph.n_pairwise_steps(), 2);
+
+        // A = 2x3 identity-like: [[1,0,0],[0,1,0]]
+        let a = DenseTensor::from_vec(
+            TensorShape::row_major(&[2, 3]),
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        );
+        // B = 3x4 all ones
+        let b = DenseTensor::from_vec(
+            TensorShape::row_major(&[3, 4]),
+            vec![1.0; 12],
+        );
+        // C = 4x2 identity-like: [[1,0],[0,1],[0,0],[0,0]]
+        let c = DenseTensor::from_vec(
+            TensorShape::row_major(&[4, 2]),
+            vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert(TensorId::new(0), &a);
+        inputs.insert(TensorId::new(1), &b);
+        inputs.insert(TensorId::new(2), &c);
+
+        let executor = ContractionExecutor::new(NaiveBackend);
+        let result = executor.execute(&graph, &inputs).unwrap();
+
+        // D = A * B * C, should be 2x2
+        assert_eq!(result.shape().dims(), &[2, 2]);
+        // A*B = [[1,1,1,1],[1,1,1,1]] (2x4, first 2 rows of B)
+        // Wait: A = [[1,0,0],[0,1,0]], B = 3x4 all ones
+        // A*B = [[1,1,1,1],[1,1,1,1]] (takes rows 0 and 1 of B)
+        // (A*B)*C = [[1,1,1,1],[1,1,1,1]] * [[1,0],[0,1],[0,0],[0,0]]
+        //         = [[1,1],[1,1]]
+        let data = result.as_slice();
+        assert!((data[0] - 1.0).abs() < 1e-12);
+        assert!((data[1] - 1.0).abs() < 1e-12);
+        assert!((data[2] - 1.0).abs() < 1e-12);
+        assert!((data[3] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn contract_once_convenience() {
+        let i = IndexId::from_raw(900);
+        let j = IndexId::from_raw(901);
+        let k = IndexId::from_raw(902);
+
+        let spec = ContractionSpec::new(
+            vec![
+                (TensorId::new(0), vec![i, j]),
+                (TensorId::new(1), vec![j, k]),
+            ],
+            vec![i, k],
+        )
+        .unwrap();
+
+        // A = [[1,2],[3,4],[5,6]] (3x2)
+        let a = DenseTensor::from_vec(
+            TensorShape::row_major(&[3, 2]),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
+        // B = [[1,0],[0,1]] (2x2 identity)
+        let b = DenseTensor::from_vec(
+            TensorShape::row_major(&[2, 2]),
+            vec![1.0, 0.0, 0.0, 1.0],
+        );
+
+        let mut inputs = HashMap::new();
+        inputs.insert(TensorId::new(0), &a);
+        inputs.insert(TensorId::new(1), &b);
+
+        let executor = ContractionExecutor::new(NaiveBackend);
+        let result = executor
+            .contract_once(&spec, &inputs, &GreedyOptimizer, &CostMetric::default(), None)
+            .unwrap();
+
+        // A * I = A
+        assert_eq!(result.shape().dims(), &[3, 2]);
+        let data = result.as_slice();
+        assert!((data[0] - 1.0).abs() < 1e-12);
+        assert!((data[1] - 2.0).abs() < 1e-12);
+        assert!((data[4] - 5.0).abs() < 1e-12);
+        assert!((data[5] - 6.0).abs() < 1e-12);
     }
 }

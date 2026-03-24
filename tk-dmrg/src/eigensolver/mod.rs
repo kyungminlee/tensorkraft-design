@@ -329,25 +329,275 @@ impl IterativeEigensolver<f64> for DavidsonSolver {
         dim: usize,
         initial: InitialSubspace<'_, f64>,
     ) -> EigenResult<f64> {
-        // Delegate to Lanczos for the draft implementation
-        let lanczos = LanczosSolver {
-            max_krylov_dim: self.max_subspace,
-            restart_vectors: self.restart_vectors,
-            max_iter: self.max_iter,
-            tol: self.tol,
-        };
-        lanczos.lowest_eigenpair(matvec, dim, initial)
+        let max_sub = self.max_subspace.min(dim);
+        let mut matvec_count = 0;
+
+        // Initialize starting vector
+        let mut v0 = vec![0.0; dim];
+        match initial {
+            InitialSubspace::SingleVector(v) => v0.copy_from_slice(v),
+            _ => {
+                for (i, val) in v0.iter_mut().enumerate() {
+                    *val = ((i * 7 + 13) % 97) as f64 / 97.0 - 0.5;
+                }
+            }
+        }
+        let norm: f64 = v0.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > 0.0 {
+            for x in &mut v0 {
+                *x /= norm;
+            }
+        }
+
+        // Subspace basis vectors (column-major conceptually, stored as Vec of Vecs)
+        let mut basis: Vec<Vec<f64>> = Vec::with_capacity(max_sub);
+        // Corresponding A*v products
+        let mut ab: Vec<Vec<f64>> = Vec::with_capacity(max_sub);
+        // Projected Hamiltonian (subspace_dim x subspace_dim, row-major)
+        let mut h_sub: Vec<f64> = Vec::new();
+
+        basis.push(v0);
+        let mut av = vec![0.0; dim];
+        matvec(&basis[0], &mut av);
+        matvec_count += 1;
+        ab.push(av);
+
+        let mut eigenvalue = 0.0;
+        let mut eigenvector = basis[0].clone();
+        let mut residual_norm = f64::INFINITY;
+
+        for _iter in 0..self.max_iter {
+            let nsub = basis.len();
+
+            // Build projected Hamiltonian H_sub[i,j] = basis[i] · ab[j]
+            h_sub.resize(nsub * nsub, 0.0);
+            for i in 0..nsub {
+                for j in i..nsub {
+                    let dot: f64 = basis[i].iter().zip(ab[j].iter()).map(|(a, b)| a * b).sum();
+                    h_sub[i * nsub + j] = dot;
+                    h_sub[j * nsub + i] = dot;
+                }
+            }
+
+            // Solve small eigenvalue problem via Jacobi rotations
+            let (evals, evecs) = symmetric_eigen_small(&h_sub, nsub);
+
+            // Find lowest eigenvalue
+            let min_idx = evals
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+
+            eigenvalue = evals[min_idx];
+
+            // Expand eigenvector in full space: y = Σ_i c_i * basis[i]
+            eigenvector.fill(0.0);
+            for i in 0..nsub {
+                let c = evecs[i * nsub + min_idx]; // column min_idx
+                for (j, val) in basis[i].iter().enumerate() {
+                    eigenvector[j] += c * val;
+                }
+            }
+
+            // Compute residual: r = A*y - θ*y
+            let mut residual = vec![0.0; dim];
+            // A*y = Σ_i c_i * ab[i]
+            for i in 0..nsub {
+                let c = evecs[i * nsub + min_idx];
+                for (j, val) in ab[i].iter().enumerate() {
+                    residual[j] += c * val;
+                }
+            }
+            for j in 0..dim {
+                residual[j] -= eigenvalue * eigenvector[j];
+            }
+
+            residual_norm = residual.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if residual_norm < self.tol {
+                return EigenResult {
+                    eigenvalue,
+                    eigenvector,
+                    converged: true,
+                    matvec_count,
+                    residual_norm,
+                };
+            }
+
+            // Apply diagonal preconditioner: t_i = r_i / (θ - H_ii)
+            // This is the key Davidson correction step
+            let mut correction = residual;
+            if let Some(ref diag) = self.diagonal {
+                for i in 0..dim {
+                    let denom = eigenvalue - diag[i];
+                    if denom.abs() > 1e-14 {
+                        correction[i] /= denom;
+                    }
+                    // If denom ~ 0, leave correction[i] unchanged
+                }
+            }
+
+            // Orthogonalize correction against existing basis (modified Gram-Schmidt)
+            for bv in &basis {
+                let dot: f64 = bv.iter().zip(correction.iter()).map(|(a, b)| a * b).sum();
+                for j in 0..dim {
+                    correction[j] -= dot * bv[j];
+                }
+            }
+
+            let cnorm: f64 = correction.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if cnorm < 1e-14 {
+                // Preconditioned correction collapsed into existing subspace.
+                // Fall back to the raw (unpreconditioned) residual.
+                let mut raw_residual = vec![0.0; dim];
+                for i in 0..nsub {
+                    let c_coeff = evecs[i * nsub + min_idx];
+                    for (j, val) in ab[i].iter().enumerate() {
+                        raw_residual[j] += c_coeff * val;
+                    }
+                }
+                for j in 0..dim {
+                    raw_residual[j] -= eigenvalue * eigenvector[j];
+                }
+                // Orthogonalize the raw residual
+                for bv in &basis {
+                    let dot: f64 = bv.iter().zip(raw_residual.iter()).map(|(a, b)| a * b).sum();
+                    for j in 0..dim {
+                        raw_residual[j] -= dot * bv[j];
+                    }
+                }
+                let rnorm: f64 = raw_residual.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if rnorm < 1e-14 {
+                    break; // Truly converged or stagnated
+                }
+                correction = raw_residual;
+                for x in &mut correction {
+                    *x /= rnorm;
+                }
+            } else {
+                for x in &mut correction {
+                    *x /= cnorm;
+                }
+            }
+
+            // Check if we need to restart
+            if nsub >= max_sub {
+                if nsub >= dim {
+                    // Full subspace — we have the exact answer, stop
+                    break;
+                }
+                // Restart: keep only the current best eigenvector
+                let mut new_av = vec![0.0; dim];
+                matvec(&eigenvector, &mut new_av);
+                matvec_count += 1;
+                basis.clear();
+                ab.clear();
+                basis.push(eigenvector.clone());
+                ab.push(new_av);
+                continue;
+            }
+
+            // Add correction to subspace
+            let mut new_av = vec![0.0; dim];
+            matvec(&correction, &mut new_av);
+            matvec_count += 1;
+            basis.push(correction);
+            ab.push(new_av);
+        }
+
+        EigenResult {
+            eigenvalue,
+            eigenvector,
+            converged: residual_norm < self.tol,
+            matvec_count,
+            residual_norm,
+        }
     }
 
     fn lowest_k_eigenpairs(
         &self,
         matvec: &dyn Fn(&[f64], &mut [f64]),
         dim: usize,
-        k: usize,
+        _k: usize,
         initial: InitialSubspace<'_, f64>,
     ) -> Vec<EigenResult<f64>> {
         vec![self.lowest_eigenpair(matvec, dim, initial)]
     }
+}
+
+/// Solve a small symmetric eigenvalue problem via Jacobi iteration.
+/// Returns (eigenvalues, eigenvectors) where eigenvectors are stored column-major
+/// in a flat array of size n*n.
+fn symmetric_eigen_small(mat: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    // Copy matrix
+    let mut a = mat.to_vec();
+    // Initialize eigenvectors to identity
+    let mut v = vec![0.0; n * n];
+    for i in 0..n {
+        v[i * n + i] = 1.0;
+    }
+
+    // Jacobi rotation iteration
+    for _ in 0..100 * n * n {
+        // Find largest off-diagonal element
+        let mut max_val = 0.0_f64;
+        let mut p = 0;
+        let mut q = 1;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if a[i * n + j].abs() > max_val {
+                    max_val = a[i * n + j].abs();
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+
+        if max_val < 1e-15 {
+            break;
+        }
+
+        // Compute rotation angle
+        let app = a[p * n + p];
+        let aqq = a[q * n + q];
+        let apq = a[p * n + q];
+        let theta = if (app - aqq).abs() < 1e-30 {
+            std::f64::consts::FRAC_PI_4
+        } else {
+            0.5 * (2.0 * apq / (app - aqq)).atan()
+        };
+
+        let c = theta.cos();
+        let s = theta.sin();
+
+        // Apply Jacobi rotation to A: A' = G^T A G
+        let mut new_a = a.clone();
+        for i in 0..n {
+            if i != p && i != q {
+                new_a[i * n + p] = c * a[i * n + p] + s * a[i * n + q];
+                new_a[p * n + i] = new_a[i * n + p];
+                new_a[i * n + q] = -s * a[i * n + p] + c * a[i * n + q];
+                new_a[q * n + i] = new_a[i * n + q];
+            }
+        }
+        new_a[p * n + p] = c * c * app + 2.0 * s * c * apq + s * s * aqq;
+        new_a[q * n + q] = s * s * app - 2.0 * s * c * apq + c * c * aqq;
+        new_a[p * n + q] = 0.0;
+        new_a[q * n + p] = 0.0;
+        a = new_a;
+
+        // Update eigenvectors: V' = V * G
+        for i in 0..n {
+            let vip = v[i * n + p];
+            let viq = v[i * n + q];
+            v[i * n + p] = c * vip + s * viq;
+            v[i * n + q] = -s * vip + c * viq;
+        }
+    }
+
+    let eigenvalues: Vec<f64> = (0..n).map(|i| a[i * n + i]).collect();
+    (eigenvalues, v)
 }
 
 /// Block-Davidson eigensolver for targeting multiple eigenvalues simultaneously.
@@ -454,5 +704,99 @@ mod tests {
         let solver = DavidsonSolver::default();
         assert_eq!(solver.max_subspace, 60);
         assert!((solver.tol - 1e-10).abs() < 1e-20);
+    }
+
+    #[test]
+    fn davidson_diagonal_matrix() {
+        // H = diag(3, 1, 4, 1, 5) — lowest eigenvalue is 1.0
+        let diag_vals = vec![3.0, 1.0, 4.0, 1.0, 5.0];
+        let matvec = |x: &[f64], y: &mut [f64]| {
+            for (i, (xi, yi)) in x.iter().zip(y.iter_mut()).enumerate() {
+                *yi = diag_vals[i] * xi;
+            }
+        };
+
+        let solver = DavidsonSolver {
+            diagonal: Some(diag_vals.clone()),
+            ..Default::default()
+        };
+        let result = solver.lowest_eigenpair(&matvec, 5, InitialSubspace::None);
+
+        assert!(
+            (result.eigenvalue - 1.0).abs() < 1e-6,
+            "Expected eigenvalue ~1.0, got {}",
+            result.eigenvalue
+        );
+        assert!(result.converged);
+    }
+
+    #[test]
+    fn davidson_tridiagonal_2x2() {
+        // H = [[2, -1], [-1, 2]], eigenvalues are 1 and 3
+        let matvec = |x: &[f64], y: &mut [f64]| {
+            y[0] = 2.0 * x[0] - x[1];
+            y[1] = -x[0] + 2.0 * x[1];
+        };
+
+        let solver = DavidsonSolver {
+            diagonal: Some(vec![2.0, 2.0]),
+            tol: 1e-8,
+            ..Default::default()
+        };
+        let result = solver.lowest_eigenpair(&matvec, 2, InitialSubspace::None);
+
+        assert!(
+            (result.eigenvalue - 1.0).abs() < 1e-6,
+            "Expected eigenvalue ~1.0, got {}",
+            result.eigenvalue
+        );
+        assert!(result.converged);
+    }
+
+    #[test]
+    fn davidson_without_preconditioner() {
+        // Should still work (falls back to plain correction)
+        let diag_vals = vec![5.0, 2.0, 8.0, 1.0, 3.0];
+        let matvec = |x: &[f64], y: &mut [f64]| {
+            for (i, (xi, yi)) in x.iter().zip(y.iter_mut()).enumerate() {
+                *yi = diag_vals[i] * xi;
+            }
+        };
+
+        let solver = DavidsonSolver {
+            diagonal: None,
+            tol: 1e-8,
+            ..Default::default()
+        };
+        let result = solver.lowest_eigenpair(&matvec, 5, InitialSubspace::None);
+
+        assert!(
+            (result.eigenvalue - 1.0).abs() < 1e-6,
+            "Expected eigenvalue ~1.0, got {}",
+            result.eigenvalue
+        );
+    }
+
+    #[test]
+    fn symmetric_eigen_small_test() {
+        // Test the small eigenvalue solver with a known 3x3 matrix
+        // H = [[2, -1, 0], [-1, 2, -1], [0, -1, 2]]
+        // Eigenvalues: 2 - sqrt(2), 2, 2 + sqrt(2)
+        let mat = vec![
+            2.0, -1.0, 0.0,
+            -1.0, 2.0, -1.0,
+            0.0, -1.0, 2.0,
+        ];
+        let (evals, _evecs) = symmetric_eigen_small(&mat, 3);
+        let mut sorted = evals.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let expected_min = 2.0 - std::f64::consts::SQRT_2;
+        assert!(
+            (sorted[0] - expected_min).abs() < 1e-10,
+            "Expected {}, got {}",
+            expected_min,
+            sorted[0]
+        );
     }
 }

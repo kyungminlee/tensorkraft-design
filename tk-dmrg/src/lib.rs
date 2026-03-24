@@ -43,8 +43,8 @@ pub use environments::{
 
 // DMRG engine
 pub use sweep::{
-    DMRGConfig, DMRGEngine, DMRGStats, StepResult, SweepDirection, SweepSchedule,
-    UpdateVariant,
+    DMRGConfig, DMRGEngine, DMRGRuntimeState, DMRGStats, StepResult, SweepDirection,
+    SweepSchedule, UpdateVariant,
 };
 
 // Eigensolvers
@@ -59,10 +59,10 @@ pub use truncation::{
 };
 
 // TDVP
-pub use tdvp::{TdvpDriver, TdvpStabilizationConfig, TdvpStepResult, exp_krylov};
+pub use tdvp::{TdvpDriver, TdvpStabilizationConfig, TdvpStepResult, exp_krylov, exp_krylov_f64};
 
 // Excited states
-pub use excited::{ExcitedStateConfig, build_heff_penalized};
+pub use excited::{ExcitedStateConfig, build_heff_penalized, build_heff_penalized_from_config};
 
 // Infinite DMRG
 pub use idmrg::{IDmrgConfig, run_idmrg};
