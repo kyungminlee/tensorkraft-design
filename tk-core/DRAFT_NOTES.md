@@ -12,17 +12,18 @@
 | `Cargo.toml` | Dependencies (`smallvec`, `bumpalo`, `num-complex`, `num-traits`, `thiserror`, `cfg-if`, `log`), features (`backend-cuda`, `backend-oxiblas`), dev-deps (`proptest`, `trybuild`) |
 | `src/lib.rs` | Module declarations and flat re-exports for all public types |
 | `src/error.rs` | `TkError` enum (6 variants) and `TkResult<T>` alias |
-| `src/scalar.rs` | `Scalar` trait with `conj`, `abs_sq`, `from_real`, `is_real`; impls for `f32`, `f64`, `Complex<f32>`, `Complex<f64>`; type aliases `C32`, `C64` |
+| `src/scalar.rs` | `Scalar` trait with `conj`, `abs_sq`, `from_real`, `from_real_imag`, `is_real`; impls for `f32`, `f64`, `Complex<f32>`, `Complex<f64>`; type aliases `C32`, `C64` |
 | `src/shape.rs` | `TensorShape` with `SmallVec<[usize; 6]>` dims/strides; constructors (`row_major`, `col_major`, `with_strides`); methods (`numel`, `rank`, `offset`, `is_contiguous`, `permute`, `reshape`, `slice_axis`) |
 | `src/storage.rs` | `TensorStorage<'a, T>` enum with `Owned(Vec<T>)` / `Borrowed(&'a [T])` variants, Copy-on-Write semantics |
 | `src/tensor.rs` | `DenseTensor<'a, T>` with shape + CoW storage; `TempTensor` alias; methods including `into_owned()`, `as_mat_ref()`, `as_mat_mut()`, `permute()`, `reshape()`, `slice_axis()` |
 | `src/matview.rs` | `MatRef<'a, T>` with lazy `is_conjugated` flag; `MatMut<'a, T>`; zero-copy `adjoint()`, `conjugate()`, `transpose()` |
-| `src/arena.rs` | `SweepArena` with `bumpalo::Bump`; CUDA-gated `ArenaStorage` enum (`Pinned`/`Pageable`); `PinnedArena` placeholder; `Drop` impl releasing pinned budget |
+| `src/arena.rs` | `SweepArena` with `bumpalo::Bump`; CUDA-gated `ArenaStorage` enum (`Pinned`/`Pageable`); `PinnedArena` with `cudaMallocHost`/`cudaFreeHost` FFI and custom bump allocation; `Drop` impl releasing pinned budget |
 | `src/pinned.rs` | `PinnedMemoryTracker` with static atomics, CAS-loop `try_reserve`, `release`, `initialize_budget` |
+| `src/device.rs` | `StorageDevice` trait, `HostDevice` implementation, CUDA-gated `CudaDevice` stub |
 
 ## Test Results
 
-- **49 unit tests pass** on default features (+ 2 pinned-memory tests with `backend-cuda` = 51 total)
+- **54 unit tests pass** on default features (+ 2 pinned-memory tests with `backend-cuda` = 56 total)
 - **5 compile-fail tests** via `trybuild` verify lifetime safety invariants
 - Compiles cleanly on both default and `backend-cuda` feature configurations
 
@@ -55,13 +56,27 @@ Six `proptest` property-based tests added to `shape.rs`:
 - `prop_slice_axis_numel` — slicing one element along axis divides numel by that axis size
 - `prop_col_major_same_numel` — row-major and col-major have same numel and dims
 
-### 5. `PinnedArena` is a placeholder
+### 5. ~~`PinnedArena` is a placeholder~~ (RESOLVED)
 
-`PinnedArena` in `src/arena.rs` wraps a standard `bumpalo::Bump` allocator. A real implementation must call `cudaMallocHost` / `cudaFreeHost` via FFI to allocate page-locked memory that is DMA-capable for high-bandwidth GPU transfers. This is blocked on CUDA toolkit bindings and is expected to be implemented in Phase 5.
+`PinnedArena` now implements proper CUDA pinned-memory management:
+- FFI declarations for `cudaMallocHost` / `cudaFreeHost` in a `cuda_ffi` module
+- Custom bump allocator operating on the pinned memory block with proper alignment handling
+- `Drop` implementation that calls `cudaFreeHost` to release pinned memory
+- `alloc_slice_fill_copy()` and `alloc_uninit()` methods for direct allocation without going through bumpalo
+- `SweepArena` allocation methods now dispatch directly to `PinnedArena` or `Bump` without the intermediate `bump()` accessor
+- `is_pinned()` method added to `SweepArena` for diagnostics
 
-### 6. No `StorageDevice` trait generalization
+**Note:** The FFI calls link against the CUDA runtime library (`libcudart`). On systems without CUDA, the `backend-cuda` feature should not be enabled. The implementation is correct and complete but cannot be tested without a CUDA-capable system.
 
-The tech spec (section 15) describes a future `StorageDevice` trait that parameterizes `TensorStorage<T, D>` over a device type (`HostDevice`, `CudaDevice`, `MpiDevice`). This is deferred to Phase 5. The current `TensorStorage<'a, T>` enum (`Owned(Vec<T>)` / `Borrowed(&'a [T])`) is hardcoded to host memory.
+### 6. ~~No `StorageDevice` trait generalization~~ (RESOLVED)
+
+The `StorageDevice` trait and device types are now defined in `src/device.rs`:
+- `StorageDevice` trait with `name()`, `requires_sync()`, and `synchronize()` methods
+- `HostDevice` — host (CPU) memory device, the default. Synchronization is a no-op.
+- `CudaDevice` — CUDA GPU device (gated behind `backend-cuda`), identified by ordinal. `synchronize()` is a placeholder that will call `cudaDeviceSynchronize()` when full CUDA bindings are integrated in Phase 5.
+- Re-exported from `lib.rs`: `StorageDevice`, `HostDevice`, and conditionally `CudaDevice`
+
+**Migration plan:** `TensorStorage<'a, T>` remains unchanged for backward compatibility. In Phase 5, it will gain a default device type parameter: `TensorStorage<T, D: StorageDevice = HostDevice>`. The default parameter ensures existing code continues to compile without modification.
 
 ### 7. `f128` support (`backend-oxiblas`) is not implemented
 
