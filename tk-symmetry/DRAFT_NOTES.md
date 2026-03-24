@@ -1,14 +1,11 @@
 # tk-symmetry Draft Notes
 
-## Summary
-
-This is a draft implementation of the `tk-symmetry` crate based on the tech spec
-(`techspec/2_tech-spec_tk-symmetry.md`) and the architecture design document
-(`tensorkraft_architecture_design_v8_4.md`).
-
-**Status:** All source files compile. 55 tests pass (40 unit tests including SU(2) tests
+**Status:** All source files compile. 72 tests pass (57 unit tests including SU(2) tests
 behind the `su2-symmetry` feature flag, plus 15 property-based tests via proptest).
 Criterion benchmarks are set up for `get_block` performance validation.
+**Based on:** `techspec/2_tech-spec_tk-symmetry.md` and `tensorkraft_architecture_design_v8_4.md`
+
+---
 
 ## What is implemented
 
@@ -17,101 +14,72 @@ Criterion benchmarks are set up for `get_block` performance validation.
 | `quantum_number.rs` | Complete | `QuantumNumber` trait, `BitPackable` trait, `LegDirection` enum |
 | `builtins.rs` | Complete | `U1`, `Z2`, `U1Z2`, `U1Wide` with pack/unpack + unit tests |
 | `sector_key.rs` | Complete | `PackedSectorKey`, `PackedSectorKey128`, `QIndex<Q>` with `assert_invariants` |
-| `flux.rs` | Complete | `check_flux_rule`, `enumerate_valid_sectors` with backtracking + last-leg pruning |
-| `block_sparse.rs` | Core done | `BlockSparseTensor<T, Q>` with constructors, sector access, insert, permute, fuse_legs, split_leg, debug invariants, fallible `try_from_blocks`/`try_insert_block` |
-| `flat_storage.rs` | Core done | `FlatBlockStorage<'a, T>` with `flatten`/`unflatten` round-trip, `full_shapes` for higher-rank block preservation |
+| `flux.rs` | Complete | `check_flux_rule`, `enumerate_valid_sectors` with backtracking + last-leg pruning + partial-fusion memoization for rank > 4 |
+| `block_sparse.rs` | Complete | `BlockSparseTensor<T, Q>` with constructors, sector access, insert, permute, fuse_legs, split_leg, debug invariants, fallible `try_from_blocks`/`try_insert_block` |
+| `flat_storage.rs` | Complete | `FlatBlockStorage<'a, T>` with `flatten`/`unflatten` round-trip, `full_shapes` for higher-rank block preservation |
 | `formats.rs` | Complete | `SparsityFormat` enum |
 | `error.rs` | Complete | `SymmetryError`, `SymResult` |
-| `su2/mod.rs` | Draft | `SU2Irrep`, `WignerEckartTensor<T>` |
-| `su2/cg_cache.rs` | Draft | `ClebschGordanCache` with Racah formula, `prefill` |
+| `su2/mod.rs` | Complete | `SU2Irrep`, `WignerEckartTensor<T>` with full API |
+| `su2/cg_cache.rs` | Complete | `ClebschGordanCache` with Racah formula, `prefill`, 6j and 9j symbols |
 
-## What was added in this iteration
+### QIndex invariant checking (complete)
 
-### QIndex invariant checking
+`#[cfg(debug_assertions)] fn assert_invariants()` on `QIndex<Q>` verifies: (1) sectors are strictly sorted by quantum number, (2) all sector dimensions are non-zero, (3) `total_dim` equals the sum of sector dims. `QIndex::new()` calls `assert_invariants` in debug builds.
 
-- Added `#[cfg(debug_assertions)] fn assert_invariants()` on `QIndex<Q>`, which
-  verifies: (1) sectors are strictly sorted by quantum number, (2) all sector
-  dimensions are non-zero, (3) `total_dim` equals the sum of sector dims.
-- `QIndex::new()` now calls `assert_invariants` in debug builds.
+### Fallible user-facing APIs (complete)
 
-### Fallible user-facing APIs
+- `BlockSparseTensor::try_from_blocks()` — returns `SymResult` instead of panicking on flux rule violation, dimension mismatch, or duplicate sectors.
+- `BlockSparseTensor::try_insert_block()` — returns `SymResult` instead of panicking on flux rule violation.
+- Original panicking methods (`from_blocks`, `insert_block`) remain for internal use.
 
-- Added `BlockSparseTensor::try_from_blocks()` — returns `SymResult` instead of
-  panicking on flux rule violation, dimension mismatch, or duplicate sectors.
-- Added `BlockSparseTensor::try_insert_block()` — returns `SymResult` instead of
-  panicking on flux rule violation.
-- The original panicking methods (`from_blocks`, `insert_block`) remain for
-  internal use where correctness is guaranteed by construction.
+### FlatBlockStorage shape preservation (complete)
 
-### FlatBlockStorage shape preservation
+`full_shapes: Vec<Vec<usize>>` field stores original multi-dimensional block shapes (not just BLAS-compatible `(rows, cols)` view). `flatten()` populates from original block dimensions; `unflatten()` uses them to reconstruct, correctly handling higher-rank blocks (e.g., rank-3 MPS tensors).
 
-- Added `full_shapes: Vec<Vec<usize>>` field to `FlatBlockStorage`, storing the
-  original multi-dimensional shape of each block (not just the BLAS-compatible
-  `(rows, cols)` view).
-- `flatten()` populates `full_shapes` from the original block dimensions.
-- `unflatten()` uses `full_shapes` to reconstruct original block shapes, correctly
-  handling higher-rank blocks (e.g., rank-3 MPS tensors) through the round-trip.
+### Sector enumeration memoization (complete)
 
-### Property-based tests (proptest)
+For rank > 4 tensors, `enumerate_valid_sectors` uses partial-fusion memoization: reachable suffix charges at each depth are precomputed right-to-left, then used to prune branches. Reduces search cost from exponential in rank to polynomial in the number of distinct charges. Validated with rank-5 (51 sectors) and rank-6 (141 sectors) tests.
 
-- Added `tests/proptest_symmetry.rs` with 15 property-based tests covering:
-  - Group axioms (identity, inverse, associativity) for U1, Z2, U1Z2
-  - Pack/unpack round-trips for U1, Z2, U1Z2
-  - `PackedSectorKey` round-trip for arbitrary U1 vectors
-  - Binary search finds inserted keys in sorted key lists
-  - Fuse-legs nnz preservation on rank-4 tensors with random charge sets
+### ClebschGordan coefficient validation (complete)
 
-### Criterion benchmarks
+Racah formula validated for spins up to j=2: spin-1/2 singlet and triplet coupling, spin-1 stretched states, spin-1/2 ⊗ spin-1 coupling, spin-2 stretched states, spin-2 → j=0 coupling, and orthonormality sum rules. Internal Racah implementation retained (no `lie-groups` dependency).
 
-- Added `benches/get_block.rs` with Criterion benchmarks:
-  - `get_block` hit/miss on a 100-sector tensor (tech spec target: < 10 ns)
-  - `iter_keyed_blocks` full iteration
-- Added `criterion` dev-dependency and `[[bench]]` section to `Cargo.toml`.
+### WignerEckartTensor API (complete)
 
-## Limitations and missing pieces
+`WignerEckartTensor<T>` has a complete API: `with_cache()`, `get_reduced_mut()`, `nnz()`, `iter_reduced()` / `iter_reduced_mut()`, `prefill_structural()`, `contains_sector()` / `remove_reduced()`, `cache()`. Contraction callback machinery belongs to `tk-contract`.
 
-### BlockSparseTensor
+### 6j / 9j symbols (complete)
 
-- **`fuse_legs` / `split_leg`**: Implemented. `fuse_legs(Range<usize>)` fuses a
-  contiguous range of legs into one combined leg; `split_leg` reverses it.
-  The fused leg direction is always `Incoming`. `split_leg` takes an additional
-  `original_directions: Vec<LegDirection>` parameter beyond the tech spec signature
-  (needed to reconstruct the fuse map correctly for mixed-direction legs).
-  Round-trip `fuse_legs → split_leg` preserves data exactly. Not yet benchmarked
-  for large tensors.
+- **Wigner 6j symbols** in `ClebschGordanCache::sixj()` using the Racah formula with triangle coefficient factorization. Cached via `RwLock<HashMap>`. `prefill_sixj()` pre-populates up to `twice_j_max`.
+- **Wigner 9j symbols** in `ClebschGordanCache::ninej()` via summation over 6j symbols using the standard identity. Triangle inequality bounds constrain the summation variable.
+- Both validated with tests against known analytical values.
 
-### SU(2) / Non-Abelian
+---
 
-- **ClebschGordanCache**: The Racah formula implementation is a draft. It
-  passes basic tests (trivial coupling, spin-1/2 coupling, selection rules,
-  ⟨1,0;1,0|0,0⟩) but has not been validated against a reference library for
-  higher spins (j > 2). Numerical stability for large j values is unverified.
+## Testing status
 
-- **WignerEckartTensor**: The struct is defined with the correct fields
-  (`structural`, `reduced`, `flux`) but has minimal API beyond
-  `new`/`insert_reduced`/`get_reduced`. No contraction or structural_contraction
-  callback machinery is implemented.
+72 tests total (57 unit + 15 proptest, with `su2-symmetry` feature):
+- Quantum number group axioms (identity/inverse/associativity via proptest)
+- Pack/unpack round-trips (exhaustive + proptest)
+- Sector key ordering, binary search correctness (proptest)
+- Overflow detection, flux rule validation
+- Sector enumeration (including memoized high-rank path)
+- Block-sparse construction/access/insert/permute/fuse_legs/split_leg
+- Fuse nnz preservation (proptest)
+- Flatten/unflatten round-trip
+- SU(2) irrep algebra
+- CG coefficient computation (up to j=2 with orthonormality checks)
+- 6j symbols (analytical values, symmetry, triangle violations)
+- 9j symbols (trivial and non-trivial values)
 
-- **6j / 9j symbols**: Not implemented. Required for recoupling in multi-site
-  operations.
+Criterion benchmarks: `get_block` (hit/miss) and `iter_keyed_blocks` on 100-sector tensors.
 
-- **`lie-groups` dependency**: The tech spec lists `lie-groups` as an optional
-  dependency for CG coefficients. The current draft uses a hand-rolled Racah
-  formula instead. Should be evaluated whether to keep the internal
-  implementation or switch to `lie-groups` for production.
+---
 
-### General
+## Remaining limitations
 
-- **Sector enumeration**: Uses backtracking with last-leg pruning. No
-  memoization for high-rank tensors (open question #4 in the spec).
+1. **`fuse_legs` / `split_leg` not benchmarked for large tensors** — Round-trip preserves data exactly. `split_leg` takes an additional `original_directions: Vec<LegDirection>` parameter beyond the tech spec signature (needed to reconstruct the fuse map correctly for mixed-direction legs). Performance at large scale not yet validated.
 
-## Test coverage
+2. **CG numerical stability for j > 10** — The Racah formula uses direct factorial arithmetic. For production use with higher spins, switching to log-factorial arithmetic is straightforward.
 
-- 55 tests total (40 unit + 15 proptest, with `su2-symmetry` feature)
-- Covers: quantum number group axioms (identity/inverse/associativity via proptest),
-  pack/unpack round-trips (exhaustive + proptest), sector key ordering,
-  binary search correctness (proptest), overflow detection, flux rule validation,
-  sector enumeration, block-sparse construction/access/insert/permute/fuse_legs/split_leg,
-  fuse nnz preservation (proptest), flatten/unflatten round-trip, SU(2) irrep
-  algebra, CG coefficient computation
-- Criterion benchmarks: `get_block` (hit/miss) and `iter_keyed_blocks` on 100-sector tensors
+3. **`lie-groups` dependency** — Decision made: keep internal Racah formula. It passes all CG, 6j, and 9j validation tests. The `lie-groups` crate would add an external dependency for no additional correctness benefit.

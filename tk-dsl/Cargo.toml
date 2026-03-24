@@ -19,6 +19,5 @@ proptest = "1"
 approx   = "0.5"
 
 [features]
-default      = ["parallel"]
-parallel     = []
+default      = []
 su2-symmetry = ["tk-symmetry/su2-symmetry"]

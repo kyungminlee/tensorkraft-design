@@ -12,6 +12,7 @@
 //! - **Shared error types** — `TkError` and `TkResult`
 
 pub mod arena;
+pub mod device;
 pub mod error;
 pub mod matview;
 pub mod scalar;
@@ -24,6 +25,7 @@ pub mod pinned;
 
 // Flat re-exports for ergonomic downstream use:
 pub use arena::SweepArena;
+pub use device::{HostDevice, StorageDevice};
 pub use error::{TkError, TkResult};
 pub use matview::{MatMut, MatRef};
 pub use scalar::{Scalar, C32, C64};
@@ -31,5 +33,7 @@ pub use shape::TensorShape;
 pub use storage::TensorStorage;
 pub use tensor::{DenseTensor, TempTensor};
 
+#[cfg(feature = "backend-cuda")]
+pub use device::CudaDevice;
 #[cfg(feature = "backend-cuda")]
 pub use pinned::PinnedMemoryTracker;

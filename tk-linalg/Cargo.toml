@@ -43,3 +43,8 @@ su2-symmetry = ["tk-symmetry/su2-symmetry"]
 
 [dev-dependencies]
 proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "linalg_benchmarks"
+harness = false

@@ -9,3 +9,8 @@ error[E0505]: cannot move out of `t` because it is borrowed
    |          ^ move out of `t` occurs here
 11 |     let _ = mat.get(0, 0); // ERROR: `t` was moved while `mat` borrows it
    |             --- borrow later used here
+   |
+help: consider cloning the value if the performance cost is acceptable
+   |
+ 9 |     let mat = t.clone().as_mat_ref().unwrap(); // borrows from `t`
+   |                ++++++++

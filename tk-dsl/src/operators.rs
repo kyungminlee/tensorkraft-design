@@ -43,21 +43,15 @@ impl SpinOp {
             SpinOp::Sz => vec![half, zero, zero, neg_half],
             // [0, 0.5; 0.5, 0]
             SpinOp::Sx => vec![zero, half, half, zero],
-            // Sy = -i/2 * (S+ - S-)
-            // For real types this is all zeros (lossy); for complex, [-i/2 at (0,1), i/2 at (1,0)]
-            // We produce zeros for real T and rely on the caller to use Complex.
+            // Sy = -i/2 * (S+ - S-)  →  [0, -i/2; i/2, 0]
+            // For real types this is all zeros (Sy has no real representation).
+            // For complex types, from_real_imag constructs the imaginary entries.
             SpinOp::Sy => {
-                if T::is_real() {
-                    vec![zero, zero, zero, zero]
-                } else {
-                    // (0,1) = -i/2 = from_real(0) * ... need imaginary unit
-                    // Use conj trick: i = from_real(0) doesn't work.
-                    // Actually for Complex<f64>: we need i * 0.5
-                    // Since Scalar doesn't expose an imaginary constructor directly,
-                    // we use a workaround: (0 - conj(half_i)) where half_i constructed via from_real
-                    // This is a known gap — see DRAFT_NOTE.md
-                    vec![zero, zero, zero, zero]
-                }
+                let real_zero = <T::Real as num_traits::cast::NumCast>::from(0.0).unwrap();
+                let real_half = <T::Real as num_traits::cast::NumCast>::from(0.5).unwrap();
+                let neg_i_half = T::from_real_imag(real_zero, -real_half); // -i/2
+                let pos_i_half = T::from_real_imag(real_zero, real_half);  //  i/2
+                vec![zero, neg_i_half, pos_i_half, zero]
             }
             // [1, 0; 0, 1]
             SpinOp::Identity => vec![one, zero, zero, one],
@@ -524,5 +518,27 @@ mod tests {
     fn fermion_adjoint_creation() {
         assert_eq!(FermionOp::CdagUp.adjoint(), FermionOp::CUp);
         assert_eq!(FermionOp::CUp.adjoint(), FermionOp::CdagUp);
+    }
+
+    #[test]
+    fn spin_op_sy_real_zeros() {
+        // For real types, Sy has no representation — entries are zero
+        // because from_real_imag ignores the imaginary part.
+        let mat = SpinOp::Sy.matrix::<f64>();
+        assert_eq!(mat, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn spin_op_sy_complex_correct() {
+        use tk_core::C64;
+        let mat = SpinOp::Sy.matrix::<C64>();
+        // Sy = [0, -i/2; i/2, 0]
+        let zero = C64::new(0.0, 0.0);
+        let neg_i_half = C64::new(0.0, -0.5);
+        let pos_i_half = C64::new(0.0, 0.5);
+        assert_eq!(mat[0], zero);       // (0,0)
+        assert_eq!(mat[1], neg_i_half); // (0,1)
+        assert_eq!(mat[2], pos_i_half); // (1,0)
+        assert_eq!(mat[3], zero);       // (1,1)
     }
 }

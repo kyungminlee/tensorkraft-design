@@ -93,6 +93,16 @@ impl<T: Scalar> WignerEckartTensor<T> {
         }
     }
 
+    /// Construct with a shared CG cache (avoids redundant computation
+    /// when multiple tensors share the same coefficient table).
+    pub fn with_cache(flux: SU2Irrep, cache: ClebschGordanCache) -> Self {
+        WignerEckartTensor {
+            structural: cache,
+            reduced: HashMap::new(),
+            flux,
+        }
+    }
+
     /// Insert a reduced matrix element block for a given sector.
     pub fn insert_reduced(
         &mut self,
@@ -102,15 +112,70 @@ impl<T: Scalar> WignerEckartTensor<T> {
         self.reduced.insert(sector, block);
     }
 
-    /// Get a reduced matrix element block.
+    /// Get a reduced matrix element block (immutable).
     pub fn get_reduced(&self, sector: &[SU2Irrep]) -> Option<&DenseTensor<'static, T>> {
         let key: SmallVec<[SU2Irrep; 6]> = SmallVec::from_slice(sector);
         self.reduced.get(&key)
     }
 
+    /// Get a reduced matrix element block (mutable).
+    pub fn get_reduced_mut(
+        &mut self,
+        sector: &[SU2Irrep],
+    ) -> Option<&mut DenseTensor<'static, T>> {
+        let key: SmallVec<[SU2Irrep; 6]> = SmallVec::from_slice(sector);
+        self.reduced.get_mut(&key)
+    }
+
     /// Number of reduced blocks.
     pub fn n_sectors(&self) -> usize {
         self.reduced.len()
+    }
+
+    /// Total number of stored elements across all reduced blocks.
+    pub fn nnz(&self) -> usize {
+        self.reduced.values().map(|b| b.numel()).sum()
+    }
+
+    /// Iterate over all reduced matrix element blocks with their sector keys.
+    pub fn iter_reduced(
+        &self,
+    ) -> impl Iterator<Item = (&SmallVec<[SU2Irrep; 6]>, &DenseTensor<'static, T>)> {
+        self.reduced.iter()
+    }
+
+    /// Iterate mutably over all reduced matrix element blocks.
+    pub fn iter_reduced_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&SmallVec<[SU2Irrep; 6]>, &mut DenseTensor<'static, T>)> {
+        self.reduced.iter_mut()
+    }
+
+    /// Pre-populate the structural CG cache up to the given twice_j_max.
+    /// Should be called before a DMRG sweep to amortize coefficient computation.
+    pub fn prefill_structural(&self, twice_j_max: u32) {
+        self.structural.prefill(twice_j_max);
+        self.structural.prefill_sixj(twice_j_max);
+    }
+
+    /// Check whether a sector key is present in the reduced map.
+    pub fn contains_sector(&self, sector: &[SU2Irrep]) -> bool {
+        let key: SmallVec<[SU2Irrep; 6]> = SmallVec::from_slice(sector);
+        self.reduced.contains_key(&key)
+    }
+
+    /// Remove a reduced block, returning it if present.
+    pub fn remove_reduced(
+        &mut self,
+        sector: &[SU2Irrep],
+    ) -> Option<DenseTensor<'static, T>> {
+        let key: SmallVec<[SU2Irrep; 6]> = SmallVec::from_slice(sector);
+        self.reduced.remove(&key)
+    }
+
+    /// Reference to the structural CG cache.
+    pub fn cache(&self) -> &ClebschGordanCache {
+        &self.structural
     }
 }
 

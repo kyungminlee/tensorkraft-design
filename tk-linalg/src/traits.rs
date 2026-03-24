@@ -305,13 +305,45 @@ pub(crate) fn construct_regularized_inverse<T: Scalar>(
 }
 
 /// Set the BLAS internal thread count for MKL/OpenBLAS FFI backends.
+///
+/// **Safety invariant:** Must only be called when NO BLAS operations are in
+/// flight. The `ThreadingRegime` enforces this by calling `set_blas_num_threads`
+/// once before the dispatch phase of `block_gemm`, and never concurrently.
+///
 /// No-op for DeviceFaer (Rayon controls its own thread pool).
-pub(crate) fn set_blas_num_threads(_n: usize) {
-    // TODO: implement for MKL/OpenBLAS when those backends are enabled.
-    // #[cfg(feature = "backend-mkl")]
-    // unsafe { intel_mkl_sys::mkl_set_num_threads(_n as i32); }
-    // #[cfg(feature = "backend-openblas")]
-    // unsafe { openblas_src::openblas_set_num_threads(_n as i32); }
+///
+/// When `backend-mkl` is enabled, calls `MKL_Set_Num_Threads`.
+/// When `backend-openblas` is enabled, calls `openblas_set_num_threads`.
+pub(crate) fn set_blas_num_threads(n: usize) {
+    #[cfg(feature = "backend-mkl")]
+    {
+        extern "C" {
+            fn MKL_Set_Num_Threads(n: std::ffi::c_int);
+        }
+        // SAFETY: MKL_Set_Num_Threads is safe to call when no MKL operations
+        // are in flight. The caller (ThreadingRegime dispatch) ensures this.
+        unsafe {
+            MKL_Set_Num_Threads(n as std::ffi::c_int);
+        }
+        log::debug!(target: "tensorkraft::linalg", "MKL threads set to {n}");
+    }
+
+    #[cfg(feature = "backend-openblas")]
+    {
+        extern "C" {
+            fn openblas_set_num_threads(n: std::ffi::c_int);
+        }
+        // SAFETY: Same invariant as MKL — no concurrent BLAS calls.
+        unsafe {
+            openblas_set_num_threads(n as std::ffi::c_int);
+        }
+        log::debug!(target: "tensorkraft::linalg", "OpenBLAS threads set to {n}");
+    }
+
+    #[cfg(not(any(feature = "backend-mkl", feature = "backend-openblas")))]
+    {
+        let _ = n; // suppress unused warning for faer-only builds
+    }
 }
 
 #[cfg(test)]

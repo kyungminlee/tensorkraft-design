@@ -152,12 +152,7 @@ impl<T: Scalar> Default for OpSum<T> {
 // OpSum += ScaledOpProduct
 impl<T: Scalar> std::ops::AddAssign<ScaledOpProduct<T>> for OpSum<T> {
     fn add_assign(&mut self, rhs: ScaledOpProduct<T>) {
-        // In debug builds, panic on out-of-bounds; in release, silently skip.
-        if cfg!(debug_assertions) {
-            self.push_term(rhs).expect("site out of bounds");
-        } else {
-            let _ = self.push_term(rhs);
-        }
+        self.push_term(rhs).expect("site out of bounds in OpSum += ScaledOpProduct");
     }
 }
 
@@ -179,11 +174,11 @@ impl<T: Scalar> std::ops::Add<OpSum<T>> for OpSum<T> {
     }
 }
 
-// OpSum * T → OpSum
-impl std::ops::Mul<f64> for OpSum<f64> {
-    type Output = OpSum<f64>;
+// OpSum * T → OpSum (generic, works for any Scalar)
+impl<T: Scalar> std::ops::Mul<T> for OpSum<T> {
+    type Output = OpSum<T>;
 
-    fn mul(mut self, rhs: f64) -> OpSum<f64> {
+    fn mul(mut self, rhs: T) -> OpSum<T> {
         self.scale(rhs);
         self
     }
