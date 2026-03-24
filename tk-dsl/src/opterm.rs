@@ -4,6 +4,7 @@
 //! (`*`, scalar multiplication) builds `OpProduct` and `ScaledOpProduct`.
 
 use smallvec::SmallVec;
+use num_complex::Complex;
 use tk_core::Scalar;
 
 use crate::operators::SiteOperator;
@@ -122,57 +123,62 @@ impl<T: Scalar> std::ops::Mul<OpTerm<T>> for OpProduct<T> {
     }
 }
 
-// OpTerm * T → ScaledOpProduct
-impl std::ops::Mul<f64> for OpTerm<f64> {
-    type Output = ScaledOpProduct<f64>;
+// Scalar multiplication for all concrete Scalar types (f32, f64, C32, C64).
+// A blanket impl over T: Scalar is impossible due to Rust's orphan rules.
+macro_rules! impl_scalar_mul {
+    ($t:ty) => {
+        // OpTerm * T → ScaledOpProduct
+        impl std::ops::Mul<$t> for OpTerm<$t> {
+            type Output = ScaledOpProduct<$t>;
 
-    fn mul(self, rhs: f64) -> ScaledOpProduct<f64> {
-        ScaledOpProduct {
-            coeff: rhs,
-            product: OpProduct {
-                factors: SmallVec::from_elem(self, 1),
-            },
+            fn mul(self, rhs: $t) -> ScaledOpProduct<$t> {
+                self.scale(rhs)
+            }
         }
-    }
+
+        // T * OpTerm → ScaledOpProduct
+        impl std::ops::Mul<OpTerm<$t>> for $t {
+            type Output = ScaledOpProduct<$t>;
+
+            fn mul(self, rhs: OpTerm<$t>) -> ScaledOpProduct<$t> {
+                rhs.scale(self)
+            }
+        }
+
+        // OpProduct * T → ScaledOpProduct
+        impl std::ops::Mul<$t> for OpProduct<$t> {
+            type Output = ScaledOpProduct<$t>;
+
+            fn mul(self, rhs: $t) -> ScaledOpProduct<$t> {
+                self.scale(rhs)
+            }
+        }
+
+        // T * OpProduct → ScaledOpProduct
+        impl std::ops::Mul<OpProduct<$t>> for $t {
+            type Output = ScaledOpProduct<$t>;
+
+            fn mul(self, rhs: OpProduct<$t>) -> ScaledOpProduct<$t> {
+                rhs.scale(self)
+            }
+        }
+
+        // T * ScaledOpProduct → ScaledOpProduct (rescale)
+        impl std::ops::Mul<ScaledOpProduct<$t>> for $t {
+            type Output = ScaledOpProduct<$t>;
+
+            fn mul(self, mut rhs: ScaledOpProduct<$t>) -> ScaledOpProduct<$t> {
+                rhs.coeff = rhs.coeff * self;
+                rhs
+            }
+        }
+    };
 }
 
-// T * OpTerm → ScaledOpProduct
-impl std::ops::Mul<OpTerm<f64>> for f64 {
-    type Output = ScaledOpProduct<f64>;
-
-    fn mul(self, rhs: OpTerm<f64>) -> ScaledOpProduct<f64> {
-        ScaledOpProduct {
-            coeff: self,
-            product: OpProduct {
-                factors: SmallVec::from_elem(rhs, 1),
-            },
-        }
-    }
-}
-
-// OpProduct * T → ScaledOpProduct
-impl std::ops::Mul<f64> for OpProduct<f64> {
-    type Output = ScaledOpProduct<f64>;
-
-    fn mul(self, rhs: f64) -> ScaledOpProduct<f64> {
-        ScaledOpProduct {
-            coeff: rhs,
-            product: self,
-        }
-    }
-}
-
-// T * OpProduct → ScaledOpProduct
-impl std::ops::Mul<OpProduct<f64>> for f64 {
-    type Output = ScaledOpProduct<f64>;
-
-    fn mul(self, rhs: OpProduct<f64>) -> ScaledOpProduct<f64> {
-        ScaledOpProduct {
-            coeff: self,
-            product: rhs,
-        }
-    }
-}
+impl_scalar_mul!(f32);
+impl_scalar_mul!(f64);
+impl_scalar_mul!(Complex<f32>);
+impl_scalar_mul!(Complex<f64>);
 
 // ScaledOpProduct * OpTerm → ScaledOpProduct (extend product)
 impl<T: Scalar> std::ops::Mul<OpTerm<T>> for ScaledOpProduct<T> {
@@ -181,16 +187,6 @@ impl<T: Scalar> std::ops::Mul<OpTerm<T>> for ScaledOpProduct<T> {
     fn mul(mut self, rhs: OpTerm<T>) -> ScaledOpProduct<T> {
         self.product.factors.push(rhs);
         self
-    }
-}
-
-// T * ScaledOpProduct → ScaledOpProduct (rescale)
-impl std::ops::Mul<ScaledOpProduct<f64>> for f64 {
-    type Output = ScaledOpProduct<f64>;
-
-    fn mul(self, mut rhs: ScaledOpProduct<f64>) -> ScaledOpProduct<f64> {
-        rhs.coeff = rhs.coeff * self;
-        rhs
     }
 }
 
@@ -231,6 +227,42 @@ mod tests {
         let scaled = product.scale(coeff);
         assert_eq!(scaled.coeff, coeff);
         assert_eq!(scaled.product.len(), 2);
+    }
+
+    #[test]
+    fn mul_overload_f32() {
+        let scaled = 0.5_f32 * op::<f32>(SpinOp::Sz, 0);
+        assert!((scaled.coeff - 0.5).abs() < 1e-6);
+        let scaled2 = op::<f32>(SpinOp::Sz, 0) * 0.5_f32;
+        assert!((scaled2.coeff - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mul_overload_c64() {
+        use tk_core::C64;
+        let c = C64::new(1.0, 2.0);
+        // T * OpTerm
+        let scaled = c * op::<C64>(SpinOp::Sz, 0);
+        assert_eq!(scaled.coeff, c);
+        // OpTerm * T
+        let scaled2 = op::<C64>(SpinOp::Sz, 0) * c;
+        assert_eq!(scaled2.coeff, c);
+        // T * OpProduct
+        let product = op::<C64>(SpinOp::Sz, 0) * op(SpinOp::Sz, 1);
+        let scaled3 = c * product;
+        assert_eq!(scaled3.coeff, c);
+        assert_eq!(scaled3.product.len(), 2);
+        // T * ScaledOpProduct (rescale)
+        let rescaled = C64::new(2.0, 0.0) * scaled;
+        assert_eq!(rescaled.coeff, C64::new(2.0, 0.0) * c);
+    }
+
+    #[test]
+    fn mul_overload_c32() {
+        use tk_core::C32;
+        let c = C32::new(0.5, -1.0);
+        let scaled = c * op::<C32>(SpinOp::Sz, 0);
+        assert_eq!(scaled.coeff, c);
     }
 
     #[test]
