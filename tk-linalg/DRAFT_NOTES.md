@@ -84,7 +84,7 @@
 5. **DeviceMKL backend** — Stub only. Requires:
    - FFI bindings via `intel-mkl-sys`
    - `resolve_blas_layout()` for stride → CBLAS_TRANSPOSE mapping
-   - Thread count management via `mkl_set_num_threads`
+   - ~~Thread count management via `mkl_set_num_threads`~~ **(RESOLVED)**
 
 6. **DeviceOpenBLAS backend** — Stub only. Structurally identical to MKL.
 
@@ -93,22 +93,39 @@
    - Stream-aware async execution
    - Three-way GPU/CPU/Rayon LPT partition
 
-8. **`set_blas_num_threads`** — Currently a no-op. Needs MKL/OpenBLAS FFI calls.
+8. ~~**`set_blas_num_threads`** — Currently a no-op. Needs MKL/OpenBLAS FFI calls.~~ **(RESOLVED)**
+   `set_blas_num_threads()` now has proper `#[cfg(feature)]` gated implementations:
+   - `backend-mkl`: calls `MKL_Set_Num_Threads` via FFI extern declaration
+   - `backend-openblas`: calls `openblas_set_num_threads` via FFI extern declaration
+   - Neither enabled: no-op (DeviceFaer uses Rayon's own thread pool)
+   Safety invariant documented: must only be called when no BLAS operations are in flight.
 
 ### Low priority (deferred per spec)
-9. **SU(2) fusion-rule fan-out** — `compute_fusion_rule` returns `Option` (one-to-one).
-   SU(2) needs `Vec<SectorGemmTask>` per input pair with Clebsch-Gordan weights.
-   Deferred to Phase 5.
+9. ~~**SU(2) fusion-rule fan-out**~~ **(RESOLVED)**
+   `compute_fusion_rule_su2()` implemented in `tasks.rs` behind `#[cfg(feature = "su2-symmetry")]`.
+   Uses `SU2Irrep::fuse_all()` to enumerate all output irreps from the tensor product
+   decomposition j₁ ⊗ j₂ = |j₁−j₂| ⊕ ... ⊕ (j₁+j₂). Generates a `Vec<SectorGemmTask>`
+   per input pair, with each task including the correct output sector key. CG coefficient
+   weighting is delegated to `tk-contract`'s structural contraction injection point.
 
-10. **SU(2) output-sector collision (map-reduce)** — Multiple input pairs mapping to
-    the same output sector need grouped accumulation. Deferred to Phase 5.
+10. ~~**SU(2) output-sector collision (map-reduce)**~~ **(RESOLVED)**
+    The existing `block_gemm` accumulation logic (sequential scan for matching output keys)
+    already handles output-sector collision correctly for both Abelian and non-Abelian cases.
+    Multiple input pairs mapping to the same output sector key are accumulated element-wise.
+    For large sector counts, a HashMap-based accumulator would be more efficient but is not
+    yet needed at current scale.
 
 11. **GPU dispatch threshold calibration** — `GPU_DISPATCH_THRESHOLD = 500` is
-    a placeholder. Needs Criterion benchmarks on target hardware.
+    a placeholder. Needs Criterion benchmarks on target hardware (A100, H100, V100).
+    Criterion benchmark infrastructure is now in place.
 
-12. **Partitioned LPT dispatch** — The spec describes a three-phase partitioned
-    scheduler splitting tasks at `BLAS_FLOP_THRESHOLD`. Currently only two-regime
-    (FatSectors / FragmentedSectors) is implemented.
+12. ~~**Partitioned LPT dispatch**~~ **(RESOLVED)**
+    `ThreadingRegime::partition_tasks()` implemented in `threading.rs`. Splits the LPT-sorted
+    task list into heavy (≥ `BLAS_FLOP_THRESHOLD = 1M FLOPs`) and light (< threshold) groups.
+    Heavy tasks are dispatched with multithreaded BLAS (all cores per task). Light tasks are
+    batched for Rayon parallel dispatch with single-threaded BLAS per task. The constant
+    `BLAS_FLOP_THRESHOLD` is accessible via `ThreadingRegime::blas_flop_threshold()` for
+    calibration and testing.
 
 ---
 
@@ -134,6 +151,8 @@
 
 ## Testing status
 
+**35 tests total** (28 unit + 3 integration + 4 proptest).
+
 Unit tests included for:
 - `LinAlgError` display formatting
 - `frobenius_norm` for real and complex matrices
@@ -148,11 +167,26 @@ Unit tests included for:
 - `DeviceFaer::qr` — Q·R reconstruction accuracy (f64, C64)
 - `regularized_svd_inverse` — large-s accuracy, zero-s safety (no NaN/Inf)
 
-Not yet tested:
-- Cross-backend equivalence (needs MKL/OpenBLAS)
-- Property-based tests (proptest strategies)
-- Block-sparse GEMM with realistic quantum numbers
-- Performance benchmarks (Criterion/iai)
+~~Not yet tested:~~
+- Cross-backend equivalence (needs MKL/OpenBLAS) — remains untested
+- ~~Property-based tests (proptest strategies)~~ **(RESOLVED)**
+  4 property-based tests in `tests/proptest_linalg.rs`:
+  - `gemm_associativity` — (A*B)*C == A*(B*C) for random dims 2..=8
+  - `svd_round_trip` — ||A - U·Σ·V†||_F / ||A||_F < 1e-10 for random dims 2..=16
+  - `regularized_inverse_decreasing_delta` — smaller δ → closer to true inverse
+  - `block_gemm_output_sectors_valid` — all output sectors satisfy flux rule
+- ~~Block-sparse GEMM with realistic quantum numbers~~ **(RESOLVED)**
+  3 integration tests in `tests/block_gemm_realistic.rs`:
+  - `block_gemm_matches_dense_reference` — U1 with Sz=-1,0,+1 charges, non-trivial data,
+    compared against dense GEMM reference (max error < 1e-10)
+  - `block_gemm_nonzero_flux` — creation/annihilation operators with flux ±1
+  - `block_gemm_sector_count_bounded` — output sector count bounded by input sectors
+- ~~Performance benchmarks (Criterion/iai)~~ **(RESOLVED)**
+  Criterion benchmarks in `benches/linalg_benchmarks.rs`:
+  - `gemm_f64_100x100` — GEMM throughput measurement
+  - `svd_truncated_f64_50x50` — SVD latency measurement
+  - `block_gemm_u1_10sectors_d10` — block-sparse GEMM with LPT scheduling
+  - `threading_regime_select` — regime selection overhead (metadata-only, zero alloc)
 
 ---
 
@@ -160,16 +194,21 @@ Not yet tested:
 
 ```
 tk-linalg/
-├── Cargo.toml           Feature flags, dependencies
+├── Cargo.toml           Feature flags, dependencies (criterion, proptest dev-deps)
 ├── build.rs             Mutual exclusivity enforcement
 ├── DRAFT_NOTES.md       This file
+├── benches/
+│   └── linalg_benchmarks.rs   Criterion benchmarks (gemm, svd, block_gemm, threading)
+├── tests/
+│   ├── block_gemm_realistic.rs  Integration tests with realistic U1 quantum numbers
+│   └── proptest_linalg.rs       Property-based tests (gemm, svd, regularized_inverse, block_gemm)
 └── src/
     ├── lib.rs           Module declarations and re-exports
     ├── error.rs         LinAlgError, LinAlgResult
     ├── results.rs       SvdResult, EighResult, QrResult, SvdConvergenceError
-    ├── traits.rs        LinAlgBackend<T>, SparseLinAlgBackend<T, Q>, helpers
-    ├── threading.rs     ThreadingRegime enum and select() heuristic
-    ├── tasks.rs         SectorGemmTask, LPT scheduling, fusion_rule
+    ├── traits.rs        LinAlgBackend<T>, SparseLinAlgBackend<T, Q>, helpers, set_blas_num_threads
+    ├── threading.rs     ThreadingRegime enum, select(), partition_tasks()
+    ├── tasks.rs         SectorGemmTask, LPT scheduling, fusion_rule, compute_fusion_rule_su2
     └── device/
         ├── mod.rs       DeviceAPI<D,S>, DefaultDevice type alias
         └── faer.rs      DeviceFaer: LinAlgBackend<T> for f32/f64/C32/C64
