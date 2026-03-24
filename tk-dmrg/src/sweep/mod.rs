@@ -117,6 +117,10 @@ impl Default for DMRGStats {
 }
 
 /// Immutable DMRG configuration — set once before a run begins.
+///
+/// Contains only plain-data parameters (no trait objects), so it implements
+/// `Clone` and `Debug`. The eigensolver lives in `DMRGRuntimeState`.
+#[derive(Clone, Debug)]
 pub struct DMRGConfig {
     /// Bond dimension schedule (ramp up over sweeps).
     pub bond_dim_schedule: BondDimensionSchedule,

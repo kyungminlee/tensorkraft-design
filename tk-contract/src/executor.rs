@@ -497,7 +497,7 @@ mod tests {
             _max_rank: usize,
             _cutoff: f64,
         ) -> Result<tk_linalg::SvdResult<f64>, tk_linalg::SvdConvergenceError> {
-            unimplemented!("SVD not needed for contraction tests")
+            unreachable!("SVD not used in contraction executor tests")
         }
 
         fn svd_truncated_gesvd(
@@ -506,7 +506,7 @@ mod tests {
             _max_rank: usize,
             _cutoff: f64,
         ) -> Result<tk_linalg::SvdResult<f64>, tk_linalg::SvdConvergenceError> {
-            unimplemented!("SVD not needed for contraction tests")
+            unreachable!("SVD not used in contraction executor tests")
         }
 
         fn gemm(
@@ -537,14 +537,14 @@ mod tests {
             _mat: &MatRef<f64>,
             _k: usize,
         ) -> tk_linalg::LinAlgResult<tk_linalg::EighResult<f64>> {
-            unimplemented!()
+            unreachable!("eigh not used in contraction executor tests")
         }
 
         fn qr(
             &self,
             _mat: &MatRef<f64>,
         ) -> tk_linalg::LinAlgResult<tk_linalg::QrResult<f64>> {
-            unimplemented!()
+            unreachable!("QR not used in contraction executor tests")
         }
     }
 

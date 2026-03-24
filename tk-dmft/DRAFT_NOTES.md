@@ -1,6 +1,6 @@
 # tk-dmft Draft Implementation Notes
 
-**Status:** Gap-filling implementation — compiles, 47 tests pass. Core algorithms (Lanczos discretization, linear prediction, Chebyshev reconstruction, positivity restoration) are fully implemented. Broyden mixing, Weiss field, TDVP spectral pipeline, and Chebyshev expansion have documented algorithms with clear delegation points. DMFT self-consistency loop structure is complete; awaiting functional DMRGEngine from tk-dmrg.
+**Status:** Gap-filling implementation — compiles, 52 tests pass (47 unit + 5 proptest). Core algorithms (Lanczos discretization, linear prediction, Chebyshev reconstruction, positivity restoration) are fully implemented. Broyden mixing, Weiss field, TDVP spectral pipeline, and Chebyshev expansion have documented algorithms with clear delegation points. DMFT self-consistency loop structure is complete; awaiting functional DMRGEngine from tk-dmrg.
 **Date:** March 2026
 
 ---
@@ -71,7 +71,7 @@
 
 3. **Operator overloading limited to `f64`** — `coeff * op(Sz, 0)` syntax doesn't work for generic `T: Scalar`. Use `ScaledOpProduct` struct literal instead. **Severity:** Medium.
 
-4. **`DMRGConfig`/`DMRGStats`/`TdvpStabilizationConfig` lack `Clone`/`Debug`** — Blocks derives on containing types. Created `DmrgIterationSummary` as a workaround. **Severity:** Medium.
+4. **`DMRGConfig` now has `Clone`/`Debug`** — Resolved. `BondDimensionSchedule` also derives `Clone + Debug`. `DMRGStats`/`TdvpStabilizationConfig` still lack derives. **Severity:** Low (mostly resolved).
 
 5. **tk-dmrg doesn't re-export dependencies** — Each upstream crate must be added as a direct dependency. **Severity:** Low.
 

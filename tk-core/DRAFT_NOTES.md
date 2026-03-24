@@ -55,7 +55,7 @@
 
 ## Testing status
 
-- **54 unit tests pass** on default features (+ 2 pinned-memory tests with `backend-cuda` = 56 total)
+- **55 unit tests pass** on default features (+ 2 pinned-memory tests with `backend-cuda` = 57 total)
 - **5 compile-fail tests** via `trybuild` verify lifetime safety invariants:
   - `arena_tensor_outlives_reset` — `TempTensor` cannot be used after `arena.reset()`
   - `arena_tensor_escape_scope` — `TempTensor` cannot escape the function that owns the arena
@@ -76,3 +76,7 @@
 ## Remaining limitations
 
 1. **`f128` support (`backend-oxiblas`)** — The `Scalar` trait implementation for `f128` is gated behind the `backend-oxiblas` feature flag but is not yet written. This depends on Rust's `f128` stabilization status and on whether `faer` provides an `f128` GEMM path (open question #2 in the tech spec).
+
+### Changes in cross-crate gap-filling pass
+
+- Removed unused `TkError::IndexOutOfBounds` and `TkError::ScalarTypeMismatch` error variants (never constructed anywhere).

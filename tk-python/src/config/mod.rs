@@ -360,7 +360,26 @@ impl PyDmrgConfig {
 
 impl PyDmrgConfig {
     /// Build the Rust `DMRGConfig` from the Python-owned mirror.
+    ///
+    /// `DMRGConfig` is now `Clone` (no trait objects). The eigensolver
+    /// is constructed separately via `to_rust_runtime_state()`.
     pub(crate) fn to_rust_config(&self) -> DMRGConfig {
+        DMRGConfig {
+            bond_dim_schedule: BondDimensionSchedule::fixed(self.max_bond_dim),
+            svd_cutoff: self.svd_cutoff,
+            max_sweeps: self.max_sweeps,
+            energy_tol: self.energy_tol,
+            variance_tol: None,
+            idmrg_warmup: false,
+            update_variant: Default::default(),
+            checkpoint_path: None,
+            n_target_states: None,
+            excited_state_weight: 0.1,
+        }
+    }
+
+    /// Build the Rust `DMRGRuntimeState` (eigensolver) from the Python mirror.
+    pub(crate) fn to_rust_runtime_state(&self) -> tk_dmrg::DMRGRuntimeState {
         let eigensolver: Box<dyn tk_dmrg::IterativeEigensolver<f64>> =
             match self.eigensolver_name.as_str() {
                 "lanczos" => Box::new(LanczosSolver::default()),
@@ -368,19 +387,7 @@ impl PyDmrgConfig {
                 "block_davidson" => Box::new(BlockDavidsonSolver::default()),
                 _ => Box::new(DavidsonSolver::default()),
             };
-        DMRGConfig {
-            bond_dim_schedule: BondDimensionSchedule::fixed(self.max_bond_dim),
-            svd_cutoff: self.svd_cutoff,
-            max_sweeps: self.max_sweeps,
-            energy_tol: self.energy_tol,
-            variance_tol: None,
-            eigensolver,
-            idmrg_warmup: false,
-            update_variant: Default::default(),
-            checkpoint_path: None,
-            n_target_states: None,
-            excited_state_weight: 0.1,
-        }
+        tk_dmrg::DMRGRuntimeState { eigensolver }
     }
 }
 

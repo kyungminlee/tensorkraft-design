@@ -83,3 +83,7 @@ Criterion benchmarks: `get_block` (hit/miss) and `iter_keyed_blocks` on 100-sect
 2. **CG numerical stability for j > 10** — The Racah formula uses direct factorial arithmetic. For production use with higher spins, switching to log-factorial arithmetic is straightforward.
 
 3. **`lie-groups` dependency** — Decision made: keep internal Racah formula. It passes all CG, 6j, and 9j validation tests. The `lie-groups` crate would add an external dependency for no additional correctness benefit.
+
+### Changes in cross-crate gap-filling pass
+
+- `BitPackable` trait now requires `Copy` as a supertrait (all implementors already derive Copy). Eliminates verbose `.clone()` calls across downstream crates.

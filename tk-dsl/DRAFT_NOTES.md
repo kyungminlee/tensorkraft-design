@@ -1,6 +1,6 @@
 # tk-dsl Draft Implementation Notes
 
-**Status:** Draft implementation — compiles, 44 tests pass, core abstractions functional.
+**Status:** Draft implementation — compiles, 49 tests pass (44 unit + 5 proptest), core abstractions functional.
 **Date:** March 2026
 
 ---

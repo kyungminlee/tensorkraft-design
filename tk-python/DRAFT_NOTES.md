@@ -56,7 +56,7 @@ Rust enums (`SpectralSolverMode`, `MixingScheme`, `ToeplitzSolver`) exposed to P
 ### Not implemented / deferred
 
 1. **TRIQS integration** — feature-gated (`triqs`) but no implementation. Requires runtime Python object inspection and zero-copy via `PyReadonlyArray3`.
-2. **Custom exception hierarchy** — `register_exceptions()` is a placeholder. Production needs `create_exception!` macros.
+2. **Custom exception hierarchy** — Implemented via `pyo3::create_exception!` macros. `TensorkraftError` (base), `ConvergenceError`, `BathError`, `SpectralError`, `DmrgError`, `CheckpointError`, `ConfigError` all registered on the `tensorkraft` module.
 3. **Zero-copy NumPy interop** — Currently all getters clone data. `numpy_interop.rs` is a placeholder.
 4. **SU(2) symmetry variant** — Feature-gated but not wired up.
 5. **`__init__.pyi` type stubs** — Not generated.
@@ -68,7 +68,7 @@ Rust enums (`SpectralSolverMode`, `MixingScheme`, `ToeplitzSolver`) exposed to P
 |:------|:-----------|
 | `ComplexU1` variant impossible (DeviceFaer lacks complex LinAlgBackend) | Removed; `complex_u1()` returns RuntimeError |
 | PyO3 `extension-module` vs test linking conflict | Moved behind feature flag; tests use `--no-default-features` |
-| `DMRGConfig` not Clone | Config mirror pattern with `to_rust_config()` |
+| `DMRGConfig` now Clone | Config mirror simplified; `to_rust_runtime_state()` added for eigensolver |
 | `AndersonImpurityModel::new()` takes 5 args, not 4 | Constructor signature corrected |
 | `LinearPredictionConfig` field names differ (`lp_order` → `prediction_order`) | Field names corrected |
 | `DeviceAPI` has no `Default` impl | Uses `DeviceAPI::new(DeviceFaer, DeviceFaer)` explicitly |

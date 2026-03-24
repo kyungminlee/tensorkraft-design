@@ -12,20 +12,20 @@ This revision incorporates cross-cutting findings from the draft implementation 
 - **§2.1** — Workspace layout corrected: crates live in top-level directories (`tk-core/`, `tk-symmetry/`, etc.), not under a `crates/` subdirectory.
 - **§3.1** — `TensorCow` eliminated: `TensorStorage<'a, T>` is now a single enum with `Owned(Vec<T>)` / `Borrowed(&'a [T])`. `DenseTensor` gains a lifetime parameter (`DenseTensor<'a, T>`) and an `offset: usize` field essential for zero-copy `slice_axis`. `TempTensor` is just `DenseTensor` with a shorter lifetime, not a distinct type.
 - **§3.4** — `Scalar` trait expanded: requires `Sub<Output=Self>`, `Neg<Output=Self>`, `Debug`, `'static`. `Real` associated type requires `PartialOrd` and `Float`. Added `from_real_imag()` for complex number construction (needed by `SpinOp::Sy`, Green's functions).
-- **§4.1** — `QuantumNumber` requires `'static` bound. `BitPackable` requires `Copy`.
-- **§4.2** — `BlockSparseTensor` gains `leg_directions: Vec<LegDirection>` field (essential for flux rule enforcement). Blocks are always `DenseTensor<'static, T>` (no arena-borrowed blocks). `permute()` is NOT zero-copy — requires `into_owned()` on each block for BLAS contiguity. `DenseTensor` and `BlockSparseTensor` require `Clone` (cross-cutting issue affecting tk-contract, tk-dsl, tk-dmrg, tk-dmft).
+- **§4.1** — `QuantumNumber` requires `'static` bound. `BitPackable` requires `Copy` (enforced as supertrait).
+- **§4.2** — `BlockSparseTensor` gains `leg_directions: Vec<LegDirection>` field (essential for flux rule enforcement). Blocks are always `DenseTensor<'static, T>` (no arena-borrowed blocks). `permute()` is NOT zero-copy — requires `into_owned()` on each block for BLAS contiguity. `DenseTensor` and `BlockSparseTensor` both implement `Clone` (resolved).
 - **§4.4** — CG cache uses hand-rolled Racah formula, not `lie-groups` dependency.
 - **§5.1** — `regularized_svd_inverse` requires `where Self: Sized` bound (breaks object-safety for that method only). Return types for SVD/eigh/QR are `DenseTensor<'static, T>` (always owned).
 - **§5.2** — `DefaultDevice` interim definition: `DeviceAPI<DeviceFaer, DeviceFaer>` (not `DeviceOxiblas`). `gesdd`→`gesvd` fallback is no-op with faer (only meaningful with MKL/OpenBLAS). faer `thin_svd()` returns ascending order; must re-sort descending.
 - **§5.3** — Threading uses simple binary heuristic for Phase 1–3, not partitioned scheduler.
 - **§7.3** — Operator overloading (`*`, `+` on `OpSum`) restricted to `f64` due to Rust orphan rules. `hamiltonian!{}` proc-macro deferred (not yet implemented).
-- **§8.3** — `DMRGConfig` should be split into immutable `DMRGConfig` and mutable `DMRGState`. `Box<dyn IterativeEigensolver>` prevents `Clone`. Davidson/Block-Davidson delegate to Lanczos (not yet independently implemented).
+- **§8.3** — `DMRGConfig` split into immutable `DMRGConfig` (now `Clone + Debug`) and mutable `DMRGRuntimeState` (owns `Box<dyn IterativeEigensolver>`). Davidson/Block-Davidson delegate to Lanczos (not yet independently implemented).
 - **§8.3** — Checkpoint non-functional: blocked by `BlockSparseTensor` lacking serde.
-- **§8.4** — Double-occupancy measurement requires `CustomOp` (no `NPairInteraction` in `FermionOp`). Positivity restoration edge case: only rescale when both sums are positive. `LinearPredictionConfig` field names: `prediction_order` (not `lp_order`), `toeplitz_solver` (not `solver`).
-- **§7.5** — `ComplexU1` variant blocked: `DeviceFaer` doesn't implement `LinAlgBackend<Complex<f64>>` yet. PyO3 `extension-module` vs test linking conflict requires feature flag pattern. Config mirror pattern needed because `DMRGConfig` is not `Clone`.
-- **§6** — `DenseTensor` lifetime makes executor generics painful; unsafe transmute workaround for lifetime unification.
+- **§8.4** — Double-occupancy measurement: `BosonOp::NPairInteraction` now exists; `FermionOp` still requires `CustomOp` for n_up*n_dn. Positivity restoration edge case: only rescale when both sums are positive. `LinearPredictionConfig` field names: `prediction_order` (not `lp_order`), `toeplitz_solver` (not `solver`).
+- **§7.5** — `ComplexU1` variant blocked: `DeviceFaer` doesn't implement `LinAlgBackend<Complex<f64>>` yet. PyO3 `extension-module` vs test linking conflict requires feature flag pattern. Config mirror pattern simplified now that `DMRGConfig` is `Clone`. Custom exception hierarchy (`create_exception!`) implemented.
+- **§6** — `DenseTensor` lifetime makes executor generics painful; resolved via `TensorRef` enum with `Borrowed` and `Owned` variants (unsafe transmute removed). Sparse executor handles arbitrary contracted leg positions via permute + fuse_legs. `IndexSpec::is_contracted` field added per techspec §3.2. All three path optimizers implemented: Greedy (default), DP (exact for n ≤ 15), TreeSA (annealing for large n).
 - **§11** — `lie-groups` dependency replaced by hand-rolled Racah formula for CG coefficients.
-- **General** — `DenseTensor Clone` is the #1 cross-cutting issue affecting tk-contract, tk-dsl, tk-dmrg, tk-dmft. Must be resolved.
+- **General** — `DenseTensor` and `BlockSparseTensor` both implement `Clone` (resolved). `TkError::IndexOutOfBounds` and `TkError::ScalarTypeMismatch` removed (dead code). Property-based tests (proptest) and criterion benchmarks added across all crates.
 
 ---
 ## Revision Notes (v8.3 → v8.4)

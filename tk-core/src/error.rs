@@ -20,16 +20,6 @@ pub enum TkError {
 
     #[error("rank error: expected rank {expected}, got rank {got}")]
     RankError { expected: usize, got: usize },
-
-    #[error("index out of bounds: axis {axis}, index {index}, dim {dim}")]
-    IndexOutOfBounds {
-        axis: usize,
-        index: usize,
-        dim: usize,
-    },
-
-    #[error("scalar type mismatch")]
-    ScalarTypeMismatch,
 }
 
 /// Convenience alias used throughout the workspace.

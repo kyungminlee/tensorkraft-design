@@ -1,6 +1,6 @@
 # tk-dmrg Draft Implementation Notes
 
-**Status:** Gap-filling implementation — compiles, 30 tests pass. Core DMRG loop is functional with working eigensolvers, environment contractions, H_eff construction, SVD truncation, and sweep step logic. MPS canonicalization and observables implemented. TDVP, iDMRG, and MPO compiler have improved stubs with documented algorithms.
+**Status:** Gap-filling implementation — compiles, 34 tests pass (30 unit + 4 proptest). Core DMRG loop is functional with working eigensolvers, environment contractions, H_eff construction, SVD truncation, and sweep step logic. MPS canonicalization and observables implemented. TDVP, iDMRG, and MPO compiler have improved stubs with documented algorithms.
 **Date:** March 2026
 
 ---
@@ -69,13 +69,20 @@
 
 ### Design issues
 
-1. **`BitPackable` does not require `Copy`** — All quantum number types (U1, Z2) are small Copy types, but `BitPackable` only transitively requires `Clone` via `QuantumNumber`. Adding `Copy` as a supertrait would eliminate verbose `.clone()` calls. **Severity:** Medium (ergonomic).
+1. **`BitPackable` now requires `Copy`** — Resolved. All quantum number types (U1, Z2) are small Copy types. `Copy` added as supertrait to `BitPackable`. **Severity:** Resolved.
 
 2. **`IterativeEigensolver<T>` not generic for complex TDVP** — Fixed to `Box<dyn IterativeEigensolver<f64>>` in `DMRGRuntimeState`. Complex-valued TDVP would need a separate eigensolver field. **Severity:** Low for now.
 
 3. **Lanczos tridiagonal solve is naive** — Uses Sturm bisection (O(n²)) instead of LAPACK `dstev` (O(n)). Fine for small Krylov dimensions (20-100). **Severity:** Low for draft.
 
 4. **`DMRGEngine` owns backend** — Limits sharing across multiple engines. Consider `&B` or `Arc<B>`. **Severity:** Low.
+
+### Changes in cross-crate gap-filling pass
+
+- `DMRGConfig` now derives `Clone + Debug` (eigensolver already in `DMRGRuntimeState`).
+- `BondDimensionSchedule` now derives `Clone + Debug`.
+- Added proptest integration tests: Lanczos eigenvalue accuracy on diagonal matrices, bond dimension schedule monotonicity, sweep schedule coverage, truncation config bounds.
+- Added criterion benchmarks: `dmrg_benchmarks.rs` with Lanczos, schedule, and sweep benchmarks.
 
 5. **No `serde` integration** — Checkpoint requires serializing `BlockSparseTensor<T, Q>`. Decision needed: `#[derive(Serialize, Deserialize)]` on types in tk-symmetry vs proxy types. **Severity:** Medium (needed for crash recovery).
 
