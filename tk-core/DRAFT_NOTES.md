@@ -5,7 +5,9 @@
 
 ---
 
-## Module Summary
+## What is implemented
+
+### Module Summary
 
 | File | Contents |
 |:-----|:---------|
@@ -21,63 +23,56 @@
 | `src/pinned.rs` | `PinnedMemoryTracker` with static atomics, CAS-loop `try_reserve`, `release`, `initialize_budget` |
 | `src/device.rs` | `StorageDevice` trait, `HostDevice` implementation, CUDA-gated `CudaDevice` stub |
 
-## Test Results
+### Arena allocation (complete)
 
-- **54 unit tests pass** on default features (+ 2 pinned-memory tests with `backend-cuda` = 56 total)
-- **5 compile-fail tests** via `trybuild` verify lifetime safety invariants
-- Compiles cleanly on both default and `backend-cuda` feature configurations
+`TensorCow` merged into `TensorStorage` as a single `Owned(Vec<T>)` / `Borrowed(&'a [T])` enum. `SweepArena::alloc_tensor` bump-allocates a zeroed slice and wraps it as `TensorStorage::Borrowed`, with the lifetime tied to the arena. No heap `Vec` is created for arena-allocated tensors.
 
-## Known Limitations
+### Slice axis with data offset (complete)
 
-### 1. ~~`SweepArena::alloc_tensor` uses heap `Vec` internally~~ (RESOLVED)
+`DenseTensor` has an `offset: usize` field. All data-access methods (`as_slice`, `as_mut_slice`, `as_mat_ref`, `as_mat_mut`) apply the offset. `into_owned()` gathers elements into a fresh contiguous buffer when offset is nonzero or layout is non-contiguous. Chained slicing accumulates offsets correctly.
 
-Fixed by merging `TensorCow` into `TensorStorage` as a single `Owned(Vec<T>)` / `Borrowed(&'a [T])` enum. `SweepArena::alloc_tensor` now bump-allocates a zeroed slice and wraps it as `TensorStorage::Borrowed`, with the lifetime tied to the arena. No heap `Vec` is created for arena-allocated tensors. `DenseTensor::borrowed()` now takes a `&'a [T]` slice directly.
+### PinnedArena CUDA FFI (complete)
 
-### 2. ~~`DenseTensor::slice_axis` does not adjust the data pointer offset~~ (RESOLVED)
-
-Fixed by adding an `offset: usize` field to `DenseTensor`. All data-access methods (`as_slice`, `as_mut_slice`, `as_mat_ref`, `as_mat_mut`) apply the offset. `into_owned()` gathers elements into a fresh contiguous buffer when offset is nonzero or layout is non-contiguous. Chained slicing accumulates offsets correctly. Covered by 5 new tests (`slice_axis_offset_correct`, `slice_axis_cols`, `slice_axis_into_owned_gathers_elements`, `slice_axis_chained`, `slice_axis_mat_ref`).
-
-### 3. ~~No compile-fail tests yet~~ (RESOLVED)
-
-Five `trybuild`-based compile-fail tests added in `tests/compile_fail/`:
-- `arena_tensor_outlives_reset` — `TempTensor` cannot be used after `arena.reset()`
-- `arena_tensor_escape_scope` — `TempTensor` cannot escape the function that owns the arena
-- `borrowed_storage_outlives_data` — `TensorStorage::Borrowed` cannot outlive its source data
-- `slice_view_outlives_tensor` — sliced view cannot be used after the original tensor is moved
-- `matref_outlives_tensor` — `MatRef` cannot be used after the tensor is moved
-
-### 4. ~~No `proptest` property-based tests yet~~ (RESOLVED)
-
-Six `proptest` property-based tests added to `shape.rs`:
-- `prop_offset_within_bounds` — offset for any valid multi-index is within numel
-- `prop_permute_preserves_numel` — permutation never changes element count
-- `prop_permute_roundtrip` — double-reverse permutation restores original shape
-- `prop_reshape_roundtrip` — flatten then reshape back recovers original dims
-- `prop_slice_axis_numel` — slicing one element along axis divides numel by that axis size
-- `prop_col_major_same_numel` — row-major and col-major have same numel and dims
-
-### 5. ~~`PinnedArena` is a placeholder~~ (RESOLVED)
-
-`PinnedArena` now implements proper CUDA pinned-memory management:
+`PinnedArena` implements proper CUDA pinned-memory management:
 - FFI declarations for `cudaMallocHost` / `cudaFreeHost` in a `cuda_ffi` module
 - Custom bump allocator operating on the pinned memory block with proper alignment handling
 - `Drop` implementation that calls `cudaFreeHost` to release pinned memory
-- `alloc_slice_fill_copy()` and `alloc_uninit()` methods for direct allocation without going through bumpalo
-- `SweepArena` allocation methods now dispatch directly to `PinnedArena` or `Bump` without the intermediate `bump()` accessor
-- `is_pinned()` method added to `SweepArena` for diagnostics
+- `alloc_slice_fill_copy()` and `alloc_uninit()` methods for direct allocation
+- `SweepArena` allocation methods dispatch directly to `PinnedArena` or `Bump`
+- `is_pinned()` method for diagnostics
 
-**Note:** The FFI calls link against the CUDA runtime library (`libcudart`). On systems without CUDA, the `backend-cuda` feature should not be enabled. The implementation is correct and complete but cannot be tested without a CUDA-capable system.
+**Note:** The FFI calls link against the CUDA runtime library (`libcudart`). On systems without CUDA, the `backend-cuda` feature should not be enabled.
 
-### 6. ~~No `StorageDevice` trait generalization~~ (RESOLVED)
+### StorageDevice trait (complete)
 
-The `StorageDevice` trait and device types are now defined in `src/device.rs`:
 - `StorageDevice` trait with `name()`, `requires_sync()`, and `synchronize()` methods
 - `HostDevice` — host (CPU) memory device, the default. Synchronization is a no-op.
-- `CudaDevice` — CUDA GPU device (gated behind `backend-cuda`), identified by ordinal. `synchronize()` is a placeholder that will call `cudaDeviceSynchronize()` when full CUDA bindings are integrated in Phase 5.
-- Re-exported from `lib.rs`: `StorageDevice`, `HostDevice`, and conditionally `CudaDevice`
+- `CudaDevice` — CUDA GPU device (gated behind `backend-cuda`), identified by ordinal. `synchronize()` is a placeholder for `cudaDeviceSynchronize()` in Phase 5.
 
-**Migration plan:** `TensorStorage<'a, T>` remains unchanged for backward compatibility. In Phase 5, it will gain a default device type parameter: `TensorStorage<T, D: StorageDevice = HostDevice>`. The default parameter ensures existing code continues to compile without modification.
+**Migration plan:** `TensorStorage<'a, T>` remains unchanged for backward compatibility. In Phase 5, it will gain a default device type parameter: `TensorStorage<T, D: StorageDevice = HostDevice>`.
 
-### 7. `f128` support (`backend-oxiblas`) is not implemented
+---
 
-The `Scalar` trait implementation for `f128` is gated behind the `backend-oxiblas` feature flag but is not yet written. This depends on Rust's `f128` stabilization status and on whether `faer` provides an `f128` GEMM path (open question #2 in the tech spec).
+## Testing status
+
+- **54 unit tests pass** on default features (+ 2 pinned-memory tests with `backend-cuda` = 56 total)
+- **5 compile-fail tests** via `trybuild` verify lifetime safety invariants:
+  - `arena_tensor_outlives_reset` — `TempTensor` cannot be used after `arena.reset()`
+  - `arena_tensor_escape_scope` — `TempTensor` cannot escape the function that owns the arena
+  - `borrowed_storage_outlives_data` — `TensorStorage::Borrowed` cannot outlive its source data
+  - `slice_view_outlives_tensor` — sliced view cannot be used after the original tensor is moved
+  - `matref_outlives_tensor` — `MatRef` cannot be used after the tensor is moved
+- **6 proptest property-based tests** in `shape.rs`:
+  - `prop_offset_within_bounds` — offset for any valid multi-index is within numel
+  - `prop_permute_preserves_numel` — permutation never changes element count
+  - `prop_permute_roundtrip` — double-reverse permutation restores original shape
+  - `prop_reshape_roundtrip` — flatten then reshape back recovers original dims
+  - `prop_slice_axis_numel` — slicing one element along axis divides numel by that axis size
+  - `prop_col_major_same_numel` — row-major and col-major have same numel and dims
+- Compiles cleanly on both default and `backend-cuda` feature configurations
+
+---
+
+## Remaining limitations
+
+1. **`f128` support (`backend-oxiblas`)** — The `Scalar` trait implementation for `f128` is gated behind the `backend-oxiblas` feature flag but is not yet written. This depends on Rust's `f128` stabilization status and on whether `faer` provides an `f128` GEMM path (open question #2 in the tech spec).
