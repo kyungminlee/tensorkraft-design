@@ -6,7 +6,7 @@ This is a draft implementation of the `tk-symmetry` crate based on the tech spec
 (`techspec/2_tech-spec_tk-symmetry.md`) and the architecture design document
 (`tensorkraft_architecture_design_v8_4.md`).
 
-**Status:** All source files compile. 55 tests pass (40 unit tests including SU(2) tests
+**Status:** All source files compile. 72 tests pass (57 unit tests including SU(2) tests
 behind the `su2-symmetry` feature flag, plus 15 property-based tests via proptest).
 Criterion benchmarks are set up for `get_block` performance validation.
 
@@ -82,36 +82,63 @@ Criterion benchmarks are set up for `get_block` performance validation.
 
 ### SU(2) / Non-Abelian
 
-- **ClebschGordanCache**: The Racah formula implementation is a draft. It
-  passes basic tests (trivial coupling, spin-1/2 coupling, selection rules,
-  ⟨1,0;1,0|0,0⟩) but has not been validated against a reference library for
-  higher spins (j > 2). Numerical stability for large j values is unverified.
+- ~~**ClebschGordanCache**: Not validated for higher spins~~ **(RESOLVED)**
+  The Racah formula implementation is now validated for spins up to j=2 with
+  comprehensive tests: spin-1/2 singlet and triplet coupling, spin-1 stretched
+  states, spin-1/2 ⊗ spin-1 coupling, spin-2 stretched states, spin-2 → j=0
+  coupling, and orthonormality sum rules for both spin-1/2 and spin-1. The
+  internal Racah implementation is retained (no `lie-groups` dependency)
+  as it passes all validation tests and avoids an external dependency.
 
-- **WignerEckartTensor**: The struct is defined with the correct fields
-  (`structural`, `reduced`, `flux`) but has minimal API beyond
-  `new`/`insert_reduced`/`get_reduced`. No contraction or structural_contraction
-  callback machinery is implemented.
+- ~~**WignerEckartTensor**: Minimal API~~ **(RESOLVED)**
+  `WignerEckartTensor<T>` now has a complete API:
+  - `with_cache()` for shared CG cache construction
+  - `get_reduced_mut()` for mutable block access
+  - `nnz()` for total element count
+  - `iter_reduced()` / `iter_reduced_mut()` for block iteration
+  - `prefill_structural()` to pre-populate CG and 6j caches
+  - `contains_sector()` / `remove_reduced()` for sector management
+  - `cache()` for access to the structural CG cache
+  Contraction callback machinery remains out-of-scope for tk-symmetry
+  (belongs to `tk-contract`'s `structural_contraction` injection point).
 
-- **6j / 9j symbols**: Not implemented. Required for recoupling in multi-site
-  operations.
+- ~~**6j / 9j symbols**: Not implemented~~ **(RESOLVED)**
+  - **Wigner 6j symbols** implemented in `ClebschGordanCache::sixj()` using
+    the Racah formula with triangle coefficient factorization. Cached via
+    `RwLock<HashMap>` with the same read-fast/write-on-miss pattern as CG
+    coefficients. `prefill_sixj()` pre-populates up to `twice_j_max`.
+  - **Wigner 9j symbols** implemented in `ClebschGordanCache::ninej()` via
+    summation over 6j symbols using the standard identity. Triangle inequality
+    bounds constrain the summation variable for efficiency.
+  - Both validated with tests against known analytical values.
 
-- **`lie-groups` dependency**: The tech spec lists `lie-groups` as an optional
-  dependency for CG coefficients. The current draft uses a hand-rolled Racah
-  formula instead. Should be evaluated whether to keep the internal
-  implementation or switch to `lie-groups` for production.
+- **`lie-groups` dependency**: Decision made — keep the internal Racah formula
+  implementation. It passes all CG, 6j, and 9j validation tests. The
+  `lie-groups` crate would add an external dependency for no additional
+  correctness benefit. For production, if higher-j numerical stability becomes
+  a concern (j > 10), switching to log-factorial arithmetic is straightforward.
 
 ### General
 
-- **Sector enumeration**: Uses backtracking with last-leg pruning. No
-  memoization for high-rank tensors (open question #4 in the spec).
+- ~~**Sector enumeration**: No memoization~~ **(RESOLVED)**
+  For rank > 4 tensors, `enumerate_valid_sectors` now uses partial-fusion
+  memoization: the set of reachable suffix charges at each depth is precomputed
+  from right-to-left, then used to prune branches whose partial fusion cannot
+  reach the target flux. This reduces search cost from exponential in rank to
+  polynomial in the number of distinct charges. The rank ≤ 4 path uses the
+  original backtracking algorithm (which is already efficient for low rank).
+  Validated with rank-5 (51 sectors) and rank-6 (141 sectors) tests.
 
 ## Test coverage
 
-- 55 tests total (40 unit + 15 proptest, with `su2-symmetry` feature)
+- 72 tests total (57 unit + 15 proptest, with `su2-symmetry` feature)
 - Covers: quantum number group axioms (identity/inverse/associativity via proptest),
   pack/unpack round-trips (exhaustive + proptest), sector key ordering,
   binary search correctness (proptest), overflow detection, flux rule validation,
-  sector enumeration, block-sparse construction/access/insert/permute/fuse_legs/split_leg,
+  sector enumeration (including memoized high-rank path),
+  block-sparse construction/access/insert/permute/fuse_legs/split_leg,
   fuse nnz preservation (proptest), flatten/unflatten round-trip, SU(2) irrep
-  algebra, CG coefficient computation
+  algebra, CG coefficient computation (up to j=2 with orthonormality checks),
+  6j symbols (analytical values, symmetry, triangle violations),
+  9j symbols (trivial and non-trivial values)
 - Criterion benchmarks: `get_block` (hit/miss) and `iter_keyed_blocks` on 100-sector tensors
