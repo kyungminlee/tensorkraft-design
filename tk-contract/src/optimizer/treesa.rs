@@ -327,15 +327,15 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 4, is_contiguous: true },
-                IndexSpec { dim: 5, is_contiguous: true },
+                IndexSpec { dim: 4, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 5, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 5, is_contiguous: true },
-                IndexSpec { dim: 6, is_contiguous: true },
+                IndexSpec { dim: 5, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 6, is_contracted: false, is_contiguous: true },
             ],
         );
 
@@ -377,7 +377,7 @@ mod tests {
         for t in 0..4 {
             let legs = &spec.tensors[t].1;
             let specs: Vec<IndexSpec> = (0..legs.len())
-                .map(|_| IndexSpec { dim: 5, is_contiguous: true })
+                .map(|_| IndexSpec { dim: 5, is_contracted: false, is_contiguous: true })
                 .collect();
             index_map.insert(TensorId::new(t as u32), specs);
         }

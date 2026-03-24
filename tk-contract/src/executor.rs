@@ -218,6 +218,7 @@ impl<T: Scalar, B: LinAlgBackend<T>> ContractionExecutor<T, B> {
                 let specs: Vec<crate::index::IndexSpec> = (0..legs.len())
                     .map(|i| crate::index::IndexSpec {
                         dim: dims.get(i).copied().unwrap_or(1),
+                        is_contracted: false, // determined from ContractionSpec, not IndexSpec
                         is_contiguous: shape.is_contiguous(),
                     })
                     .collect();
@@ -403,11 +404,10 @@ impl<T: Scalar> ExecutionPlan<T> {
         let steps = self.graph.execution_order();
 
         if steps.is_empty() {
-            return Err(ContractionError::OptimizerFailed {
-                optimizer: "sparse".to_string(),
-                reason: "single-tensor contraction not supported; use input directly"
-                    .to_string(),
-            });
+            // Single-tensor "contraction": return a clone of the input.
+            let tid = self.graph.inputs.first().ok_or(ContractionError::EmptySpec)?;
+            let tensor = inputs.get(tid).ok_or(ContractionError::MissingTensor(*tid))?;
+            return Ok((*tensor).clone());
         }
 
         let mut intermediates: HashMap<TensorId, tk_symmetry::BlockSparseTensor<T, Q>> =
@@ -567,15 +567,15 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 2, is_contiguous: true },
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 3, is_contiguous: true },
-                IndexSpec { dim: 2, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
             ],
         );
 
@@ -625,13 +625,13 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 4, is_contiguous: true },
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 4, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
-            vec![IndexSpec { dim: 3, is_contiguous: true }],
+            vec![IndexSpec { dim: 3, is_contracted: false, is_contiguous: true }],
         );
 
         let plan = ExecutionPlan::<f64>::build(
@@ -664,13 +664,13 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 4, is_contiguous: true },
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 4, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
-            vec![IndexSpec { dim: 3, is_contiguous: true }],
+            vec![IndexSpec { dim: 3, is_contracted: false, is_contiguous: true }],
         );
 
         let plan = ExecutionPlan::<f64>::build(
@@ -687,13 +687,13 @@ mod tests {
         new_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 8, is_contiguous: true }, // changed from 4 to 8
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 8, is_contracted: false, is_contiguous: true }, // changed from 4 to 8
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
         new_map.insert(
             TensorId::new(1),
-            vec![IndexSpec { dim: 3, is_contiguous: true }],
+            vec![IndexSpec { dim: 3, is_contracted: false, is_contiguous: true }],
         );
 
         assert!(plan.needs_rebuild(&new_map));
@@ -723,22 +723,22 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 2, is_contiguous: true },
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 3, is_contiguous: true },
-                IndexSpec { dim: 4, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 4, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(2),
             vec![
-                IndexSpec { dim: 4, is_contiguous: true },
-                IndexSpec { dim: 2, is_contiguous: true },
+                IndexSpec { dim: 4, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
             ],
         );
 
@@ -851,8 +851,8 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 2, is_contiguous: true },
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
 
@@ -894,11 +894,11 @@ mod tests {
         let mut index_map = IndexMap::new();
         index_map.insert(
             TensorId::new(0),
-            vec![IndexSpec { dim: 2, is_contiguous: true }],
+            vec![IndexSpec { dim: 2, is_contracted: false, is_contiguous: true }],
         );
         index_map.insert(
             TensorId::new(1),
-            vec![IndexSpec { dim: 3, is_contiguous: true }],
+            vec![IndexSpec { dim: 3, is_contracted: false, is_contiguous: true }],
         );
 
         let graph = GreedyOptimizer
@@ -945,15 +945,15 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 2, is_contiguous: true },
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 3, is_contiguous: true },
-                IndexSpec { dim: 2, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
             ],
         );
 
@@ -994,15 +994,15 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 2, is_contiguous: true },
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 3, is_contiguous: true },
-                IndexSpec { dim: 2, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
             ],
         );
 

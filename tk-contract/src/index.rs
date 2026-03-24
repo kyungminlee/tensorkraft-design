@@ -92,6 +92,12 @@ impl std::fmt::Debug for TensorId {
 pub struct IndexSpec {
     /// Logical dimension of this leg.
     pub dim: usize,
+    /// True when this index is summed over in the contraction.
+    /// False when it appears in the output tensor (free index).
+    /// Set by the caller when building the `IndexMap`; not used by the
+    /// optimizer (which determines contracted vs. free from `ContractionSpec`)
+    /// but useful for diagnostic introspection.
+    pub is_contracted: bool,
     /// Whether this leg is contiguous (unit stride) in the current layout.
     /// Used by the cost estimator to determine whether a transpose is needed.
     pub is_contiguous: bool,
@@ -489,14 +495,14 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 4, is_contiguous: true },
-                IndexSpec { dim: 3, is_contiguous: true }, // j has dim 3 on tensor 0
+                IndexSpec { dim: 4, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true }, // j has dim 3 on tensor 0
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 5, is_contiguous: true }, // j has dim 5 on tensor 1 — mismatch!
+                IndexSpec { dim: 5, is_contracted: false, is_contiguous: true }, // j has dim 5 on tensor 1 — mismatch!
             ],
         );
 
@@ -525,14 +531,14 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 4, is_contiguous: true },
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 4, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 3, is_contiguous: true },
+                IndexSpec { dim: 3, is_contracted: false, is_contiguous: true },
             ],
         );
 
@@ -542,16 +548,16 @@ mod tests {
     #[test]
     fn index_map_dims_match() {
         let mut a = IndexMap::new();
-        a.insert(TensorId::new(0), vec![IndexSpec { dim: 3, is_contiguous: true }]);
+        a.insert(TensorId::new(0), vec![IndexSpec { dim: 3, is_contracted: false, is_contiguous: true }]);
 
         let mut b = IndexMap::new();
-        b.insert(TensorId::new(0), vec![IndexSpec { dim: 3, is_contiguous: false }]);
+        b.insert(TensorId::new(0), vec![IndexSpec { dim: 3, is_contracted: false, is_contiguous: false }]);
 
         // Strides differ but dims match => true
         assert!(a.dims_match(&b));
 
         let mut c = IndexMap::new();
-        c.insert(TensorId::new(0), vec![IndexSpec { dim: 5, is_contiguous: true }]);
+        c.insert(TensorId::new(0), vec![IndexSpec { dim: 5, is_contracted: false, is_contiguous: true }]);
 
         // Dims differ => false
         assert!(!a.dims_match(&c));

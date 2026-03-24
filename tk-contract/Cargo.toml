@@ -18,6 +18,11 @@ log         = "0.4"
 [dev-dependencies]
 proptest  = "1"
 approx    = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "contract_benchmarks"
+harness = false
 
 [features]
 default = ["backend-faer", "parallel"]

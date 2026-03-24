@@ -247,15 +247,15 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 4, is_contiguous: true },
-                IndexSpec { dim: 5, is_contiguous: true },
+                IndexSpec { dim: 4, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 5, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 5, is_contiguous: true },
-                IndexSpec { dim: 6, is_contiguous: true },
+                IndexSpec { dim: 5, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 6, is_contracted: false, is_contiguous: true },
             ],
         );
 
@@ -291,22 +291,22 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 2, is_contiguous: true },
-                IndexSpec { dim: 10, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 10, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 10, is_contiguous: true },
-                IndexSpec { dim: 10, is_contiguous: true },
+                IndexSpec { dim: 10, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 10, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(2),
             vec![
-                IndexSpec { dim: 10, is_contiguous: true },
-                IndexSpec { dim: 2, is_contiguous: true },
+                IndexSpec { dim: 10, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 2, is_contracted: false, is_contiguous: true },
             ],
         );
 
@@ -343,15 +343,15 @@ mod tests {
         index_map.insert(
             TensorId::new(0),
             vec![
-                IndexSpec { dim: 1000, is_contiguous: true },
-                IndexSpec { dim: 1000, is_contiguous: true },
+                IndexSpec { dim: 1000, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 1000, is_contracted: false, is_contiguous: true },
             ],
         );
         index_map.insert(
             TensorId::new(1),
             vec![
-                IndexSpec { dim: 1000, is_contiguous: true },
-                IndexSpec { dim: 1000, is_contiguous: true },
+                IndexSpec { dim: 1000, is_contracted: false, is_contiguous: true },
+                IndexSpec { dim: 1000, is_contracted: false, is_contiguous: true },
             ],
         );
 
