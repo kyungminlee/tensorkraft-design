@@ -1324,6 +1324,7 @@ dependencies = [
 name = "tk-dsl"
 version = "0.1.0"
 dependencies = [
+ "num-complex",
  "num-traits",
  "smallstr",
  "smallvec",

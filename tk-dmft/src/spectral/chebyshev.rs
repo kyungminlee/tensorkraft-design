@@ -125,14 +125,112 @@ pub fn reconstruct_from_moments(
     Ok(SpectralFunction::new(omega.to_vec(), values))
 }
 
-/// Placeholder for full Chebyshev expansion using DMRG engine.
+/// Compute the impurity spectral function via Chebyshev expansion.
 ///
-/// The actual implementation requires `DMRGEngine` to apply H to MPS states.
-/// This is a design coordination point with tk-dmrg (spec Open Question #3).
+/// Algorithm (design doc Section 8.4.3):
 ///
-/// For draft: provides `reconstruct_from_moments` for pre-computed moments.
-/// Full `chebyshev_expand` that computes moments via H_eff matvec will be
-/// implemented when `DMRGEngine::apply_hamiltonian_to_mps` is available.
+/// 1. Rescale H to H_tilde = (H - b) / a where:
+///      a = (E_max - E_min) / (2 - epsilon)   (small epsilon for numerical safety)
+///      b = (E_max + E_min) / 2
+///    This maps the spectrum into (-1, 1).
+///
+/// 2. Construct |alpha> = c^dag_{0,sigma}|psi_0> by applying the impurity
+///    creation operator to the DMRG ground state.
+///
+/// 3. Compute Chebyshev moments via the three-term recursion:
+///      |phi_0> = |alpha>
+///      |phi_1> = H_tilde|alpha>
+///      |phi_n> = 2 * H_tilde|phi_{n-1}> - |phi_{n-2}>
+///      mu_n = <psi_0|c_{0,sigma}|phi_n>
+///
+///    Each step calls `DMRGEngine::apply_hamiltonian` (H_eff matvec reuse).
+///
+/// 4. Apply Jackson kernel (if enabled).
+///
+/// 5. Reconstruct A(omega) via `reconstruct_from_moments`.
+///
+/// # Complexity
+/// O(n_moments * N * d * D^2 * w) — one H_eff matvec application per moment.
+///
+/// # Parameters
+/// - `omega`: target frequency grid
+/// - `e_min`: lower spectral bound
+/// - `e_max`: upper spectral bound
+/// - `config`: Chebyshev configuration
+///
+/// # Errors
+/// Returns `DmftError::ChebyshevBandwidthError` if e_min >= e_max.
+/// Returns `DmftError::Dmrg` if the Hamiltonian application fails.
+pub fn chebyshev_expand(
+    _omega: &[f64],
+    e_min: f64,
+    e_max: f64,
+    _config: &ChebyshevConfig,
+) -> DmftResult<SpectralFunction> {
+    if e_min >= e_max {
+        return Err(DmftError::ChebyshevBandwidthError {
+            e_min,
+            e_max,
+            e0: 0.0,
+        });
+    }
+
+    // The Chebyshev moment computation requires:
+    //
+    // 1. A converged ground state MPS |psi_0> from DMRGEngine
+    // 2. Application of c†_{0,σ}|psi_0> = |α> (same as TDVP pipeline)
+    // 3. Iterative H_eff matvec to build Chebyshev vectors:
+    //    |φ_0> = |α>
+    //    |φ_1> = H̃|α>    where H̃ = (H - b·I) / a
+    //    |φ_n> = 2·H̃|φ_{n-1}> - |φ_{n-2}>
+    // 4. Moments: μ_n = <ψ_0|c_{0,σ}|φ_n>
+    //
+    // When DMRGEngine::apply_hamiltonian_to_mps is available:
+    //
+    //   let eps = 0.01;
+    //   let a = (e_max - e_min) / (2.0 - eps);
+    //   let b = (e_max + e_min) / 2.0;
+    //
+    //   let alpha = apply_operator_to_mps(c_dag_up, site_0, &psi0);
+    //   let bra = apply_operator_to_mps(c_up, site_0, &psi0);
+    //
+    //   let mut phi_prev = alpha.clone();
+    //   let mut phi_curr = rescaled_apply_h(&phi_prev, a, b, engine);
+    //   let mut moments = vec![0.0; config.n_moments];
+    //   moments[0] = mps_overlap(&bra, &phi_prev).re;
+    //   if config.n_moments > 1 {
+    //       moments[1] = mps_overlap(&bra, &phi_curr).re;
+    //   }
+    //
+    //   for n in 2..config.n_moments {
+    //       let phi_next = 2 * rescaled_apply_h(&phi_curr, a, b, engine) - &phi_prev;
+    //       moments[n] = mps_overlap(&bra, &phi_next).re;
+    //       phi_prev = phi_curr;
+    //       phi_curr = phi_next;
+    //   }
+    //
+    //   reconstruct_from_moments(&moments, omega, e_min, e_max, config)
+
+    Err(DmftError::Dmrg(tk_dmrg::DmrgError::NotImplemented(
+        "Chebyshev moment computation requires DMRGEngine::apply_hamiltonian_to_mps".into(),
+    )))
+}
+
+/// Compute a spectral function from pre-computed Chebyshev moments.
+///
+/// This is the usable entry point when moments have been computed externally
+/// (e.g., from exact diagonalization or a future DMRGEngine integration).
+///
+/// Delegates to `reconstruct_from_moments` with the configured Jackson kernel.
+pub fn chebyshev_from_precomputed_moments(
+    moments: &[f64],
+    omega: &[f64],
+    e_min: f64,
+    e_max: f64,
+    config: &ChebyshevConfig,
+) -> DmftResult<SpectralFunction> {
+    reconstruct_from_moments(moments, omega, e_min, e_max, config)
+}
 
 #[cfg(test)]
 mod tests {
@@ -202,5 +300,32 @@ mod tests {
                 assert!(v.abs() < 1e-10, "nonzero outside band at w={}: {}", w, v);
             }
         }
+    }
+
+    #[test]
+    fn test_chebyshev_expand_bandwidth_error() {
+        let omega = vec![0.0];
+        let result = chebyshev_expand(&omega, 1.0, 0.0, &ChebyshevConfig::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_chebyshev_expand_returns_not_implemented() {
+        let omega: Vec<f64> = (-10..=10).map(|i| i as f64 * 0.1).collect();
+        let result = chebyshev_expand(&omega, -5.0, 5.0, &ChebyshevConfig::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_chebyshev_from_precomputed_moments() {
+        let mut moments = vec![0.0; 50];
+        moments[0] = 1.0;
+        let omega: Vec<f64> = (-50..=50).map(|i| i as f64 * 0.1).collect();
+        let config = ChebyshevConfig {
+            n_moments: 50,
+            ..Default::default()
+        };
+        let result = chebyshev_from_precomputed_moments(&moments, &omega, -5.0, 5.0, &config);
+        assert!(result.is_ok());
     }
 }

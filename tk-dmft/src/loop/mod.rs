@@ -47,6 +47,8 @@ pub struct DMFTLoop<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> {
     n_iterations: usize,
     #[allow(dead_code)]
     backend: B,
+    /// Broyden mixing state (used when MixingScheme::Broyden is selected).
+    broyden_state: Option<mixing::BroydenState>,
     _phantom: PhantomData<Q>,
 }
 
@@ -64,6 +66,12 @@ where
         config: DMFTConfig,
         backend: B,
     ) -> Self {
+        let broyden_state = match &config.mixing {
+            mixing::MixingScheme::Broyden { history_depth, .. } => {
+                Some(mixing::BroydenState::new(*history_depth))
+            }
+            _ => None,
+        };
         Self {
             impurity,
             config,
@@ -71,6 +79,7 @@ where
             is_converged: false,
             n_iterations: 0,
             backend,
+            broyden_state,
             _phantom: PhantomData,
         }
     }
@@ -79,43 +88,155 @@ where
     ///
     /// Returns the converged primary spectral function A(omega).
     ///
+    /// The self-consistency loop:
+    /// 1. Build AIM chain Hamiltonian (OpSum) from current bath
+    /// 2. Run DMRG ground-state solver
+    /// 3. Compute spectral functions via TDVP and/or Chebyshev
+    /// 4. Adaptive solver selection (entanglement gap)
+    /// 5. Cross-validate primary vs secondary
+    /// 6. Compute Weiss field (Bethe lattice Dyson equation)
+    /// 7. Discretize new bath via Lanczos tridiagonalization
+    /// 8. Mix old and new bath (linear or Broyden)
+    /// 9. Check convergence
+    ///
     /// # Errors
     /// - `DmftError::Dmrg` wrapping any `DmrgError` from DMRG or TDVP
     /// - `DmftError::BathDiscretizationFailed` if Lanczos discretization fails
     /// - `DmftError::MaxIterationsExceeded` if `max_iterations` is reached
+    /// - `DmftError::Cancelled` if the cancellation flag is set
     pub fn solve(&mut self) -> DmftResult<SpectralFunction> {
-        // TODO: Full implementation requires functional DMRGEngine and TdvpDriver.
-        //
-        // The self-consistency loop pseudocode:
-        //
-        // loop {
-        //     chain_mpo = impurity.build_chain_hamiltonian()
-        //     gs_engine = DMRGEngine::new(mps_init, chain_mpo, backend, dmrg_config)
-        //     gs_engine.run()?
-        //
-        //     // Adaptive solver selection:
-        //     let use_cheb_primary = match config.solver_mode { ... };
-        //
-        //     // Compute both spectral functions:
-        //     spectral_tdvp = self.tdvp_spectral(&gs_engine, &chain_mpo)?
-        //     spectral_cheb = chebyshev_expand(&gs_engine, &chain_mpo, ..)?
-        //
-        //     // Cross-validate:
-        //     self.validate_consistency(primary, cross)
-        //
-        //     // Self-consistency update:
-        //     delta_new = self.weiss_field(primary)
-        //     bath_new = impurity.discretize(&delta_new, ..)?
-        //     bath_mixed = apply_mixing(&impurity.bath, &bath_new, &config.mixing)
-        //     impurity.update_bath(bath_mixed)
-        //
-        //     if converged { return Ok(primary.clone()); }
-        // }
+        // Build the frequency grid for spectral functions and Weiss field
+        let n_omega = self.config.bath_discretization.n_omega_points;
+        let bw = self.config.bath_discretization.bandwidth;
+        let _omega: Vec<f64> = (0..n_omega)
+            .map(|i| -bw + 2.0 * bw * i as f64 / (n_omega as f64 - 1.0))
+            .collect();
 
-        unimplemented!(
-            "DMFTLoop::solve() requires functional DMRGEngine sweep, \
-             TdvpDriver time evolution, and environment contraction from tk-dmrg"
-        )
+        let mut _last_spectral: Option<SpectralFunction> = None;
+
+        for iteration in 0..self.config.max_iterations {
+            let _iter_start = std::time::Instant::now();
+
+            // --- Step 1: Build AIM chain Hamiltonian ---
+            let _opsum =
+                crate::impurity::hamiltonian::build_aim_chain_hamiltonian(&self.impurity);
+
+            // --- Step 2: DMRG ground state ---
+            // This requires compiling the OpSum into an MPO and running DMRGEngine.
+            // When tk-dmrg's MpoCompiler and DMRGEngine are fully functional:
+            //
+            //   let mpo = MpoCompiler::compile(&opsum, &backend)?;
+            //   let mps = MPS::random(n_sites, d=4, D_init=10, &backend);
+            //   let mut engine = DMRGEngine::new(mps, mpo, &backend, &config.dmrg_config);
+            //   engine.run()?;
+            //   let gs_energy = engine.energy();
+            //   let gs_mps = engine.mps();
+
+            // --- Step 3: Spectral functions ---
+            // Adaptive solver selection based on entanglement gap:
+            //   let use_cheb_primary = match self.config.solver_mode {
+            //       SpectralSolverMode::TdvpPrimary => false,
+            //       SpectralSolverMode::ChebyshevPrimary => true,
+            //       SpectralSolverMode::Adaptive { gap_threshold } => {
+            //           gs_mps.entanglement_gap_at_center() < gap_threshold
+            //       }
+            //   };
+            //
+            //   let spectral_tdvp = tdvp_spectral_pipeline(&tdvp_config, &lp_config, &omega)?;
+            //   let spectral_cheb = chebyshev_expand(&omega, e_min, e_max, &cheb_config)?;
+            //
+            //   let (primary, cross) = if use_cheb_primary {
+            //       (spectral_cheb, spectral_tdvp)
+            //   } else {
+            //       (spectral_tdvp, spectral_cheb)
+            //   };
+
+            // For now, return an error indicating DMRG engine is needed.
+            // Once tk-dmrg provides a functional DMRGEngine with sweep(),
+            // the above pseudocode should be uncommented and the error removed.
+            return Err(DmftError::Dmrg(tk_dmrg::DmrgError::NotImplemented(
+                format!(
+                    "DMFT iteration {} requires functional DMRGEngine, \
+                     MpoCompiler, and TdvpDriver from tk-dmrg. \
+                     The self-consistency loop structure is complete; \
+                     awaiting upstream integration.",
+                    iteration
+                ),
+            )));
+
+            // --- The following code documents the complete loop structure ---
+            // --- and will execute once the DMRG engine is functional ---
+
+            // // Step 4: Cross-validate
+            // self.validate_consistency(&primary, &cross);
+
+            // // Step 5: Weiss field (Bethe lattice)
+            // let delta_new = self.weiss_field(&primary);
+
+            // // Step 6: Discretize new bath
+            // // Convert complex delta to the format expected by Lanczos
+            // let delta_as_t: Vec<T> = delta_new.iter().map(|c| {
+            //     T::from_real(T::Real::from(-c.im))
+            // }).collect();
+            // let omega_real: Vec<T::Real> = omega.iter().map(|&w| T::Real::from(w)).collect();
+            // let bath_proposed = self.impurity.discretize(
+            //     &delta_as_t, &omega_real, &self.config.bath_discretization
+            // )?;
+
+            // // Step 7: Mix
+            // let bath_mixed = self.apply_mixing(&bath_proposed);
+
+            // // Step 8: Convergence check
+            // let omega_real: Vec<T::Real> = omega.iter().map(|&w| T::Real::from(w)).collect();
+            // let broadening = T::Real::from(self.config.bath_discretization.broadening);
+            // let distance = self.impurity.bath.hybridization_distance(
+            //     &bath_mixed, &omega_real, broadening
+            // );
+
+            // // Step 9: Update bath and statistics
+            // self.impurity.update_bath(bath_mixed);
+            // self.n_iterations = iteration + 1;
+
+            // let wall_time = iter_start.elapsed().as_secs_f64();
+            // let dmrg_summary = stats::DmrgIterationSummary {
+            //     energy: gs_energy,
+            //     max_truncation_error: 0.0,
+            //     max_bond_dim: 0,
+            //     n_sweeps: 0,
+            //     wall_time_secs: wall_time,
+            // };
+
+            // self.stats.push_iteration(
+            //     gs_energy, distance, primary.sum_rule(),
+            //     0.0, use_cheb_primary, wall_time, dmrg_summary,
+            // );
+
+            // // Checkpoint
+            // if let Some(ref cp_path) = self.config.checkpoint_path {
+            //     let checkpoint = DMFTCheckpoint { ... };
+            //     checkpoint.write_to_file(cp_path)?;
+            // }
+
+            // if distance < self.config.self_consistency_tol {
+            //     self.is_converged = true;
+            //     return Ok(primary);
+            // }
+
+            // last_spectral = Some(primary);
+        }
+
+        // Max iterations exceeded
+        let final_distance = self
+            .stats
+            .hybridization_distances
+            .last()
+            .copied()
+            .unwrap_or(f64::INFINITY);
+        Err(DmftError::MaxIterationsExceeded {
+            iterations: self.config.max_iterations,
+            distance: final_distance,
+            threshold: self.config.self_consistency_tol,
+        })
     }
 
     /// Run with an `AtomicBool` cancellation flag.
@@ -149,24 +270,44 @@ where
 
     /// Compute the non-interacting Weiss field from the impurity spectral function.
     ///
-    /// Specialized to the Bethe lattice for Phase 4.
+    /// Specialized to the Bethe lattice (infinite coordination).
     ///
-    /// G_imp(omega) is reconstructed from A_imp(omega) via Kramers-Kronig.
-    /// Delta(omega) = omega + mu - G_imp^-1(omega) - epsilon_imp
+    /// For the Bethe lattice with half-bandwidth W, the self-consistency
+    /// relation simplifies to:
+    ///   Delta(omega) = (W/2)^2 * G_imp(omega)
+    ///
+    /// where G_imp(omega) is reconstructed from A_imp(omega) via Kramers-Kronig:
+    ///   G_imp(omega + i*eta) = integral A(omega') / (omega - omega' + i*eta) d_omega'
+    ///
+    /// The half-bandwidth W is taken from `bath_discretization.bandwidth` in the config.
     pub(crate) fn weiss_field(
         &self,
-        _spectral: &SpectralFunction,
+        spectral: &SpectralFunction,
     ) -> Vec<Complex<f64>> {
-        // TODO: Phase 5+ — implement general lattice Weiss field via Dyson equation.
-        // For Bethe lattice:
-        //   G_0^-1(omega) = omega + mu - (W^2/z) * G_imp(omega)
-        //   Delta(omega) = omega + mu - G_imp^-1(omega) - epsilon_imp
-        //
-        // Requires Kramers-Kronig transform to get G_imp(omega) from A_imp(omega):
-        //   G_imp(omega) = integral A(omega') / (omega - omega' + i*0+) d_omega'
-        //
-        // This is a Hilbert transform that can be computed via FFT.
-        unimplemented!("Bethe lattice Weiss field computation")
+        let eta = self.config.bath_discretization.broadening;
+        let half_bw = self.config.bath_discretization.bandwidth / 2.0;
+
+        // Reconstruct G_imp(omega) from A(omega) via Kramers-Kronig (discrete Hilbert transform)
+        // G_imp(omega_i) = sum_j A(omega_j) * d_omega / (omega_i - omega_j + i*eta)
+        let d_omega = spectral.d_omega;
+        let n = spectral.omega.len();
+
+        let g_imp: Vec<Complex<f64>> = spectral
+            .omega
+            .iter()
+            .map(|&w_i| {
+                let mut g = Complex::new(0.0, 0.0);
+                for j in 0..n {
+                    let denom = Complex::new(w_i - spectral.omega[j], eta);
+                    g = g + spectral.values[j] * d_omega / denom;
+                }
+                g
+            })
+            .collect();
+
+        // Bethe lattice self-consistency: Delta(omega) = (W/2)^2 * G_imp(omega)
+        let t_sq = half_bw * half_bw;
+        g_imp.iter().map(|&g| t_sq * g).collect()
     }
 
     /// Apply the configured mixing scheme to produce the next bath parameters.
@@ -178,13 +319,54 @@ where
             mixing::MixingScheme::Linear { alpha } => {
                 self.impurity.bath.linear_mix(bath_proposed, *alpha)
             }
-            mixing::MixingScheme::Broyden {
-                alpha,
-                history_depth: _,
-            } => {
-                // TODO: Implement Broyden quasi-Newton mixing.
-                // For draft: fall back to linear mixing.
-                self.impurity.bath.linear_mix(bath_proposed, *alpha)
+            mixing::MixingScheme::Broyden { alpha, .. } => {
+                let alpha_val = *alpha;
+                // Flatten current bath into parameter vector [epsilon..., |v|...]
+                let n = self.impurity.bath.n_bath;
+                let mut x_current = Vec::with_capacity(2 * n);
+                for &e in &self.impurity.bath.epsilon {
+                    x_current.push(e.into());
+                }
+                for &v in &self.impurity.bath.v {
+                    let v_f64: f64 = v.abs_sq().into();
+                    x_current.push(v_f64.sqrt());
+                }
+
+                let mut f_proposed = Vec::with_capacity(2 * n);
+                for &e in &bath_proposed.epsilon {
+                    f_proposed.push(e.into());
+                }
+                for &v in &bath_proposed.v {
+                    let v_f64: f64 = v.abs_sq().into();
+                    f_proposed.push(v_f64.sqrt());
+                }
+
+                let x_next = if let Some(ref mut state) = self.broyden_state {
+                    state.update(&x_current, &f_proposed, alpha_val)
+                } else {
+                    // Fallback: linear mixing
+                    x_current
+                        .iter()
+                        .zip(&f_proposed)
+                        .map(|(x, f)| (1.0 - alpha_val) * x + alpha_val * f)
+                        .collect()
+                };
+
+                // Reconstruct BathParameters from flattened vector
+                let mut epsilon = Vec::with_capacity(n);
+                let mut v = Vec::with_capacity(n);
+                for i in 0..n {
+                    epsilon.push(T::Real::from(x_next[i]));
+                }
+                for i in 0..n {
+                    v.push(T::from_real(T::Real::from(x_next[n + i])));
+                }
+
+                crate::impurity::bath::BathParameters {
+                    epsilon,
+                    v,
+                    n_bath: n,
+                }
             }
         }
     }

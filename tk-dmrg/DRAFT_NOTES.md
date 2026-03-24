@@ -1,6 +1,6 @@
 # tk-dmrg Draft Implementation Notes
 
-**Status:** Draft implementation — compiles, 26 tests pass, core type scaffolding functional with working Lanczos and Davidson eigensolvers. Sweep engine, environments, TDVP, and MPO compilation are skeletons.
+**Status:** Gap-filling implementation — compiles, 30 tests pass. Core DMRG loop is functional with working eigensolvers, environment contractions, H_eff construction, SVD truncation, and sweep step logic. MPS canonicalization and observables implemented. TDVP, iDMRG, and MPO compiler have improved stubs with documented algorithms.
 **Date:** March 2026
 
 ---
@@ -42,18 +42,30 @@
 
 ## Remaining limitations
 
-### Not implemented (skeletons only)
+### Newly implemented (gap-filling)
+
+| Component | Status |
+|:----------|:-------|
+| `truncate_svd` | **Implemented** — delegates to `LinAlgBackend::svd_truncated`, applies cutoff/min/max constraints, computes truncation error |
+| MPS canonicalization | **Implemented** — `left_canonicalize`, `right_canonicalize`, `mixed_canonicalize` via per-sector QR |
+| MPS `center()` | **Fixed** — added `center_site` field to MPS struct |
+| `mps_norm` / `mps_overlap` | **Implemented** — transfer matrix contraction |
+| `mps_energy` | **Implemented** — left-to-right MPS-MPO-MPS sandwich contraction |
+| Environment contraction | **Implemented** — dense `grow_left`/`grow_right` with block-sparse sector iteration |
+| `build_from_scratch` | **Implemented** — builds all right environments via right-to-left sweep |
+| H_eff matvec closures | **Implemented** — `build_heff_two_site`/`build_heff_single_site` build full dense H_eff matrix |
+| DMRG step logic | **Implemented** — `dmrg_step_two_site`/`dmrg_step_single_site` with eigensolver + SVD + environment update |
+| TDVP step | **Partially implemented** — sweep structure with expansion age tracking, Krylov integration pending |
+
+### Still skeleton / not implemented
 
 | Component | Description |
 |:----------|:------------|
-| `MpoCompiler::compile` | OpSum → MPO FSA + SVD compilation |
-| Environment contraction | `grow_left`/`grow_right` |
-| H_eff matvec closures | `build_heff_two_site`/`build_heff_single_site` |
-| DMRG step logic | eigensolve → SVD truncate → update MPS → update env |
-| TDVP bond evolution | subspace expansion (Krylov exp is implemented) |
-| Block-Davidson | block operations |
-| iDMRG | unit-cell extension loop |
-| Checkpoint serialization | requires serde on `BlockSparseTensor` |
+| `MpoCompiler::compile` | OpSum → MPO FSA + SVD compilation (documented algorithm, returns error) |
+| TDVP bond evolution | Full Krylov forward/backward site+bond evolution |
+| Block-Davidson | block operations (delegates to Lanczos) |
+| iDMRG | Unit-cell extension loop structure, needs MPO construction |
+| Checkpoint serialization | Requires serde on `BlockSparseTensor` |
 
 ### Design issues
 

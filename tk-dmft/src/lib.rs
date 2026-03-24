@@ -29,17 +29,17 @@ pub use impurity::hamiltonian::build_aim_chain_hamiltonian;
 
 // Spectral function types and free functions
 pub use spectral::{SpectralFunction, SpectralSolverMode};
-pub use spectral::chebyshev::{ChebyshevConfig, jackson_kernel, reconstruct_from_moments};
+pub use spectral::chebyshev::{ChebyshevConfig, chebyshev_expand, chebyshev_from_precomputed_moments, jackson_kernel, reconstruct_from_moments};
 pub use spectral::linear_predict::{
     LinearPredictionConfig, ToeplitzSolver,
     deconvolve_lorentzian, fft_to_spectral, linear_predict_regularized,
     solve_toeplitz_levinson_durbin,
 };
 pub use spectral::positivity::restore_positivity;
-pub use spectral::tdvp::TdvpSpectralConfig;
+pub use spectral::tdvp::{TdvpSpectralConfig, compute_greens_function_tdvp, tdvp_spectral_pipeline};
 
 // DMFT loop and configuration
 pub use r#loop::config::{DMFTConfig, TimeEvolutionConfig};
-pub use r#loop::mixing::MixingScheme;
+pub use r#loop::mixing::{BroydenState, MixingScheme};
 pub use r#loop::stats::{DMFTStats, DmrgIterationSummary};
 pub use r#loop::{DMFTCheckpoint, DMFTLoop};

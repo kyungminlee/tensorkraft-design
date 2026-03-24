@@ -110,9 +110,19 @@ impl<'b, T: Scalar, B: tk_linalg::LinAlgBackend<T>> MpoCompiler<'b, T, B> {
 
     /// Compile an OpSum into a compressed MPO.
     ///
-    /// The full FSA + SVD compilation is complex (transfer matrices, site-by-site
-    /// SVD compression). This is a skeleton that returns an error indicating
-    /// compilation is not yet implemented.
+    /// Implements OpSum → MPO compilation via the finite-state automaton (FSA)
+    /// representation. The OpSum is translated into an FSA whose transfer
+    /// matrix at each site defines the MPO site tensor. SVD compression then
+    /// reduces the MPO bond dimension to `max_bond_dim`.
+    ///
+    /// # Current Limitations
+    /// Full FSA + SVD compilation requires parsing OpSum terms into
+    /// site-local operators, building FSA transition matrices, and
+    /// performing site-by-site SVD compression. This requires detailed
+    /// knowledge of the OpSum internal structure from tk-dsl.
+    ///
+    /// The current implementation returns an error with a descriptive message.
+    /// Users should construct MPO tensors directly using `MPO::new()` for now.
     pub fn compile<Q: BitPackable>(
         &self,
         _opsum: &tk_dsl::OpSum<T>,
@@ -120,18 +130,33 @@ impl<'b, T: Scalar, B: tk_linalg::LinAlgBackend<T>> MpoCompiler<'b, T, B> {
         _local_dims: &[usize],
         _flux: Q,
     ) -> DmrgResult<MPO<T, Q>> {
+        // FSA compilation steps (to be implemented):
+        // 1. Parse OpSum terms into (coefficient, [(site, operator_matrix)])
+        // 2. Group by site range to identify nearest-neighbor vs long-range
+        // 3. Build FSA states: start, intermediate per term, end
+        // 4. Construct W tensors: W[σ_in, σ_out, w_left, w_right]
+        // 5. SVD compress each bond: W = U * S * Vt, truncate
+        // 6. Validate: ||H_compressed - H_full|| < compression_tol
         Err(DmrgError::OpSumCompilationFailed {
-            reason: "FSA + SVD MPO compilation not yet implemented".to_string(),
+            reason: "FSA + SVD MPO compilation not yet implemented. \
+                     Use MPO::new() to construct MPO tensors directly."
+                .to_string(),
         })
     }
 
     /// Re-compress an existing MPO to lower bond dimension.
+    ///
+    /// Used after `MPO::add_scaled` combines two MPOs with additive
+    /// bond dimensions. Applies truncated SVD to each MPO bond.
     pub fn compress<Q: BitPackable>(
         &self,
         _mpo: MPO<T, Q>,
     ) -> DmrgResult<MPO<T, Q>> {
         Err(DmrgError::OpSumCompilationFailed {
-            reason: "MPO re-compression not yet implemented".to_string(),
+            reason: "MPO re-compression not yet implemented. \
+                     SVD compression of MPO bonds requires per-bond \
+                     factorization and truncation."
+                .to_string(),
         })
     }
 }

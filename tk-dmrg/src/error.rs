@@ -51,6 +51,9 @@ pub enum DmrgError {
 
     #[error("computation cancelled")]
     Cancelled,
+
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
 }
 
 pub type DmrgResult<T> = Result<T, DmrgError>;

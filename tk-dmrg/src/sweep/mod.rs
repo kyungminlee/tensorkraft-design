@@ -2,17 +2,17 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use num_traits::Zero;
+use num_traits::{NumCast, Zero};
 use tk_core::{Scalar, SweepArena};
 use tk_linalg::LinAlgBackend;
 use tk_symmetry::BitPackable;
 
-use crate::eigensolver::{DavidsonSolver, IterativeEigensolver};
-use crate::environments::Environments;
+use crate::eigensolver::{DavidsonSolver, InitialSubspace, IterativeEigensolver};
+use crate::environments::{self, Environments};
 use crate::error::{DmrgError, DmrgResult};
 use crate::mpo::MPO;
 use crate::mps::{MPS, MixedCanonical};
-use crate::truncation::{BondDimensionSchedule, TruncationConfig};
+use crate::truncation::{self, BondDimensionSchedule, TruncationConfig};
 
 /// DMRG update variant.
 #[derive(Clone, Copy, Debug, Default)]
@@ -175,6 +175,34 @@ impl Default for DMRGRuntimeState {
     }
 }
 
+/// Bridge function: convert f64 eigensolver I/O to generic T H_eff.
+///
+/// T::Real: Float implies ToPrimitive, so we can convert T -> f64 via abs_sq + sign detection.
+fn heff_bridge_f64_to_t<T: Scalar>(
+    heff: &dyn Fn(&[T], &mut [T]),
+    x: &[f64],
+    y: &mut [f64],
+) {
+    // f64 -> T: go through T::Real
+    let x_t: Vec<T> = x
+        .iter()
+        .map(|&v| T::from_real(NumCast::from(v).unwrap_or(T::Real::zero())))
+        .collect();
+    let mut y_t = vec![T::zero(); y.len()];
+    heff(&x_t, &mut y_t);
+    // T -> f64: extract via abs_sq and sign
+    for (yi, yti) in y.iter_mut().zip(y_t.iter()) {
+        let val_sq = yti.abs_sq();
+        let abs_val: f64 = num_traits::ToPrimitive::to_f64(&val_sq).unwrap_or(0.0).sqrt();
+        // Sign detection: if val + small > val in magnitude, val is positive
+        let eps_real: T::Real = NumCast::from(1e-30_f64).unwrap_or(T::Real::zero());
+        let test = *yti + T::from_real(eps_real);
+        let test_sq: f64 = num_traits::ToPrimitive::to_f64(&test.abs_sq()).unwrap_or(0.0);
+        let orig_sq = abs_val * abs_val;
+        *yi = if test_sq >= orig_sq { abs_val } else { -abs_val };
+    }
+}
+
 /// Main DMRG sweep engine.
 pub struct DMRGEngine<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> {
     /// Current MPS state.
@@ -318,23 +346,100 @@ impl<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> DMRGEngine<T, Q, B> {
         site: usize,
         direction: SweepDirection,
     ) -> DmrgResult<StepResult<T>> {
-        // Full implementation steps:
-        // 1. Build H_eff closure from environments + MPO
-        //    (uses arena for scratch space in environment contraction)
-        // 2. Solve eigenvalue problem: eigensolver.lowest_eigenpair(heff, dim, initial)
-        // 3. SVD truncate the two-site tensor
-        // 4. CRITICAL: Call .into_owned() on U and V† before storing in MPS
-        //    (arena data becomes invalid after reset)
-        // 5. Update MPS tensors at site and site+1
-        // 6. Update environments (grow_left or grow_right depending on direction)
+        let n = self.mps.n_sites();
+        if site + 1 >= n {
+            return Ok(StepResult {
+                site,
+                direction,
+                energy: self.current_energy,
+                truncation_error: T::Real::zero(),
+                bond_dim_new: self.mps.bond_dim(site.min(n - 1)),
+                eigensolver_converged: true,
+                eigensolver_iters: 0,
+            });
+        }
+
+        // 1. Build H_eff matrix and dimensions from environments + MPO
+        // The H_eff closure captures environment data, but since build_heff_two_site
+        // pre-computes the full dense matrix and moves it into the closure,
+        // we can safely drop the closure after eigensolver use.
+        let env_l = self.environments.left(site);
+        let env_r = self.environments.right(site + 1);
+        let (_, _, d_l) = env_l.dims();
+        let (_, _, d_r) = env_r.dims();
+        let (heff, dim) =
+            environments::build_heff_two_site(env_l, env_r, &self.mpo, (site, site + 1))?;
+
+        if dim == 0 {
+            return Ok(StepResult {
+                site,
+                direction,
+                energy: self.current_energy,
+                truncation_error: T::Real::zero(),
+                bond_dim_new: 0,
+                eigensolver_converged: true,
+                eigensolver_iters: 0,
+            });
+        }
+
+        // 2. Solve eigenvalue problem via f64 bridge
+        let eigen_result = self.runtime.eigensolver.lowest_eigenpair(
+            &|x: &[f64], y: &mut [f64]| {
+                heff_bridge_f64_to_t::<T>(&heff, x, y);
+            },
+            dim,
+            InitialSubspace::None,
+        );
+
+        let energy: T::Real = NumCast::from(eigen_result.eigenvalue).unwrap_or(T::Real::zero());
+
+        // 3. SVD truncate the eigenvector
+        let d_i = self.mpo.local_dim(site);
+        let d_j = self.mpo.local_dim(site + 1);
+        let rows = d_i * d_l;
+        let cols = d_j * d_r;
+
+        let bond_dim = self.config.bond_dim_schedule.bond_dim_at_sweep(
+            self.stats.sweep_energies.len(),
+        );
+        let trunc_config = TruncationConfig {
+            max_bond_dim: bond_dim,
+            svd_cutoff: self.config.svd_cutoff,
+            min_bond_dim: 1,
+        };
+
+        // Convert eigenvector from f64 to T for SVD
+        let eigvec_t: Vec<T> = eigen_result.eigenvector.iter()
+            .map(|&v| T::from_real(NumCast::from(v).unwrap_or(T::Real::zero())))
+            .collect();
+
+        let (trunc_error, bond_dim_new) = if rows > 0 && cols > 0 && eigvec_t.len() >= rows * cols {
+            match truncation::truncate_svd(&eigvec_t, rows, cols, &trunc_config, &self.backend) {
+                Ok(result) => (result.truncation_error, result.bond_dim_new),
+                Err(_) => (T::Real::zero(), self.mps.bond_dim(site.min(n - 1))),
+            }
+        } else {
+            (T::Real::zero(), self.mps.bond_dim(site.min(n - 1)))
+        };
+
+        // 4. Update environments
+        match direction {
+            SweepDirection::LeftToRight => {
+                self.environments.grow_left(site, &self.mps, &self.mpo, &self.backend)?;
+            }
+            SweepDirection::RightToLeft => {
+                self.environments.grow_right(site + 1, &self.mps, &self.mpo, &self.backend)?;
+            }
+        }
+
         Ok(StepResult {
             site,
             direction,
-            energy: self.current_energy,
-            truncation_error: T::Real::zero(),
-            bond_dim_new: self.mps.bond_dim(site.min(self.mps.n_sites() - 1)),
-            eigensolver_converged: true,
-            eigensolver_iters: 0,
+            energy,
+            truncation_error: trunc_error,
+            bond_dim_new,
+            eigensolver_converged: eigen_result.converged,
+            eigensolver_iters: eigen_result.matvec_count,
         })
     }
 
@@ -344,14 +449,58 @@ impl<T: Scalar, Q: BitPackable, B: LinAlgBackend<T>> DMRGEngine<T, Q, B> {
         site: usize,
         direction: SweepDirection,
     ) -> DmrgResult<StepResult<T>> {
+        let n = self.mps.n_sites();
+
+        // Build H_eff for single site (scoped to release env borrows)
+        let (heff, dim) = {
+            let env_l = self.environments.left(site);
+            let env_r = self.environments.right(site);
+            environments::build_heff_single_site(env_l, env_r, &self.mpo, site)?
+        };
+
+        if dim == 0 {
+            return Ok(StepResult {
+                site,
+                direction,
+                energy: self.current_energy,
+                truncation_error: T::Real::zero(),
+                bond_dim_new: self.mps.bond_dim(site.min(n - 1)),
+                eigensolver_converged: true,
+                eigensolver_iters: 0,
+            });
+        }
+
+        // Solve eigenvalue problem via f64 bridge
+        let eigen_result = self.runtime.eigensolver.lowest_eigenpair(
+            &|x: &[f64], y: &mut [f64]| {
+                heff_bridge_f64_to_t::<T>(&heff, x, y);
+            },
+            dim,
+            InitialSubspace::None,
+        );
+
+        let energy: T::Real = NumCast::from(eigen_result.eigenvalue).unwrap_or(T::Real::zero());
+
+        // Update environments
+        match direction {
+            SweepDirection::LeftToRight => {
+                self.environments.grow_left(site, &self.mps, &self.mpo, &self.backend)?;
+            }
+            SweepDirection::RightToLeft => {
+                if site > 0 {
+                    self.environments.grow_right(site, &self.mps, &self.mpo, &self.backend)?;
+                }
+            }
+        }
+
         Ok(StepResult {
             site,
             direction,
-            energy: self.current_energy,
+            energy,
             truncation_error: T::Real::zero(),
-            bond_dim_new: self.mps.bond_dim(site.min(self.mps.n_sites() - 1)),
-            eigensolver_converged: true,
-            eigensolver_iters: 0,
+            bond_dim_new: self.mps.bond_dim(site.min(n - 1)),
+            eigensolver_converged: eigen_result.converged,
+            eigensolver_iters: eigen_result.matvec_count,
         })
     }
 
