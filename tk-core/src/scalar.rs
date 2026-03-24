@@ -40,6 +40,12 @@ pub trait Scalar:
     /// Embed a real value into this scalar type.
     fn from_real(r: Self::Real) -> Self;
 
+    /// Construct a scalar from real and imaginary parts.
+    ///
+    /// For real types (`f32`, `f64`), the imaginary part is ignored and
+    /// only `re` is returned. For complex types, returns `re + im*i`.
+    fn from_real_imag(re: Self::Real, im: Self::Real) -> Self;
+
     /// Returns true iff complex conjugation is a no-op (i.e., T is real).
     /// Used by the contraction engine to skip conjugation-flag propagation
     /// in tight loops over real-valued models.
@@ -66,6 +72,11 @@ impl Scalar for f32 {
     #[inline(always)]
     fn from_real(r: Self::Real) -> Self {
         r
+    }
+
+    #[inline(always)]
+    fn from_real_imag(re: Self::Real, _im: Self::Real) -> Self {
+        re
     }
 
     #[inline(always)]
@@ -97,6 +108,11 @@ impl Scalar for f64 {
     }
 
     #[inline(always)]
+    fn from_real_imag(re: Self::Real, _im: Self::Real) -> Self {
+        re
+    }
+
+    #[inline(always)]
     fn is_real() -> bool {
         true
     }
@@ -125,6 +141,11 @@ impl Scalar for Complex<f32> {
     }
 
     #[inline(always)]
+    fn from_real_imag(re: Self::Real, im: Self::Real) -> Self {
+        Complex::new(re, im)
+    }
+
+    #[inline(always)]
     fn is_real() -> bool {
         false
     }
@@ -150,6 +171,11 @@ impl Scalar for Complex<f64> {
     #[inline(always)]
     fn from_real(r: Self::Real) -> Self {
         Complex::new(r, 0.0)
+    }
+
+    #[inline(always)]
+    fn from_real_imag(re: Self::Real, im: Self::Real) -> Self {
+        Complex::new(re, im)
     }
 
     #[inline(always)]

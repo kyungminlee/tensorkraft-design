@@ -72,6 +72,32 @@ impl<T: Scalar> ScaledOpProduct<T> {
     }
 }
 
+// --- Generic scaling methods (work for any T: Scalar) ---
+
+impl<T: Scalar> OpTerm<T> {
+    /// Scale this single-operator term by a coefficient.
+    /// Works for any `T: Scalar`, unlike the `f64`-only `Mul` overload.
+    pub fn scale(self, coeff: T) -> ScaledOpProduct<T> {
+        ScaledOpProduct {
+            coeff,
+            product: OpProduct {
+                factors: SmallVec::from_elem(self, 1),
+            },
+        }
+    }
+}
+
+impl<T: Scalar> OpProduct<T> {
+    /// Scale this operator product by a coefficient.
+    /// Works for any `T: Scalar`, unlike the `f64`-only `Mul` overload.
+    pub fn scale(self, coeff: T) -> ScaledOpProduct<T> {
+        ScaledOpProduct {
+            coeff,
+            product: self,
+        }
+    }
+}
+
 // --- Operator overloading ---
 
 // OpTerm * OpTerm → OpProduct
@@ -186,6 +212,25 @@ mod tests {
         let scaled = 0.5 * op::<f64>(SpinOp::Sz, 0);
         assert!((scaled.coeff - 0.5).abs() < 1e-12);
         assert_eq!(scaled.product.len(), 1);
+    }
+
+    #[test]
+    fn op_term_scale_generic() {
+        use tk_core::C64;
+        let coeff = C64::new(1.0, 2.0);
+        let scaled = op::<C64>(SpinOp::Sz, 0).scale(coeff);
+        assert_eq!(scaled.coeff, coeff);
+        assert_eq!(scaled.product.len(), 1);
+    }
+
+    #[test]
+    fn op_product_scale_generic() {
+        use tk_core::C64;
+        let coeff = C64::new(0.5, -0.3);
+        let product = op::<C64>(SpinOp::Sz, 0) * op(SpinOp::Sz, 1);
+        let scaled = product.scale(coeff);
+        assert_eq!(scaled.coeff, coeff);
+        assert_eq!(scaled.product.len(), 2);
     }
 
     #[test]

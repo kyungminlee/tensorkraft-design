@@ -16,9 +16,8 @@ pub struct IndexedTensor<T: Scalar> {
     pub indices: SmallVec<[Index; 6]>,
 }
 
-impl<T: Scalar> IndexedTensor<T> {
-    /// Clone by copying the underlying data.
-    pub fn clone_owned(&self) -> Self {
+impl<T: Scalar> Clone for IndexedTensor<T> {
+    fn clone(&self) -> Self {
         let data = DenseTensor::from_vec(
             self.data.shape().clone(),
             self.data.as_slice().to_vec(),
@@ -27,6 +26,14 @@ impl<T: Scalar> IndexedTensor<T> {
             data,
             indices: self.indices.clone(),
         }
+    }
+}
+
+impl<T: Scalar> IndexedTensor<T> {
+    /// Clone by copying the underlying data.
+    #[deprecated(note = "IndexedTensor now implements Clone; use .clone() instead")]
+    pub fn clone_owned(&self) -> Self {
+        self.clone()
     }
 }
 
