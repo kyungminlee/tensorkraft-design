@@ -12,6 +12,7 @@ use crate::error::DmrgResult;
 use crate::sweep::DMRGEngine;
 
 /// Configuration for TDVP numerical stabilization.
+#[derive(Clone, Debug)]
 pub struct TdvpStabilizationConfig {
     /// Tikhonov regularization parameter δ (default: 1e-10).
     pub tikhonov_delta: f64,

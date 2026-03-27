@@ -3,10 +3,13 @@
 use proptest::prelude::*;
 use num_complex::Complex;
 
-use tk_dmft::spectral::linear_predict::{solve_toeplitz_levinson_durbin, LinearPredictionConfig};
+use tk_dmft::spectral::linear_predict::{
+    solve_toeplitz_levinson_durbin, solve_toeplitz_svd_pseudoinverse, LinearPredictionConfig,
+};
 use tk_dmft::spectral::positivity::restore_positivity;
-use tk_dmft::spectral::chebyshev::jackson_kernel;
+use tk_dmft::spectral::chebyshev::{jackson_kernel, reconstruct_from_moments, ChebyshevConfig};
 use tk_dmft::r#loop::mixing::BroydenState;
+use tk_dmft::impurity::bath::BathParameters;
 use tk_dmft::SpectralFunction;
 
 proptest! {
@@ -162,6 +165,114 @@ proptest! {
                 kernel[i] <= kernel[i - 1] + 1e-10,
                 "Jackson kernel not monotone at n={}: g[{}]={} > g[{}]={}",
                 n_moments, i, kernel[i], i - 1, kernel[i - 1],
+            );
+        }
+    }
+
+    /// SVD pseudo-inverse solver should produce finite, bounded coefficients
+    /// for well-conditioned AR(1) autocorrelation sequences.
+    #[test]
+    fn svd_solver_produces_bounded_coefficients(
+        rho in 0.1_f64..0.9_f64,
+        p in 1_usize..=7_usize,
+    ) {
+        let autocorr: Vec<Complex<f64>> = (0..=p)
+            .map(|k| Complex::new(rho.powi(k as i32), 0.0))
+            .collect();
+
+        let coeffs = solve_toeplitz_svd_pseudoinverse(&autocorr, 1e-8)
+            .expect("SVD solver should succeed on well-conditioned AR(1)");
+
+        prop_assert_eq!(coeffs.len(), p);
+
+        for (k, c) in coeffs.iter().enumerate() {
+            prop_assert!(
+                c.re.is_finite() && c.im.is_finite(),
+                "SVD coefficient a[{}] = {:?} is not finite", k, c,
+            );
+        }
+
+        // For order 1, the exact solution is a[0] ≈ rho
+        if p == 1 {
+            prop_assert!(
+                (coeffs[0].re - rho).abs() < 0.01,
+                "Order-1 SVD coefficient {} should be close to rho = {}",
+                coeffs[0].re, rho,
+            );
+        }
+    }
+
+    /// Chebyshev reconstruction from a single nonzero moment (mu_0=1)
+    /// should produce a non-negative spectral function inside the band.
+    #[test]
+    fn chebyshev_reconstruct_nonneg_inside_band(
+        n_moments in 10_usize..=100_usize,
+        half_bw in 1.0_f64..10.0_f64,
+    ) {
+        let mut moments = vec![0.0_f64; n_moments];
+        moments[0] = 1.0;
+
+        let omega: Vec<f64> = (-50..=50).map(|i| i as f64 * half_bw / 50.0).collect();
+        let config = ChebyshevConfig {
+            n_moments,
+            jackson_kernel: true,
+            ..Default::default()
+        };
+
+        let result = reconstruct_from_moments(
+            &moments, &omega, -half_bw, half_bw, &config,
+        ).expect("reconstruction should succeed");
+
+        // Values outside the band should be zero
+        for (&w, &v) in result.omega.iter().zip(result.values.iter()) {
+            if w.abs() > half_bw * 1.01 {
+                prop_assert!(
+                    v.abs() < 1e-8,
+                    "Nonzero outside band at w={}: v={}",
+                    w, v,
+                );
+            }
+        }
+    }
+
+    /// Uniform bath with even number of sites: hybridization distance
+    /// to itself should be exactly zero.
+    #[test]
+    fn uniform_bath_self_distance_zero(
+        n_bath in 2_usize..=8_usize,
+        bandwidth in 2.0_f64..20.0_f64,
+    ) {
+        let bath: BathParameters<f64> = BathParameters::uniform(n_bath, bandwidth, 1.0);
+        let omega: Vec<f64> = (-50..=50).map(|i| i as f64 * 0.2).collect();
+        let broadening = 0.1;
+
+        let dist = bath.hybridization_distance(&bath, &omega, broadening);
+        prop_assert!(
+            dist < 1e-12,
+            "Self-distance should be zero, got {}",
+            dist,
+        );
+    }
+
+    /// Linear mixing of two identical baths should return the original bath.
+    #[test]
+    fn linear_mix_identity(
+        n_bath in 1_usize..=6_usize,
+        alpha in 0.0_f64..=1.0_f64,
+    ) {
+        let bath: BathParameters<f64> = BathParameters::uniform(n_bath, 10.0, 1.0);
+        let mixed = bath.linear_mix(&bath, alpha);
+
+        for i in 0..n_bath {
+            prop_assert!(
+                (mixed.epsilon[i] - bath.epsilon[i]).abs() < 1e-12,
+                "epsilon mismatch at {}: {} vs {}",
+                i, mixed.epsilon[i], bath.epsilon[i],
+            );
+            prop_assert!(
+                (mixed.v[i] - bath.v[i]).abs() < 1e-12,
+                "v mismatch at {}: {} vs {}",
+                i, mixed.v[i], bath.v[i],
             );
         }
     }
