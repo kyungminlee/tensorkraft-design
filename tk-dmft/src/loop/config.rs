@@ -11,10 +11,7 @@ use crate::spectral::linear_predict::LinearPredictionConfig;
 use super::mixing::MixingScheme;
 
 /// Configuration for TDVP-based real-time Green's function computation.
-///
-/// Does not derive `Clone` or `Debug` because `TdvpStabilizationConfig`
-/// from tk-dmrg doesn't implement them (it depends on types with
-/// `Box<dyn ...>` fields).
+#[derive(Clone, Debug)]
 pub struct TimeEvolutionConfig {
     /// Total simulation time t_max (in inverse energy units). Default: 20.0.
     pub t_max: f64,
@@ -45,9 +42,7 @@ impl Default for TimeEvolutionConfig {
 }
 
 /// Top-level configuration for a DMFT self-consistency run.
-///
-/// Does not derive `Clone` or `Debug` because `DMRGConfig` from tk-dmrg
-/// contains `Box<dyn IterativeEigensolver<f64>>` which is not clonable.
+#[derive(Clone, Debug)]
 pub struct DMFTConfig {
     /// DMRG sweep configuration for ground-state computation at each iteration.
     pub dmrg_config: DMRGConfig,
@@ -70,6 +65,22 @@ pub struct DMFTConfig {
     pub checkpoint_path: Option<std::path::PathBuf>,
 }
 
+impl Default for DMFTConfig {
+    fn default() -> Self {
+        Self {
+            dmrg_config: DMRGConfig::default(),
+            time_evolution: TimeEvolutionConfig::default(),
+            linear_prediction: LinearPredictionConfig::default(),
+            solver_mode: SpectralSolverMode::default(),
+            mixing: MixingScheme::default(),
+            self_consistency_tol: 1e-4,
+            max_iterations: 50,
+            bath_discretization: BathDiscretizationConfig::default(),
+            checkpoint_path: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +92,21 @@ mod tests {
         assert!((config.dt - 0.05).abs() < 1e-12);
         assert_eq!(config.max_bond_dim, 500);
         assert!((config.cross_validation_tol - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_dmft_config_default() {
+        let config = DMFTConfig::default();
+        assert_eq!(config.max_iterations, 50);
+        assert!((config.self_consistency_tol - 1e-4).abs() < 1e-15);
+        assert!(config.checkpoint_path.is_none());
+    }
+
+    #[test]
+    fn test_dmft_config_clone() {
+        let config = DMFTConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.max_iterations, config.max_iterations);
+        assert!((cloned.self_consistency_tol - config.self_consistency_tol).abs() < 1e-15);
     }
 }

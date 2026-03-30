@@ -28,6 +28,11 @@ proptest     = "1"
 approx       = "0.5"
 rand         = "0.8"
 rand_chacha  = "0.3"
+criterion    = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "dmft_benchmarks"
+harness = false
 
 [features]
 default      = ["backend-faer", "parallel"]

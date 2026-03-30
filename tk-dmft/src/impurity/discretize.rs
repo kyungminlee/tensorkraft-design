@@ -220,15 +220,57 @@ where
         }
     }
 
-    // Step 6: Validation (optional — check residual if needed)
-    // For draft: skip full validation, return the discretized parameters.
-    // TODO: Implement full Delta_discretized vs Delta_target residual check.
-
-    Ok(BathParameters {
+    // Step 6: Validation — check Delta_discretized vs Delta_target residual
+    let bath_result = BathParameters {
         epsilon,
         v: v_params,
         n_bath,
-    })
+    };
+
+    // Compute discretized hybridization and compare to target
+    // Only validate if we have enough omega points and reasonable broadening
+    if n_omega > 1 && config.broadening > 0.0 {
+        let broadening = T::Real::from(config.broadening);
+        let delta_disc = bath_result.hybridization_function(omega, broadening);
+
+        // Compute L-infinity relative residual:
+        //   ||Im(Delta_disc) - Im(Delta_target)||_inf / ||Im(Delta_target)||_inf
+        let mut max_diff: f64 = 0.0;
+        let mut max_ref: f64 = 0.0;
+        for j in 0..n_omega {
+            let target_im = weights[j] * std::f64::consts::PI / d_omega; // recover -Im[Delta]
+            let disc_im = -delta_disc[j].im;
+            let diff = (disc_im - target_im).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            if target_im.abs() > max_ref {
+                max_ref = target_im;
+            }
+        }
+
+        let relative_residual = if max_ref > f64::EPSILON {
+            max_diff / max_ref
+        } else {
+            0.0
+        };
+
+        // Log a warning if the discretization is poor (but don't fail —
+        // the Lanczos tridiagonalization is an approximation by design)
+        if relative_residual > config.lanczos_tol && max_ref > f64::EPSILON {
+            log::warn!(
+                target: "tensorkraft::telemetry",
+                "BATH_DISCRETIZATION_RESIDUAL: relative L-inf residual = {:.2e} \
+                 (tolerance = {:.2e}). Consider increasing n_bath ({}) or \
+                 adjusting the frequency grid.",
+                relative_residual,
+                config.lanczos_tol,
+                n_bath,
+            );
+        }
+    }
+
+    Ok(bath_result)
 }
 
 #[cfg(test)]
@@ -284,5 +326,51 @@ mod tests {
         assert_eq!(bath.n_bath, n_bath);
         assert_eq!(bath.epsilon.len(), n_bath);
         assert_eq!(bath.v.len(), n_bath);
+    }
+
+    #[test]
+    fn test_lanczos_validation_runs() {
+        // Verify the validation step executes without panicking
+        // and produces a reasonable bath for a semicircular DOS
+        let n_omega = 200;
+        let omega: Vec<f64> = (0..n_omega)
+            .map(|i| -5.0 + 10.0 * i as f64 / (n_omega as f64 - 1.0))
+            .collect();
+        let half_bw = 2.0;
+        let delta: Vec<f64> = omega
+            .iter()
+            .map(|&w| {
+                if w.abs() < half_bw {
+                    (2.0 / std::f64::consts::PI) * (1.0 - (w / half_bw).powi(2)).sqrt()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        let config = BathDiscretizationConfig {
+            max_lanczos_steps: 0,
+            lanczos_tol: 1e-4,
+            n_omega_points: n_omega,
+            bandwidth: 10.0,
+            broadening: 0.1,
+        };
+
+        let n_bath = 8;
+        let result = lanczos_tridiagonalize::<f64>(&delta, &omega, n_bath, &config);
+        assert!(result.is_ok());
+        let bath = result.unwrap();
+
+        // Bath energies should be within the bandwidth
+        for &e in &bath.epsilon {
+            assert!(
+                e.abs() <= 6.0,
+                "bath energy {} outside expected range",
+                e
+            );
+        }
+
+        // First hybridization should be positive (sqrt of total weight)
+        assert!(bath.v[0] > 0.0, "V_1 should be positive");
     }
 }

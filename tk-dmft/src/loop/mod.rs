@@ -268,6 +268,53 @@ where
         &self.impurity.bath
     }
 
+    /// Resume a DMFT run from a previously saved checkpoint.
+    ///
+    /// Restores bath parameters and iteration count from the checkpoint,
+    /// allowing a crashed or interrupted run to continue from where it
+    /// left off without recomputing earlier iterations.
+    ///
+    /// # Parameters
+    /// - `checkpoint`: a `DMFTCheckpoint` loaded via `DMFTCheckpoint::read_from_file`
+    ///
+    /// # Panics
+    /// Panics if the checkpoint bath size doesn't match the current AIM bath size.
+    pub fn resume_from_checkpoint(&mut self, checkpoint: &DMFTCheckpoint) {
+        let n = checkpoint.bath_epsilon.len();
+        assert_eq!(
+            n,
+            checkpoint.bath_v.len(),
+            "checkpoint bath_epsilon and bath_v must have the same length"
+        );
+        assert_eq!(
+            n, self.impurity.bath.n_bath,
+            "checkpoint bath size ({}) must match current AIM bath size ({})",
+            n, self.impurity.bath.n_bath,
+        );
+
+        // Restore bath parameters
+        let epsilon: Vec<T::Real> = checkpoint
+            .bath_epsilon
+            .iter()
+            .map(|&e| T::Real::from(e))
+            .collect();
+        let v: Vec<T> = checkpoint
+            .bath_v
+            .iter()
+            .map(|&v_val| T::from_real(T::Real::from(v_val)))
+            .collect();
+
+        self.impurity.update_bath(crate::impurity::bath::BathParameters {
+            epsilon,
+            v,
+            n_bath: n,
+        });
+
+        // Restore iteration count and convergence state
+        self.n_iterations = checkpoint.iteration;
+        self.is_converged = checkpoint.converged;
+    }
+
     /// Compute the non-interacting Weiss field from the impurity spectral function.
     ///
     /// Specialized to the Bethe lattice (infinite coordination).
@@ -466,5 +513,39 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_resume_from_checkpoint() {
+        use crate::impurity::AndersonImpurityModel;
+        use tk_linalg::DeviceFaer;
+        use tk_symmetry::U1;
+
+        let aim: AndersonImpurityModel<f64> =
+            AndersonImpurityModel::new(4.0, -2.0, 3, 10.0, 1.0);
+        let config = crate::r#loop::config::DMFTConfig::default();
+        let backend = DeviceFaer;
+
+        let mut dmft_loop: DMFTLoop<f64, U1, DeviceFaer> =
+            DMFTLoop::new(aim, config, backend);
+
+        // Create a checkpoint with known values
+        let checkpoint = DMFTCheckpoint {
+            iteration: 7,
+            converged: false,
+            config_json: "{}".to_string(),
+            bath_epsilon: vec![-2.0, 0.0, 2.0],
+            bath_v: vec![0.3, 0.5, 0.3],
+            spectral_omega: vec![],
+            spectral_values: vec![],
+        };
+
+        dmft_loop.resume_from_checkpoint(&checkpoint);
+
+        assert_eq!(dmft_loop.n_iterations(), 7);
+        assert!(!dmft_loop.converged());
+        assert!((dmft_loop.bath().epsilon[0] - (-2.0)).abs() < 1e-12);
+        assert!((dmft_loop.bath().epsilon[2] - 2.0).abs() < 1e-12);
+        assert!((dmft_loop.bath().v[1] - 0.5).abs() < 1e-12);
     }
 }

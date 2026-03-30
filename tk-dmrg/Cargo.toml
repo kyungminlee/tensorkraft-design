@@ -20,8 +20,13 @@ log          = "0.4"
 rand         = "0.8"
 
 [dev-dependencies]
-proptest = "1"
-approx   = "0.5"
+proptest  = "1"
+approx    = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "dmrg_benchmarks"
+harness = false
 
 [features]
 default      = ["backend-faer", "parallel"]

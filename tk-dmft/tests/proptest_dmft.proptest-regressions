@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 04d89cc031077de17054b97f7e94288d132fc501f2d66111bc7937e2165991d2 # shrinks to autocorr = [Complex { re: 1.0, im: 0.0 }, Complex { re: 0.1, im: 0.0 }, Complex { re: 0.010000000000000002, im: 0.0 }, Complex { re: 0.0010000000000000002, im: 0.0 }, Complex { re: 0.00010000000000000005, im: 0.0 }]
+cc 86d0084da768e29cc206bfe2e4d773372e726e1715f15c6d7250ca5df6be085b # shrinks to len = 3
+cc 6c57c6573f9df79fbd03989b17323bdce0cfc2b7d48da11da3ef749451e2b0ee # shrinks to rho = 0.8466158475141179, p = 2

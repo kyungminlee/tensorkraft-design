@@ -33,7 +33,7 @@ pub use spectral::chebyshev::{ChebyshevConfig, chebyshev_expand, chebyshev_from_
 pub use spectral::linear_predict::{
     LinearPredictionConfig, ToeplitzSolver,
     deconvolve_lorentzian, fft_to_spectral, linear_predict_regularized,
-    solve_toeplitz_levinson_durbin,
+    solve_toeplitz_levinson_durbin, solve_toeplitz_svd_pseudoinverse,
 };
 pub use spectral::positivity::restore_positivity;
 pub use spectral::tdvp::{TdvpSpectralConfig, compute_greens_function_tdvp, tdvp_spectral_pipeline};

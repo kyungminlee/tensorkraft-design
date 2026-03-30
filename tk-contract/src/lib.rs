@@ -31,6 +31,6 @@ pub use error::{ContractionError, ContractResult};
 pub use executor::{ContractionExecutor, DenseExecutionPlan, ExecutionPlan};
 pub use graph::{ContractionGraph, ContractionNode};
 pub use index::{ContractionSpec, IndexId, IndexMap, IndexSpec, TensorId};
-pub use optimizer::{GreedyOptimizer, PathOptimizer};
+pub use optimizer::{DPOptimizer, GreedyOptimizer, PathOptimizer, TreeSAOptimizer};
 pub use sparse::SparseContractionExecutor;
 pub use structural::{AbelianHook, StructuralContractionHook};

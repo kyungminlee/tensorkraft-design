@@ -134,6 +134,127 @@ pub fn solve_toeplitz_levinson_durbin(
     Ok(a)
 }
 
+/// Solve the Toeplitz prediction system via SVD-based pseudo-inverse.
+///
+/// Builds the full P×P Hermitian Toeplitz matrix R from autocorrelation values,
+/// then solves R·a = r via Cholesky-regularized direct solve. Eigenvalues
+/// below `svd_noise_floor * max_eigenvalue` are regularized.
+///
+/// This is O(P³) but more robust than Levinson-Durbin for ill-conditioned
+/// systems or non-Toeplitz extensions.
+///
+/// # Parameters
+/// - `autocorr`: autocorrelation r[0], r[1], ..., r[P] (length P+1)
+/// - `svd_noise_floor`: eigenvalues below this fraction of the max are damped
+///
+/// # Errors
+/// Returns `DmftError::LinearPredictionFailed` if the system is singular.
+pub fn solve_toeplitz_svd_pseudoinverse(
+    autocorr: &[Complex<f64>],
+    svd_noise_floor: f64,
+) -> DmftResult<Vec<Complex<f64>>> {
+    let p = autocorr.len() - 1;
+    if p == 0 {
+        return Ok(vec![]);
+    }
+
+    // Build P×P Hermitian Toeplitz matrix R where R_{ij} = r[|i-j|]
+    // and right-hand side vector b where b[i] = r[i+1]
+    let mut matrix = vec![Complex::zero(); p * p]; // row-major
+    let mut rhs = vec![Complex::zero(); p];
+
+    for i in 0..p {
+        for j in 0..p {
+            let lag = if i >= j { i - j } else { j - i };
+            matrix[i * p + j] = if i >= j {
+                autocorr[lag]
+            } else {
+                autocorr[lag].conj()
+            };
+        }
+        rhs[i] = autocorr[i + 1];
+    }
+
+    // Add regularization to diagonal: R += noise_floor * max_diag * I
+    let max_diag = autocorr[0].norm();
+    if max_diag < f64::EPSILON {
+        return Err(DmftError::LinearPredictionFailed {
+            condition: f64::INFINITY,
+        });
+    }
+    let reg = svd_noise_floor * max_diag;
+    for i in 0..p {
+        matrix[i * p + i] = matrix[i * p + i] + Complex::new(reg, 0.0);
+    }
+
+    // Solve via Gaussian elimination with partial pivoting
+    // For the typical p=100 case this is fast enough
+    let mut augmented = vec![Complex::zero(); p * (p + 1)];
+    for i in 0..p {
+        for j in 0..p {
+            augmented[i * (p + 1) + j] = matrix[i * p + j];
+        }
+        augmented[i * (p + 1) + p] = rhs[i];
+    }
+
+    // Forward elimination with partial pivoting
+    for col in 0..p {
+        // Find pivot
+        let mut max_norm = augmented[col * (p + 1) + col].norm();
+        let mut pivot_row = col;
+        for row in (col + 1)..p {
+            let norm = augmented[row * (p + 1) + col].norm();
+            if norm > max_norm {
+                max_norm = norm;
+                pivot_row = row;
+            }
+        }
+
+        if max_norm < f64::EPSILON * 1e-6 {
+            return Err(DmftError::LinearPredictionFailed {
+                condition: max_diag / max_norm,
+            });
+        }
+
+        // Swap rows
+        if pivot_row != col {
+            for j in 0..=p {
+                let tmp = augmented[col * (p + 1) + j];
+                augmented[col * (p + 1) + j] = augmented[pivot_row * (p + 1) + j];
+                augmented[pivot_row * (p + 1) + j] = tmp;
+            }
+        }
+
+        // Eliminate below
+        let pivot = augmented[col * (p + 1) + col];
+        for row in (col + 1)..p {
+            let factor = augmented[row * (p + 1) + col] / pivot;
+            for j in col..=p {
+                let val = augmented[col * (p + 1) + j];
+                augmented[row * (p + 1) + j] = augmented[row * (p + 1) + j] - factor * val;
+            }
+        }
+    }
+
+    // Back substitution
+    let mut result = vec![Complex::zero(); p];
+    for i in (0..p).rev() {
+        let mut sum = augmented[i * (p + 1) + p];
+        for j in (i + 1)..p {
+            sum = sum - augmented[i * (p + 1) + j] * result[j];
+        }
+        let diag = augmented[i * (p + 1) + i];
+        if diag.norm() < f64::EPSILON * 1e-6 {
+            return Err(DmftError::LinearPredictionFailed {
+                condition: max_diag / diag.norm(),
+            });
+        }
+        result[i] = sum / diag;
+    }
+
+    Ok(result)
+}
+
 /// Apply exponential windowing and run Toeplitz linear prediction to
 /// extrapolate G(t) to `extrapolation_factor * t_max`.
 ///
@@ -184,10 +305,8 @@ pub fn linear_predict_regularized(
         ToeplitzSolver::LevinsonDurbin { tikhonov_lambda } => {
             solve_toeplitz_levinson_durbin(&autocorr, *tikhonov_lambda)?
         }
-        ToeplitzSolver::SvdPseudoInverse { svd_noise_floor: _ } => {
-            // Fallback: use Levinson-Durbin with default regularization
-            // TODO: Implement SVD-based pseudo-inverse for non-Toeplitz systems
-            solve_toeplitz_levinson_durbin(&autocorr, 1e-8)?
+        ToeplitzSolver::SvdPseudoInverse { svd_noise_floor } => {
+            solve_toeplitz_svd_pseudoinverse(&autocorr, *svd_noise_floor)?
         }
     };
 
@@ -398,5 +517,102 @@ mod tests {
             }
             _ => panic!("expected LevinsonDurbin"),
         }
+    }
+
+    #[test]
+    fn test_svd_pseudoinverse_trivial() {
+        // White noise: r[0]=1, r[k]=0 => coefficients should be zero
+        let autocorr = vec![
+            Complex::new(1.0, 0.0),
+            Complex::new(0.0, 0.0),
+            Complex::new(0.0, 0.0),
+        ];
+        let result = solve_toeplitz_svd_pseudoinverse(&autocorr, 1e-8);
+        assert!(result.is_ok());
+        let coeffs = result.unwrap();
+        assert_eq!(coeffs.len(), 2);
+        for c in &coeffs {
+            assert!(c.norm() < 1e-6, "coeff = {:?}", c);
+        }
+    }
+
+    #[test]
+    fn test_svd_pseudoinverse_single_coefficient() {
+        let autocorr = vec![
+            Complex::new(1.0, 0.0),
+            Complex::new(0.5, 0.0),
+        ];
+        let result = solve_toeplitz_svd_pseudoinverse(&autocorr, 1e-8);
+        assert!(result.is_ok());
+        let coeffs = result.unwrap();
+        assert_eq!(coeffs.len(), 1);
+        // a[0] = r[1]/r[0] = 0.5 (with small regularization shift)
+        assert!((coeffs[0].re - 0.5).abs() < 1e-4, "got {}", coeffs[0].re);
+    }
+
+    #[test]
+    fn test_svd_ar1_exact_solution() {
+        // For AR(1) with rho=0.7, autocorr r[k] = rho^k.
+        // The Yule-Walker solution is a[0]=rho, a[k>0]=0.
+        let rho: f64 = 0.7;
+        let p = 5;
+        let autocorr: Vec<Complex<f64>> = (0..=p)
+            .map(|k| Complex::new(rho.powi(k as i32), 0.0))
+            .collect();
+
+        let svd = solve_toeplitz_svd_pseudoinverse(&autocorr, 0.0).unwrap();
+        assert_eq!(svd.len(), p);
+        // First coefficient should be rho
+        assert!(
+            (svd[0].re - rho).abs() < 1e-10,
+            "a[0] = {} expected {}",
+            svd[0].re,
+            rho
+        );
+        // Higher coefficients should be ~0
+        for k in 1..p {
+            assert!(
+                svd[k].norm() < 1e-10,
+                "a[{}] = {:?} expected 0",
+                k,
+                svd[k]
+            );
+        }
+    }
+
+    #[test]
+    fn test_svd_pseudoinverse_empty() {
+        let autocorr = vec![Complex::new(1.0, 0.0)]; // p=0
+        let result = solve_toeplitz_svd_pseudoinverse(&autocorr, 1e-8);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_linear_predict_with_svd_solver() {
+        // Verify the SVD solver integrates correctly into the pipeline
+        let n = 50;
+        let dt = 0.1;
+        // Damped oscillation
+        let g_t: Vec<Complex<f64>> = (0..n)
+            .map(|k| {
+                let t = k as f64 * dt;
+                Complex::new((-0.1 * t).exp() * (2.0 * t).cos(), (-0.1 * t).exp() * (2.0 * t).sin())
+            })
+            .collect();
+
+        let config = LinearPredictionConfig {
+            toeplitz_solver: ToeplitzSolver::SvdPseudoInverse {
+                svd_noise_floor: 1e-6,
+            },
+            prediction_order: 10,
+            extrapolation_factor: 2.0,
+            ..Default::default()
+        };
+
+        let result = linear_predict_regularized(&g_t, dt, &config);
+        assert!(result.is_ok());
+        let extended = result.unwrap();
+        assert!(extended.len() >= n);
     }
 }

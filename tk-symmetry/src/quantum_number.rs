@@ -32,7 +32,7 @@ pub trait QuantumNumber: Clone + Eq + Hash + Ord + Debug + Send + Sync + 'static
 ///
 /// Only Abelian symmetries implement this trait. Non-Abelian symmetries
 /// (SU(2)) use a separate SmallVec-keyed storage path.
-pub trait BitPackable: QuantumNumber {
+pub trait BitPackable: QuantumNumber + Copy {
     /// Number of bits required to encode one quantum number.
     /// Must be a compile-time constant.
     const BIT_WIDTH: usize;

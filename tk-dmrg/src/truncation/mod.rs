@@ -127,6 +127,7 @@ pub fn truncate_svd<T: Scalar, B: LinAlgBackend<T>>(
 }
 
 /// Schedule for ramping up bond dimension across sweeps.
+#[derive(Clone, Debug)]
 pub struct BondDimensionSchedule {
     dims: Vec<usize>,
 }

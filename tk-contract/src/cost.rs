@@ -159,4 +159,25 @@ mod tests {
         let expected = 240.0 + 50.0 * (4 * 5 * 8) as f64;
         assert!((cost - expected).abs() < 1e-12);
     }
+
+    #[test]
+    fn cost_metric_custom_weights() {
+        let metric = CostMetric {
+            flop_weight: 2.0,
+            bandwidth_weight: 100.0,
+        };
+        // M=4, K=5, N=6, both contiguous → only FLOP cost with weight 2
+        let cost = CostEstimator::step_cost::<f64>(4, 5, 6, true, true, &metric);
+        assert!((cost - 480.0).abs() < 1e-12); // 2 * 240
+    }
+
+    #[test]
+    fn flop_count_edge_cases() {
+        // Zero dimension → zero flops
+        assert!((CostEstimator::flop_count(0, 5, 6) - 0.0).abs() < 1e-12);
+        assert!((CostEstimator::flop_count(4, 0, 6) - 0.0).abs() < 1e-12);
+        assert!((CostEstimator::flop_count(4, 5, 0) - 0.0).abs() < 1e-12);
+        // Single element
+        assert!((CostEstimator::flop_count(1, 1, 1) - 2.0).abs() < 1e-12);
+    }
 }

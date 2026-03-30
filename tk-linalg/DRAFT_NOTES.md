@@ -137,7 +137,11 @@
 
 ## Testing status
 
-**35 tests total** (28 unit + 3 integration + 4 proptest).
+**39 tests total** (28 unit + 3 integration + 4 proptest + 4 spmv integration).
+
+### Changes in cross-crate gap-filling pass
+
+- Added `spmv_test.rs` integration tests: `spmv_matches_dense_reference`, `spmv_zero_flux`, `spmv_nonzero_flux`, `spmv_empty_tensor`.
 
 Unit tests (28):
 - `LinAlgError` display formatting (3 tests)

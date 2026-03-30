@@ -1,8 +1,12 @@
 //! Path optimizer trait and implementations.
 
+pub mod dp;
 pub mod greedy;
+pub mod treesa;
 
+pub use dp::DPOptimizer;
 pub use greedy::GreedyOptimizer;
+pub use treesa::TreeSAOptimizer;
 
 use crate::cost::CostMetric;
 use crate::error::ContractResult;
